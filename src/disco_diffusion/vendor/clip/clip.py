@@ -1,9 +1,20 @@
 import hashlib
 import os
+import ssl
 import urllib
 import warnings
 from packaging import version
 from typing import Union, List
+
+try:
+    import certifi
+
+    # Use the same CA bundle as `requests` so downloads behave consistently across
+    # environments (e.g. proxies presenting a private CA). Falls back to the system
+    # default if certifi is unavailable.
+    _SSL_CONTEXT: "ssl.SSLContext | None" = ssl.create_default_context(cafile=certifi.where())
+except Exception:  # pragma: no cover - certifi should always be present
+    _SSL_CONTEXT = None
 
 import torch
 from PIL import Image
@@ -56,7 +67,7 @@ def _download(url: str, root: str):
         else:
             warnings.warn(f"{download_target} exists, but the SHA256 checksum does not match; re-downloading the file")
 
-    with urllib.request.urlopen(url) as source, open(download_target, "wb") as output:
+    with urllib.request.urlopen(url, context=_SSL_CONTEXT) as source, open(download_target, "wb") as output:
         with tqdm(total=int(source.info().get("Content-Length")), ncols=80, unit='iB', unit_scale=True, unit_divisor=1024) as loop:
             while True:
                 buffer = source.read(8192)

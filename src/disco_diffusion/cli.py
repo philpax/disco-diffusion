@@ -20,6 +20,11 @@ from .generate import generate as run_generate
 app = typer.Typer(add_completion=False, help="Disco Diffusion: CLIP-guided diffusion art.")
 
 
+@app.callback()
+def _main() -> None:
+    """Disco Diffusion: CLIP-guided diffusion art."""
+
+
 @app.command()
 def generate(
     prompt: Annotated[
