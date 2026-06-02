@@ -1,0 +1,73 @@
+[project]
+name = "disco-diffusion"
+version = "6.0.0"
+description = "A durable, typed port of the Disco Diffusion CLIP-guided diffusion art generator."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+dependencies = [
+    "torch>=2.7",
+    "torchvision>=0.22",
+    "numpy>=1.26",
+    "pillow>=10.0",
+    "requests>=2.31",
+    "tqdm>=4.66",
+    "pydantic>=2.6",
+    "typer>=0.12",
+    "ftfy>=6.1",
+    "regex>=2024.0",
+]
+
+[project.scripts]
+disco-diffusion = "disco_diffusion.cli:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/disco_diffusion"]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.6",
+    "mypy>=1.10",
+    "pytest>=8.0",
+]
+
+# torch/torchvision come from the CUDA 12.8 wheel index so the RTX 5090 (Blackwell,
+# sm_120) is supported. Override with a different index for other platforms.
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
+torchvision = { index = "pytorch-cu128" }
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+# Vendored research code is kept close to upstream; only format it, don't lint-gate it.
+extend-exclude = ["src/disco_diffusion/vendor"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "W"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+files = ["src/disco_diffusion"]
+
+# The vendored 2022 research code is intentionally not held to strict typing.
+[[tool.mypy.overrides]]
+module = "disco_diffusion.vendor.*"
+ignore_errors = true
+
+[[tool.mypy.overrides]]
+module = ["lpips.*", "resize_right.*", "clip.*", "guided_diffusion.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
