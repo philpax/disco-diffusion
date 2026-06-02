@@ -84,10 +84,16 @@ print(paths)
 
 ## Performance
 
-On an RTX 5090 the default 1280×768 / 250-step run takes **~78 s once warm** (down from
-~120 s), via `torch.compile` on the UNet and CLIP image encoders, batched CLIP guidance,
-TF32 matmuls, and disabled gradient checkpointing. The UNet forward alone drops 2.4×
-(258 → ~108 ms).
+On an RTX 5090 the default 1280×768 / 250-step run takes **~61 s once warm** (down from
+~120 s — about 1.95×), via:
+- `torch.compile` on the UNet and CLIP image encoders (UNet forward 258 → ~110 ms),
+- batched CLIP guidance, TF32 matmuls, and disabled gradient checkpointing,
+- a **cached resize matrix** for the cutouts: resize_right (the lanczos/cubic resampler
+  called ~144×/step) is a fixed linear operator per (in,out) size, so its matrix is
+  extracted once and applied as a matmul — ~10× faster per resize and bit-identical to
+  resize_right (~3e-7), so output stays within the noise floor.
+
+All of these are *faithful* — output stays within the run-to-run noise floor (see below).
 
 `torch.compile` is on by default. The **first run** with a given configuration pays a
 one-time compile cost (~1 min); the compiled kernels are then cached on disk (under
@@ -95,11 +101,12 @@ one-time compile cost (~1 min); the compiled kernels are then cached on disk (un
 cold start, slower steps). Changing resolution / CLIP models / `--cutn-batches` triggers a
 fresh one-time compile for the new shapes.
 
-Getting under 60 s requires lowering `--cutn-batches` (e.g. `2` → ~55 s): fewer CLIP
-guidance samples per step. This still produces good, on-style images, but it is **not** a
-near-exact reproduction of the default — it's a genuinely different sample (measured ~11 dB
-PSNR vs the `4` output, well outside the ~25 dB run-to-run noise floor). The default stays
-at `4` to preserve faithful reproduction; treat `--cutn-batches 2` as a speed/quality knob.
+The faithful default sits right at the ~60 s line; getting reliably *under* it would
+require a non-faithful change. Lowering `--cutn-batches` (e.g. `2` → ~55 s) uses fewer CLIP
+guidance samples per step: still good, on-style images, but **not** a near-exact
+reproduction of the default — a genuinely different sample (~11 dB PSNR vs `4`, well
+outside the ~25 dB noise floor). The default stays at `4` to preserve faithful
+reproduction; treat `--cutn-batches 2` as a speed/quality knob.
 
 **Reproducibility note:** Disco Diffusion is *not* bit-reproducible, even with a fixed
 seed and the original code — the CLIP-guidance backward uses non-deterministic GPU
