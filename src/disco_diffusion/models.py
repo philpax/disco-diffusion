@@ -34,6 +34,11 @@ def build_model_config(config: RunConfig) -> dict[str, Any]:
     """Construct the guided-diffusion model/diffusion config for this run."""
     model_config = dict(model_and_diffusion_defaults())
     use_fp16 = not config.cpu
+    # Gradient checkpointing only trades compute for memory during backprop, but the
+    # guidance gradient is taken through the secondary model, not this UNet (and we
+    # have ample VRAM). It also forces graph breaks under torch.compile, so disable it
+    # whenever we compile.
+    use_checkpoint = config.use_checkpoint and not config.compile
 
     if config.diffusion_model == DiffusionModel.finetune_512:
         model_config.update(
@@ -50,7 +55,7 @@ def build_model_config(config: RunConfig) -> dict[str, Any]:
                 "num_head_channels": 64,
                 "num_res_blocks": 2,
                 "resblock_updown": True,
-                "use_checkpoint": config.use_checkpoint,
+                "use_checkpoint": use_checkpoint,
                 "use_fp16": use_fp16,
                 "use_scale_shift_norm": True,
             }
@@ -70,7 +75,7 @@ def build_model_config(config: RunConfig) -> dict[str, Any]:
                 "num_head_channels": 64,
                 "num_res_blocks": 2,
                 "resblock_updown": True,
-                "use_checkpoint": config.use_checkpoint,
+                "use_checkpoint": use_checkpoint,
                 "use_fp16": use_fp16,
                 "use_scale_shift_norm": True,
             }
@@ -89,7 +94,7 @@ def build_model_config(config: RunConfig) -> dict[str, Any]:
                 "num_heads": 4,
                 "num_res_blocks": 2,
                 "resblock_updown": True,
-                "use_checkpoint": config.use_checkpoint,
+                "use_checkpoint": use_checkpoint,
                 "use_fp16": use_fp16,
                 "use_scale_shift_norm": True,
             }

@@ -66,6 +66,8 @@ Useful options (`disco-diffusion generate --help` for the full list):
 | `--diffusion-model` | `512x512_diffusion_uncond_finetune_008100` | Primary checkpoint |
 | `--sampling-mode` | `ddim` | `ddim` or `plms` |
 | `--clip-model` | (the three above) | CLIP model (repeatable) |
+| `--cutn-batches` | 4 | CLIP guidance samples per step (lower = faster, slightly noisier) |
+| `--compile` / `--no-compile` | on | `torch.compile` the UNet + CLIP (~1.5× faster once warm) |
 | `--cpu` | off | Force CPU |
 
 Images and a JSON settings dump are written to `images_out/<batch_name>/`.
@@ -79,6 +81,29 @@ from disco_diffusion.generate import generate
 paths = generate(RunConfig(prompts=["a serene mountain lake at dawn"], steps=100))
 print(paths)
 ```
+
+## Performance
+
+On an RTX 5090 the default 1280×768 / 250-step run takes **~78 s once warm** (down from
+~120 s), via `torch.compile` on the UNet and CLIP image encoders, batched CLIP guidance,
+TF32 matmuls, and disabled gradient checkpointing. The UNet forward alone drops 2.4×
+(258 → ~108 ms).
+
+`torch.compile` is on by default. The **first run** with a given configuration pays a
+one-time compile cost (~1 min); the compiled kernels are then cached on disk (under
+`models/.inductor_cache`) so later runs are fast. Pass `--no-compile` to skip it (faster
+cold start, slower steps). Changing resolution / CLIP models / `--cutn-batches` triggers a
+fresh one-time compile for the new shapes.
+
+For an extra ~30% on top, lower `--cutn-batches` (e.g. `2`): fewer CLIP guidance samples
+per step, a slightly noisier gradient but visually very similar output.
+
+**Reproducibility note:** Disco Diffusion is *not* bit-reproducible, even with a fixed
+seed and the original code — the CLIP-guidance backward uses non-deterministic GPU
+reductions, and the chaos compounds over ~240 steps (two identical-seed eager runs differ
+by ~25 dB PSNR). The optimizations here stay within that same noise floor — an optimized
+image differs from an eager one by no more than two eager runs differ from each other — so
+composition, style and quality are preserved.
 
 ## Development
 

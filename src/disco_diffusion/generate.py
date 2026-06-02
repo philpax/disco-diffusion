@@ -10,6 +10,7 @@ from __future__ import annotations
 import gc
 import io
 import json
+import os
 import random
 from collections.abc import Callable
 from pathlib import Path
@@ -48,6 +49,18 @@ def select_device(cpu: bool) -> torch.device:
     return torch.device("cpu")
 
 
+def _configure_perf(models_dir: Path) -> None:
+    """Enable TF32 matmuls and a persistent on-disk Inductor cache.
+
+    The persistent cache means the one-time ``torch.compile`` warmup is paid only on
+    the first run; later runs reuse the compiled kernels.
+    """
+    torch.set_float32_matmul_precision("high")
+    cache_dir = models_dir / ".inductor_cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", str(cache_dir.resolve()))
+
+
 def _fetch(url_or_path: str) -> io.BytesIO | Any:
     if str(url_or_path).startswith(("http://", "https://")):
         r = requests.get(url_or_path, timeout=60)
@@ -65,6 +78,9 @@ class Generator:
         self.device = device or select_device(config.cpu)
         print(f"Using device: {self.device}")
 
+        if config.compile and self.device.type == "cuda":
+            _configure_perf(config.models_dir)
+
         self.model_config = build_model_config(config)
         self.model, self.diffusion = load_diffusion_model(config, self.model_config, self.device)
         self.secondary_model = (
@@ -74,6 +90,14 @@ class Generator:
         # LPIPS is only used for the init-image loss; load it lazily to avoid the
         # VGG backbone download when it isn't needed.
         self.lpips_model = load_lpips(self.device) if config.init_image is not None else None
+
+        if config.compile and self.device.type == "cuda":
+            # Compile the UNet and the CLIP image encoders. The first run pays a
+            # one-time warmup (cached on disk by _configure_perf); later runs are fast.
+            print("torch.compile enabled (first run compiles kernels; subsequent runs reuse cache)")
+            self.model = torch.compile(self.model)  # type: ignore[assignment]
+            for clip_model in self.clip_models:
+                clip_model.encode_image = torch.compile(clip_model.encode_image)
 
     # -- target embeddings ------------------------------------------------
     def _build_model_stats(self) -> list[dict[str, Any]]:
@@ -166,15 +190,24 @@ class Generator:
                     x_in = out["pred_xstart"] * fac + x * (1 - fac)
                     x_in_grad = torch.zeros_like(x_in)
 
+                t_int = int(t.item()) + 1
+                overview_n = int(cut_overview[1000 - t_int])
+                inner_n = int(cut_innercut[1000 - t_int])
+                n_cuts = overview_n + inner_n
                 for model_stat in model_stats:
+                    try:
+                        input_resolution = model_stat["clip_model"].visual.input_resolution
+                    except AttributeError:
+                        input_resolution = 224
+                    # Recompute per model so each model's grad call has its own graph
+                    # (sharing this node across autograd.grad calls double-frees it).
+                    x_in_unit = x_in.add(1).div(2)
+                    # Draw all cutn_batches cutout sets (identical RNG sequence to the
+                    # per-batch loop), then run a single batched CLIP encode + one grad
+                    # call. The per-batch gradient mean reduces to a single mean over all
+                    # cutn_batches*n_cuts cutouts, so this is numerically equivalent.
+                    batches = []
                     for _ in range(cfg.cutn_batches):
-                        t_int = int(t.item()) + 1
-                        try:
-                            input_resolution = model_stat["clip_model"].visual.input_resolution
-                        except AttributeError:
-                            input_resolution = 224
-                        overview_n = int(cut_overview[1000 - t_int])
-                        inner_n = int(cut_innercut[1000 - t_int])
                         cuts = MakeCutoutsDango(
                             input_resolution,
                             overview=overview_n,
@@ -183,17 +216,17 @@ class Generator:
                             ic_grey_p=cut_icgray_p[1000 - t_int],
                             skip_augs=cfg.skip_augs,
                         )
-                        clip_in = CLIP_NORMALIZE(cuts(x_in.add(1).div(2)))
-                        image_embeds = model_stat["clip_model"].encode_image(clip_in).float()
-                        dists = spherical_dist_loss(
-                            image_embeds.unsqueeze(1), model_stat["target_embeds"].unsqueeze(0)
-                        )
-                        dists = dists.view([overview_n + inner_n, n, -1])
-                        losses = dists.mul(model_stat["weights"]).sum(2).mean(0)
-                        x_in_grad += (
-                            torch.autograd.grad(losses.sum() * cfg.clip_guidance_scale, x_in)[0]
-                            / cfg.cutn_batches
-                        )
+                        batches.append(cuts(x_in_unit))
+                    clip_in = CLIP_NORMALIZE(torch.cat(batches))
+                    image_embeds = model_stat["clip_model"].encode_image(clip_in).float()
+                    dists = spherical_dist_loss(
+                        image_embeds.unsqueeze(1), model_stat["target_embeds"].unsqueeze(0)
+                    )
+                    dists = dists.view([cfg.cutn_batches * n_cuts, n, -1])
+                    losses = dists.mul(model_stat["weights"]).sum(2).mean(0)
+                    x_in_grad += torch.autograd.grad(losses.sum() * cfg.clip_guidance_scale, x_in)[
+                        0
+                    ]
 
                 tv_losses = tv_loss(x_in)
                 range_losses = range_loss(

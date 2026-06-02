@@ -128,6 +128,10 @@ class RunConfig(BaseModel):
 
     # Runtime
     cpu: bool = False
+    # torch.compile the UNet and CLIP image encoders. ~2x faster per step once
+    # warm; the first run pays a one-time compile cost that is then cached on disk
+    # (so subsequent runs are fast). Disable for a faster cold start / debugging.
+    compile: bool = True
 
     @field_validator("clip_models")
     @classmethod

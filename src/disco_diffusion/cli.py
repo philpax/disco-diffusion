@@ -56,6 +56,12 @@ def generate(
     models_dir: Annotated[Path, typer.Option(help="Model cache directory.")] = Path("models"),
     batch_name: Annotated[str, typer.Option(help="Batch name (output subfolder).")] = "TimeToDisco",
     cpu: Annotated[bool, typer.Option(help="Force CPU (very slow).")] = False,
+    compile: Annotated[
+        bool,
+        typer.Option(
+            help="torch.compile the UNet/CLIP (~2x faster once warm; first run compiles)."
+        ),
+    ] = True,
 ) -> None:
     """Generate an image from a text prompt."""
     overrides: dict[str, Any] = {
@@ -74,6 +80,7 @@ def generate(
         "models_dir": models_dir,
         "batch_name": batch_name,
         "cpu": cpu,
+        "compile": compile,
     }
     if prompt:
         overrides["prompts"] = prompt
