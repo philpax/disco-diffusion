@@ -1,6 +1,6 @@
 # Performance
 
-On an RTX 5090, the default 1280×768 / 250-step run takes about 59 seconds once warm, down from ~124 seconds right after the port: a 2.1× speedup with no visible change to the output, which stays within the run-to-run noise floor (see [Faithfulness](#faithfulness)).
+On an RTX 5090, the default 1280×768 / 250-step run takes about 59 seconds once warm, down from ~124 seconds right after the port: a 2.1× speedup with no visible change to the output, which stays within the run-to-run noise floor (see [Faithfulness](#faithfulness)). On an RTX 3090 the same run is about 4m27s once warm, roughly 4.5× slower.
 
 Times are for the warm sampling loop, meaning the 240 denoising steps that run after `--skip-steps`, measured at seed 1234 with the default configuration on one RTX 5090 (torch 2.11.0+cu128). Per-step figures are the mean over steady-state steps, excluding warmup and the first-run compile. All milestones share the same `uv.lock`, so the differences come from code, not dependencies.
 
