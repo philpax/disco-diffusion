@@ -6,6 +6,10 @@ This version is a proper Python library and CLI, managed with [`uv`](https://doc
 
 The 3D, video, turbo, VR and 2D-animation modes from the original are gone; this port only generates still images.
 
+![Sample outputs: a cosmic nebula over an alien sea, a misty alpine valley, an aurora over snowy tundra, and a psychedelic fractal](gallery.jpg)
+
+*Sample outputs at 1280×768, each CLIP-guided toward a different artist-style prompt.*
+
 ## Requirements
 
 - `uv`
