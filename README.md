@@ -67,6 +67,7 @@ Useful options (`disco-diffusion generate --help` for the full list):
 | `--sampling-mode` | `ddim` | `ddim` or `plms` |
 | `--clip-model` | (the three above) | CLIP model (repeatable) |
 | `--cutn-batches` | 4 | CLIP guidance samples per step (lower = faster, slightly noisier) |
+| `--guidance-every` | 1 | Recompute CLIP guidance every N steps (1 = faithful; 2 ≈ 1.46× faster) |
 | `--compile` / `--no-compile` | on | `torch.compile` the UNet + CLIP (~1.5× faster once warm) |
 | `--cpu` | off | Force CPU |
 
@@ -114,9 +115,15 @@ opt-in "fast" levers (all **off** by default — the default stays faithful):
 | `--fast-fp16-secondary` | secondary guidance model in fp16 (~58 s) | mild ~3 dB departure (borderline-faithful) |
 | `--fast` | enables all of the above | |
 
-Separately, lowering `--cutn-batches` (e.g. `2` → ~55 s) uses fewer CLIP guidance samples:
-still good images, but a genuinely different sample (~11 dB vs `4`). A speed/quality knob,
-not a faithful reproduction.
+Separately, two speed/quality knobs trade a genuinely different (but still good) sample for
+more speed — not faithful reproduction, but the result is a *different valid image*, not a
+degraded one:
+
+- `--cutn-batches` (e.g. `2` → ~55 s): fewer CLIP guidance samples (~11 dB vs `4`).
+- `--guidance-every N` (default `1`): recompute the CLIP guidance gradient only every `N`
+  steps and reuse it in between. The gradient drifts slowly, so this mostly changes the
+  composition rather than the quality. `2` → ~1.46× faster (~64 → ~44 s); higher `N`
+  accelerates further (up to ~1.73× at `4`) but the style starts to drift (more saturated).
 
 **Reproducibility note:** Disco Diffusion is *not* bit-reproducible, even with a fixed
 seed and the original code — the CLIP-guidance backward uses non-deterministic GPU

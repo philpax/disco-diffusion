@@ -70,6 +70,10 @@ def generate(
         bool,
         typer.Option(help="fp16 secondary model (~3s faster; mild ~3dB departure)."),
     ] = False,
+    guidance_every: Annotated[
+        int,
+        typer.Option(help="Recompute CLIP guidance every N steps (1=faithful; 2=~25% faster)."),
+    ] = 1,
 ) -> None:
     """Generate an image from a text prompt."""
     overrides: dict[str, Any] = {
@@ -91,6 +95,7 @@ def generate(
         "compile": compile,
         # --fast turns on all the individual fast levers.
         "fast_fp16_secondary": fast or fast_fp16_secondary,
+        "guidance_every": guidance_every,
     }
     if prompt:
         overrides["prompts"] = prompt

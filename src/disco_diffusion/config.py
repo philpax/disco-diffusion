@@ -138,6 +138,11 @@ class RunConfig(BaseModel):
     # floor). The CLI groups these: --fast enables all of them.
     # Run the secondary guidance model in fp16 (~3s faster; ~3dB systematic departure).
     fast_fp16_secondary: bool = False
+    # Lazy guidance: recompute the CLIP-guidance gradient only every N steps and reuse it
+    # in between (the gradient drifts slowly between steps). 1 = faithful (every step).
+    # The guidance is ~half the per-step cost, so N=2 is ~25% faster end-to-end, with a
+    # fidelity departure that grows with N (measure before relying on it). Not in --fast.
+    guidance_every: int = Field(default=1, ge=1)
 
     @field_validator("clip_models")
     @classmethod
