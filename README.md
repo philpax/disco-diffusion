@@ -112,12 +112,7 @@ opt-in "fast" levers (all **off** by default — the default stays faithful):
 | Flag | Effect | Cost |
 | --- | --- | --- |
 | `--fast-fp16-secondary` | secondary guidance model in fp16 (~58 s) | mild ~3 dB departure (borderline-faithful) |
-| `--fast-interpolate-cutout` | native `F.interpolate` cutout resize | **not recommended** — ~0 speedup over the (faithful) cached resize, but a visible ~18 dB departure |
 | `--fast` | enables all of the above | |
-
-In practice only `--fast-fp16-secondary` is worth using — the cached resize matrix already
-made cutout resizing a non-bottleneck, so `--fast-interpolate-cutout` is strictly dominated
-(it's kept only for completeness/experimentation).
 
 Separately, lowering `--cutn-batches` (e.g. `2` → ~55 s) uses fewer CLIP guidance samples:
 still good images, but a genuinely different sample (~11 dB vs `4`). A speed/quality knob,

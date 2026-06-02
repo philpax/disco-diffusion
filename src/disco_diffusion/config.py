@@ -138,9 +138,6 @@ class RunConfig(BaseModel):
     # floor). The CLI groups these: --fast enables all of them.
     # Run the secondary guidance model in fp16 (~3s faster; ~3dB systematic departure).
     fast_fp16_secondary: bool = False
-    # Resample cutouts with native F.interpolate instead of the (bit-faithful) cached
-    # lanczos matrix (faster, but a visible ~18dB departure from the reference).
-    fast_interpolate_cutout: bool = False
 
     @field_validator("clip_models")
     @classmethod

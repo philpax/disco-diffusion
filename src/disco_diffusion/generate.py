@@ -218,7 +218,6 @@ class Generator:
                             ic_size_pow=cut_ic_pow[1000 - t_int],
                             ic_grey_p=cut_icgray_p[1000 - t_int],
                             skip_augs=cfg.skip_augs,
-                            fast_resize=cfg.fast_interpolate_cutout,
                         )
                         batches.append(cuts(x_in_unit))
                     clip_in = CLIP_NORMALIZE(torch.cat(batches))
