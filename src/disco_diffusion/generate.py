@@ -37,6 +37,7 @@ from .models import (
 from .noise import regen_perlin
 from .prompts import parse_prompt
 from .secondary import alpha_sigma_to_t
+from .tls import ensure_certifi_ssl
 from .vendor import clip
 
 
@@ -59,6 +60,7 @@ class Generator:
     """Loads the models once and generates images for a :class:`RunConfig`."""
 
     def __init__(self, config: RunConfig, device: torch.device | None = None) -> None:
+        ensure_certifi_ssl()
         self.config = config
         self.device = device or select_device(config.cpu)
         print(f"Using device: {self.device}")
@@ -69,7 +71,9 @@ class Generator:
             load_secondary_model(config, self.device) if config.use_secondary_model else None
         )
         self.clip_models = load_clip_models(config, self.device)
-        self.lpips_model = load_lpips(self.device)
+        # LPIPS is only used for the init-image loss; load it lazily to avoid the
+        # VGG backbone download when it isn't needed.
+        self.lpips_model = load_lpips(self.device) if config.init_image is not None else None
 
     # -- target embeddings ------------------------------------------------
     def _build_model_stats(self) -> list[dict[str, Any]]:
@@ -201,7 +205,7 @@ class Generator:
                     + range_losses.sum() * cfg.range_scale
                     + sat_losses.sum() * cfg.sat_scale
                 )
-                if init is not None and cfg.init_scale:
+                if init is not None and cfg.init_scale and self.lpips_model is not None:
                     init_losses = self.lpips_model(x_in, init)
                     loss = loss + init_losses.sum() * cfg.init_scale
                 x_in_grad += torch.autograd.grad(loss, x_in)[0]
