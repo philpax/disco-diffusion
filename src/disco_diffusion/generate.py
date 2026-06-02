@@ -12,6 +12,7 @@ import io
 import json
 import os
 import random
+import sys
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -43,9 +44,24 @@ from .vendor import clip
 
 
 def select_device(cpu: bool) -> torch.device:
-    """Pick CUDA when available (any architecture, e.g. 3090 or 5090), else CPU."""
+    """Pick CUDA when available (any architecture, e.g. 3090 or 5090).
+
+    If CUDA is unavailable and ``cpu`` wasn't requested explicitly, warn and ask before
+    falling back: a full run on CPU takes hours, so a silent fallback is almost always a
+    mistake (an old or invisible driver, or — on NixOS — not being inside the nix-shell).
+    """
     if not cpu and torch.cuda.is_available():
         return torch.device("cuda:0")
+    if not cpu:
+        print(
+            "\nWARNING: CUDA is not available, so this would run on CPU — a full run takes "
+            "hours.\nUsually the GPU driver isn't visible (on NixOS, enter the nix-shell "
+            "first) or is too old for the CUDA 12.8 wheels.",
+            file=sys.stderr,
+        )
+        reply = input("Run on CPU anyway? [y/N] ").strip().lower() if sys.stdin.isatty() else "n"
+        if reply not in ("y", "yes"):
+            raise SystemExit("Aborted. Fix the GPU/driver, or pass --cpu to use CPU deliberately.")
     return torch.device("cpu")
 
 
