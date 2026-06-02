@@ -85,52 +85,20 @@ print(paths)
 
 ## Performance
 
-On an RTX 5090 the default 1280×768 / 250-step run takes **~61 s once warm** (down from
-~120 s — about 1.95×), via:
-- `torch.compile` on the UNet and CLIP image encoders (UNet forward 258 → ~110 ms),
-- batched CLIP guidance, TF32 matmuls, and disabled gradient checkpointing,
-- a **cached resize matrix** for the cutouts: resize_right (the lanczos/cubic resampler
-  called ~144×/step) is a fixed linear operator per (in,out) size, so its matrix is
-  extracted once and applied as a matmul — ~10× faster per resize and bit-identical to
-  resize_right (~3e-7), so output stays within the noise floor.
+The default 1280×768 / 250-step run takes **~59 s once warm** on an RTX 5090 — about **2.1×**
+faster than the post-port baseline (~124 s), with no loss of fidelity (output stays within
+the run-to-run noise floor). The speedups come from `torch.compile` (with `max-autotune`),
+batched CLIP guidance, TF32, and a cached resize matrix for the cutouts.
 
-All of these are *faithful* — output stays within the run-to-run noise floor (see below).
+`torch.compile` is on by default; the first run with a given configuration pays a one-time
+compile/autotune cost (cached on disk under `models/.inductor_cache`), so later runs are
+fast. Pass `--no-compile` to skip it. The optional `--fast`, `--cutn-batches`, and
+`--guidance-every` levers trade a measured amount of fidelity for more speed (all off by
+default — the default stays faithful).
 
-`torch.compile` is on by default. The **first run** with a given configuration pays a
-one-time compile cost (~1 min); the compiled kernels are then cached on disk (under
-`models/.inductor_cache`) so later runs are fast. Pass `--no-compile` to skip it (faster
-cold start, slower steps). Changing resolution / CLIP models / `--cutn-batches` triggers a
-fresh one-time compile for the new shapes.
-
-### Faithful floor and the `--fast` levers
-
-The faithful default sits right at the ~60 s line — that's the hardware floor for this
-exact computation (the UNet is convolution-bound and already on tensor cores; CLIP is
-already fp16; `channels_last` is *slower* for this model; fp8 convs aren't available).
-Getting reliably *under* 60 s requires a small, measured fidelity tradeoff, exposed as
-opt-in "fast" levers (all **off** by default — the default stays faithful):
-
-| Flag | Effect | Cost |
-| --- | --- | --- |
-| `--fast-fp16-secondary` | secondary guidance model in fp16 (~58 s) | mild ~3 dB departure (borderline-faithful) |
-| `--fast` | enables all of the above | |
-
-Separately, two speed/quality knobs trade a genuinely different (but still good) sample for
-more speed — not faithful reproduction, but the result is a *different valid image*, not a
-degraded one:
-
-- `--cutn-batches` (e.g. `2` → ~55 s): fewer CLIP guidance samples (~11 dB vs `4`).
-- `--guidance-every N` (default `1`): recompute the CLIP guidance gradient only every `N`
-  steps and reuse it in between. The gradient drifts slowly, so this mostly changes the
-  composition rather than the quality. `2` → ~1.46× faster (~64 → ~44 s); higher `N`
-  accelerates further (up to ~1.73× at `4`) but the style starts to drift (more saturated).
-
-**Reproducibility note:** Disco Diffusion is *not* bit-reproducible, even with a fixed
-seed and the original code — the CLIP-guidance backward uses non-deterministic GPU
-reductions, and the chaos compounds over ~240 steps (two identical-seed eager runs differ
-by ~25 dB PSNR). The optimizations here stay within that same noise floor — an optimized
-image differs from an eager one by no more than two eager runs differ from each other — so
-composition, style and quality are preserved.
+See **[PERFORMANCE.md](PERFORMANCE.md)** for the per-optimization breakdown, measured impact
+at each milestone, why ~59 s is the faithful floor (and what was tried and rejected), and the
+opt-in levers.
 
 ## Development
 
