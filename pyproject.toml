@@ -32,7 +32,6 @@ packages = ["src/disco_diffusion"]
 dev = [
     "ruff>=0.6",
     "mypy>=1.10",
-    "pytest>=8.0",
 ]
 
 # torch/torchvision come from the CUDA 12.8 wheel index so the RTX 5090 (Blackwell,
@@ -75,6 +74,3 @@ follow_imports = "skip"
 [[tool.mypy.overrides]]
 module = ["torchvision.*", "tqdm.*", "lpips.*", "resize_right.*", "clip.*", "guided_diffusion.*"]
 ignore_missing_imports = true
-
-[tool.pytest.ini_options]
-testpaths = ["tests"]

@@ -85,7 +85,6 @@ print(paths)
 ```sh
 uv run ruff check . && uv run ruff format --check .
 uv run mypy src
-uv run pytest
 ```
 
 ## Credits & license
