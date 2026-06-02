@@ -133,6 +133,15 @@ class RunConfig(BaseModel):
     # (so subsequent runs are fast). Disable for a faster cold start / debugging.
     compile: bool = True
 
+    # "fast" (lossy) speed levers. Each trades a small, measured fidelity departure for
+    # speed and is OFF by default (the default stays faithful, within the run-to-run noise
+    # floor). The CLI groups these: --fast enables all of them.
+    # Run the secondary guidance model in fp16 (~3s faster; ~3dB systematic departure).
+    fast_fp16_secondary: bool = False
+    # Resample cutouts with native F.interpolate instead of the (bit-faithful) cached
+    # lanczos matrix (faster, but a visible ~18dB departure from the reference).
+    fast_interpolate_cutout: bool = False
+
     @field_validator("clip_models")
     @classmethod
     def _validate_clip_models(cls, value: list[str]) -> list[str]:

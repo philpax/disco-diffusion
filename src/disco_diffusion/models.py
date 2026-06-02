@@ -133,6 +133,11 @@ def load_secondary_model(config: RunConfig, device: torch.device) -> SecondaryDi
     model = SecondaryDiffusionImageNet2()
     model.load_state_dict(torch.load(path, map_location="cpu", weights_only=False))
     model.eval().requires_grad_(False).to(device)
+    # The --fast-fp16-secondary lever: the secondary model only steers the CLIP guidance
+    # (it doesn't produce the final pixels), so running it in fp16 is ~1.9x faster for a
+    # small (~3dB) systematic departure. Off by default.
+    if config.fast_fp16_secondary and device.type == "cuda" and not config.cpu:
+        model.half()
     return model
 
 

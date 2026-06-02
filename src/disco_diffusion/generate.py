@@ -177,7 +177,10 @@ class Generator:
                         dtype=torch.float32,
                     )
                     cosine_t = alpha_sigma_to_t(alpha, sigma)
-                    out = self.secondary_model(x, cosine_t[None].repeat([n])).pred
+                    sec_dtype = next(self.secondary_model.parameters()).dtype
+                    out = self.secondary_model(
+                        x.to(sec_dtype), cosine_t[None].repeat([n]).to(sec_dtype)
+                    ).pred.float()
                     fac = diffusion.sqrt_one_minus_alphas_cumprod[cur_t[0]]
                     x_in = out * fac + x * (1 - fac)
                     x_in_grad = torch.zeros_like(x_in)
@@ -215,6 +218,7 @@ class Generator:
                             ic_size_pow=cut_ic_pow[1000 - t_int],
                             ic_grey_p=cut_icgray_p[1000 - t_int],
                             skip_augs=cfg.skip_augs,
+                            fast_resize=cfg.fast_interpolate_cutout,
                         )
                         batches.append(cuts(x_in_unit))
                     clip_in = CLIP_NORMALIZE(torch.cat(batches))

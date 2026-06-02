@@ -53,6 +53,16 @@ def _resample_to(x: torch.Tensor, size: int) -> torch.Tensor:
     return torch.einsum("pw,ncow->ncop", mat_w, out)
 
 
+def _resample_interpolate(x: torch.Tensor, size: int) -> torch.Tensor:
+    """Faster native antialiased resample (the ``--fast-interpolate-cutout`` lever).
+
+    bicubic-antialias is ~40x faster than the cached matrix but a *systematic* (not
+    random) departure from resize_right's lanczos — a visibly different (still good)
+    sample, outside the noise floor.
+    """
+    return F.interpolate(x, size=(size, size), mode="bicubic", antialias=True)
+
+
 def sinc(x: torch.Tensor) -> torch.Tensor:
     return torch.where(x != 0, torch.sin(math.pi * x) / (math.pi * x), x.new_ones([]))
 
@@ -159,6 +169,7 @@ class MakeCutoutsDango(nn.Module):
         ic_size_pow: float = 0.5,
         ic_grey_p: float = 0.2,
         skip_augs: bool = False,
+        fast_resize: bool = False,
     ) -> None:
         super().__init__()
         self.cut_size = cut_size
@@ -167,6 +178,7 @@ class MakeCutoutsDango(nn.Module):
         self.ic_size_pow = ic_size_pow
         self.ic_grey_p = ic_grey_p
         self.skip_augs = skip_augs
+        self._resize = _resample_interpolate if fast_resize else _resample_to
         self.augs = T.Compose(
             [
                 T.RandomHorizontalFlip(p=0.5),
@@ -198,7 +210,7 @@ class MakeCutoutsDango(nn.Module):
                 (sideX - max_size) // 2,
             ),
         )
-        cutout = _resample_to(pad_input, self.cut_size)
+        cutout = self._resize(pad_input, self.cut_size)
 
         if self.overview > 0:
             if self.overview <= 4:
@@ -211,7 +223,7 @@ class MakeCutoutsDango(nn.Module):
                 if self.overview == 4:
                     cutouts.append(gray(TF.hflip(cutout)))
             else:
-                cutout = _resample_to(pad_input, self.cut_size)
+                cutout = self._resize(pad_input, self.cut_size)
                 for _ in range(self.overview):
                     cutouts.append(cutout)
 
@@ -223,7 +235,7 @@ class MakeCutoutsDango(nn.Module):
                 cutout = input[:, :, offsety : offsety + size, offsetx : offsetx + size]
                 if i <= int(self.ic_grey_p * self.inner_crop):
                     cutout = gray(cutout)
-                cutout = _resample_to(cutout, self.cut_size)
+                cutout = self._resize(cutout, self.cut_size)
                 cutouts.append(cutout)
 
         cutouts_t = torch.cat(cutouts)

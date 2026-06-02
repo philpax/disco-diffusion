@@ -62,6 +62,18 @@ def generate(
             help="torch.compile the UNet/CLIP (~2x faster once warm; first run compiles)."
         ),
     ] = True,
+    fast: Annotated[
+        bool,
+        typer.Option("--fast", help="Enable all fast (slightly lossy) levers (~55s)."),
+    ] = False,
+    fast_fp16_secondary: Annotated[
+        bool,
+        typer.Option(help="fp16 secondary model (~3s faster; mild ~3dB departure)."),
+    ] = False,
+    fast_interpolate_cutout: Annotated[
+        bool,
+        typer.Option(help="Native F.interpolate cutout resize (faster; visible departure)."),
+    ] = False,
 ) -> None:
     """Generate an image from a text prompt."""
     overrides: dict[str, Any] = {
@@ -81,6 +93,9 @@ def generate(
         "batch_name": batch_name,
         "cpu": cpu,
         "compile": compile,
+        # --fast turns on all the individual fast levers.
+        "fast_fp16_secondary": fast or fast_fp16_secondary,
+        "fast_interpolate_cutout": fast or fast_interpolate_cutout,
     }
     if prompt:
         overrides["prompts"] = prompt

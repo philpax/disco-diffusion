@@ -101,12 +101,27 @@ one-time compile cost (~1 min); the compiled kernels are then cached on disk (un
 cold start, slower steps). Changing resolution / CLIP models / `--cutn-batches` triggers a
 fresh one-time compile for the new shapes.
 
-The faithful default sits right at the ~60 s line; getting reliably *under* it would
-require a non-faithful change. Lowering `--cutn-batches` (e.g. `2` → ~55 s) uses fewer CLIP
-guidance samples per step: still good, on-style images, but **not** a near-exact
-reproduction of the default — a genuinely different sample (~11 dB PSNR vs `4`, well
-outside the ~25 dB noise floor). The default stays at `4` to preserve faithful
-reproduction; treat `--cutn-batches 2` as a speed/quality knob.
+### Faithful floor and the `--fast` levers
+
+The faithful default sits right at the ~60 s line — that's the hardware floor for this
+exact computation (the UNet is convolution-bound and already on tensor cores; CLIP is
+already fp16; `channels_last` is *slower* for this model; fp8 convs aren't available).
+Getting reliably *under* 60 s requires a small, measured fidelity tradeoff, exposed as
+opt-in "fast" levers (all **off** by default — the default stays faithful):
+
+| Flag | Effect | Cost |
+| --- | --- | --- |
+| `--fast-fp16-secondary` | secondary guidance model in fp16 (~58 s) | mild ~3 dB departure (borderline-faithful) |
+| `--fast-interpolate-cutout` | native `F.interpolate` cutout resize | **not recommended** — ~0 speedup over the (faithful) cached resize, but a visible ~18 dB departure |
+| `--fast` | enables all of the above | |
+
+In practice only `--fast-fp16-secondary` is worth using — the cached resize matrix already
+made cutout resizing a non-bottleneck, so `--fast-interpolate-cutout` is strictly dominated
+(it's kept only for completeness/experimentation).
+
+Separately, lowering `--cutn-batches` (e.g. `2` → ~55 s) uses fewer CLIP guidance samples:
+still good images, but a genuinely different sample (~11 dB vs `4`). A speed/quality knob,
+not a faithful reproduction.
 
 **Reproducibility note:** Disco Diffusion is *not* bit-reproducible, even with a fixed
 seed and the original code — the CLIP-guidance backward uses non-deterministic GPU
