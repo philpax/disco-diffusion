@@ -95,8 +95,11 @@ one-time compile cost (~1 min); the compiled kernels are then cached on disk (un
 cold start, slower steps). Changing resolution / CLIP models / `--cutn-batches` triggers a
 fresh one-time compile for the new shapes.
 
-For an extra ~30% on top, lower `--cutn-batches` (e.g. `2`): fewer CLIP guidance samples
-per step, a slightly noisier gradient but visually very similar output.
+Getting under 60 s requires lowering `--cutn-batches` (e.g. `2` → ~55 s): fewer CLIP
+guidance samples per step. This still produces good, on-style images, but it is **not** a
+near-exact reproduction of the default — it's a genuinely different sample (measured ~11 dB
+PSNR vs the `4` output, well outside the ~25 dB run-to-run noise floor). The default stays
+at `4` to preserve faithful reproduction; treat `--cutn-batches 2` as a speed/quality knob.
 
 **Reproducibility note:** Disco Diffusion is *not* bit-reproducible, even with a fixed
 seed and the original code — the CLIP-guidance backward uses non-deterministic GPU
