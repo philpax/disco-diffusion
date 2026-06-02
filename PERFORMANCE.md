@@ -1,29 +1,21 @@
 # Performance
 
-The default 1280×768 / 250-step run on an RTX 5090 went from **~124 s to ~59 s — a 2.1×
-speedup — with no loss of fidelity** (the output stays within the run-to-run noise floor;
-see [Faithfulness](#faithfulness)). This document records each optimization and its measured
-impact.
+On an RTX 5090, the default 1280×768 / 250-step run takes about 59 seconds once warm, down from ~124 seconds right after the port: a 2.1× speedup with no visible change to the output, which stays within the run-to-run noise floor (see [Faithfulness](#faithfulness)).
 
-All numbers below are the **warm sampling-loop time** (the 240 denoising steps that actually
-run after `--skip-steps`), measured at a fixed seed (1234) with the default configuration on
-one RTX 5090, torch 2.11.0+cu128. Per-step times are the mean over steady-state steps
-(warmup / first-run compile excluded). Every milestone was measured against the *same*
-`uv.lock`, so the deltas reflect code changes, not dependency changes.
+Times are for the warm sampling loop, meaning the 240 denoising steps that run after `--skip-steps`, measured at seed 1234 with the default configuration on one RTX 5090 (torch 2.11.0+cu128). Per-step figures are the mean over steady-state steps, excluding warmup and the first-run compile. All milestones share the same `uv.lock`, so the differences come from code, not dependencies.
 
-## The faithful optimization path
+## The optimization path
 
-Each row is a commit; each is faithful (within the noise floor). Cumulative speedup is vs.
-the post-port eager baseline.
+Each row is a commit, all faithful (within the noise floor); cumulative is relative to the eager baseline (A).
 
 | # | Optimization | ms/step | sampling | incremental | cumulative |
 | --- | --- | ---: | ---: | ---: | ---: |
 | A | Post-port baseline (eager) | 516 | 124 s | — | 1.00× |
 | B | `torch.compile` + batched guidance + TF32 | 328 | 79 s | 1.57× | 1.57× |
 | C | Cached resize matrix | 255 | 61 s | 1.29× | 2.02× |
-| D | UNet `max-autotune` | 245 | 59 s | 1.04× | **2.11×** |
+| D | UNet `max-autotune` | 245 | 59 s | 1.04× | 2.11× |
 
-A single denoising step is ~45% primary UNet and ~55% CLIP guidance:
+A single denoising step is roughly 45% primary UNet and 55% CLIP guidance:
 
 ```
 per warm step (HEAD, ~245 ms):
@@ -35,93 +27,54 @@ per warm step (HEAD, ~245 ms):
     └─ secondary forward ........... ~17 ms
 ```
 
-### B. `torch.compile` + batched guidance + TF32 — 1.57×
+### torch.compile, batched guidance, TF32
 
-The biggest single win. Three changes that landed together:
+`torch.compile` on the UNet and CLIP image encoders drops the UNet forward from 258 ms eager to about 128 ms, as Inductor fuses GroupNorm, SiLU and residual adds into the convolution epilogues that eager mode runs as dozens of separate memory-bound kernels; the compiled kernels are cached on disk under `models/.inductor_cache`, so the ~1 minute warmup is paid once per configuration. 
 
-- **`torch.compile` on the UNet and CLIP image encoders.** The UNet forward drops from
-  258 ms (eager) to ~128 ms — Inductor fuses the GroupNorm/SiLU/residual elementwise ops
-  into the convolution epilogues, which eager runs as dozens of separate memory-bound
-  kernels. Compiled kernels are cached on disk (`models/.inductor_cache`), so the one-time
-  warmup (~1 min) is paid only on the first run with a given configuration.
-- **Batched CLIP guidance.** The `cutn_batches` cutout sets were encoded and
-  back-propagated one batch at a time; collapsing them into a single batched CLIP encode +
-  one `autograd.grad` per model is numerically identical (the per-batch gradient mean
-  reduces to one mean over all cutouts) but far fewer launches.
-- **TF32 matmuls** (`set_float32_matmul_precision("high")`) and **disabled gradient
-  checkpointing** (the guidance gradient flows through the *secondary* model, not the
-  primary UNet, so checkpointing the UNet only added recompute and broke compile graphs).
+Batched CLIP guidance replaces the per-batch encode and backward over the `cutn_batches` cutout sets with one batched encode and one `autograd.grad` per model, which is numerically identical (the per-batch gradient mean is a mean over all cutouts) but launches far fewer kernels.
 
-### C. Cached resize matrix — 1.29×
+TF32 matmuls (`set_float32_matmul_precision("high")`) and disabling gradient checkpointing finish it off; the guidance gradient runs through the secondary model rather than the primary UNet, so checkpointing the UNet only added recompute and broke the compile graph.
 
-After compile, the cutout machinery became the bottleneck: `resize_right` (the lanczos/cubic
-resampler) is called ~144×/step (≈12 inner crops × 4 `cutn_batches` × 3 CLIP models) and is
-Python-heavy, recomputing its resampling weights on every call.
+### Cached resize matrix
 
-The insight: **`resize_right` with a fixed interpolation method is a constant linear operator
-on pixel values** — for a given (in_size, out_size) it equals a fixed matrix `M`. So extract
-`M` once (by resizing an identity basis), cache it, and apply it as a matmul. This reproduces
-`resize_right` to float rounding (~3e-7) — bit-identical for our purposes — while being ~10×
-faster per resize. See `cutouts.py` (`_resize_matrix` / `_resample_to`).
+With the UNet compiled, the cutout code became the bottleneck. `resize_right`, the lanczos/cubic resampler, is called around 144 times per step (roughly 12 inner crops × 4 `cutn_batches` × 3 CLIP models) and rebuilds its resampling weights on every call. But with a fixed interpolation method it is a constant linear operator on the pixels: for a given input and output size it is the same matrix every time. Building that matrix once by resizing an identity basis, caching it, and applying it as a matmul reproduces `resize_right` to about 3e-7 (bit-identical for our purposes) and runs roughly 10× faster per resize. See `_resize_matrix` and `_resample_to` in `cutouts.py`.
 
-### D. UNet `max-autotune` — 1.04×
+### UNet max-autotune
 
-The compiled UNet is convolution-bound (~50% of its runtime is fp16 tensor-core GEMMs).
-Compiling with `mode="max-autotune-no-cudagraphs"` lets Inductor benchmark Triton/CUTLASS
-conv+matmul templates and pick the fastest, taking the UNet forward from ~128 ms to ~109 ms
-(~14%). It's lossless (still fp16 tensor cores) and the slower first-run autotune is cached
-on disk. CUDA graphs are skipped because the forward is GPU-bound, not launch-bound (they
-gave no measurable speedup). End-to-end this is a smaller ~4% because guidance is the other
-half of the step.
+The compiled UNet spends about half its time in fp16 tensor-core convolutions. Compiling with `mode="max-autotune-no-cudagraphs"` benchmarks Triton and CUTLASS templates for those convs and matmuls and keeps the fastest, taking the forward from ~128 ms to ~109 ms. It is lossless (still fp16 tensor cores), the longer first-run autotune is cached, and CUDA graphs are left off because the forward is GPU-bound rather than launch-bound. End-to-end this is about 4%, since the UNet is just under half the step.
 
 ## Faithfulness
 
-Disco Diffusion is **not** bit-reproducible, even with a fixed seed and the original code —
-the CLIP-guidance backward uses non-deterministic GPU reductions, and the chaos compounds
-over ~240 steps, so two identical-seed runs differ by ~17–21 dB PSNR. "Faithful" therefore
-means *within that noise floor*.
+Disco Diffusion is not bit-reproducible, even with a fixed seed and the original code: the CLIP-guidance backward uses non-deterministic GPU reductions, and that noise compounds over ~240 steps, so two runs from the same seed land 17–21 dB apart in PSNR. "Faithful" means staying within that floor. At seed 1234 the optimized HEAD image is 16.5 dB from the eager baseline, about the same distance as two runs of identical code, so composition, style and quality are preserved.
 
-Measured at seed 1234: the fully-optimized HEAD image differs from the eager baseline image
-by **16.5 dB** — essentially equal to the ~17 dB two-runs-of-the-same-code floor. In other
-words, an optimized image differs from an eager one by no more than two eager runs differ
-from each other. Composition, style and quality are preserved.
+## Why ~59 s is the floor
 
-## Why ~59 s is the faithful floor
-
-The per-step budget is now genuinely hard to reduce without changing the result. The
-following were all implemented and measured, and **rejected** — each either gave no speedup
-or moved the output below the noise floor:
+The remaining cost is convolutions in the UNet and the CLIP backward in the guidance, neither of which has a faithful lever left. The following were implemented and measured, then dropped, each because it either did not help or pushed the output below the noise floor:
 
 | Idea | Result | Why |
 | --- | --- | --- |
 | `channels_last` UNet | slower (120→135 ms compiled) | this NCHW model fuses better under Inductor; the 1D-conv attention reshapes force conversions |
-| SDPA / FlashAttention | 0.5–0.7× (slower) | attention is only ~1% of the compiled UNet; the batched einsum wins at these shapes |
-| CUDA graphs (`reduce-overhead`) | ~0 | the UNet forward is GPU-bound, not launch-bound |
-| `torch.compile` the secondary model | ~0 | too small to benefit |
-| `max-autotune` on CLIP encoders | ~0 | the 224² ViT/RN50 are too small (unlike the big UNet) |
-| fp8 convs / CLIP | n/a / too lossy | fp8 convs unavailable; fp8 CLIP departs too far |
-| Batched inner-crop resampling | bit-faithful, but 0 end-to-end | cutouts run in fp32; densifying the operators adds FLOPs that offset the saved autograd nodes |
-| Stream overlap (UNet ∥ guidance) | 0 speedup + 11 dB | real `cond_fn` serializes via `.item()` syncs; concurrency also reorders the nondeterministic reductions below the floor |
-| Shared cutouts across CLIP models | 1.4× guidance, but 9.8 dB | reusing identical cutouts across all 3 models collapses gradient diversity (≈ halving `cutn-batches`) |
-
-The remaining cost is real, faithful compute: convolution FLOPs in the UNet and the CLIP
-backward in the guidance. Neither has a faithful lever left.
+| SDPA / FlashAttention | 0.5–0.7× (slower) | attention is only ~1% of the compiled UNet, and the batched einsum wins at these shapes |
+| CUDA graphs (`reduce-overhead`) | no change | the UNet forward is GPU-bound, not launch-bound |
+| `torch.compile` the secondary model | no change | too small to benefit |
+| `max-autotune` on the CLIP encoders | no change | the 224² ViT/RN50 are too small, unlike the big UNet |
+| fp8 convs / CLIP | unavailable / too lossy | fp8 convs aren't available, and fp8 CLIP departs too far |
+| Batched inner-crop resampling | bit-faithful, but no net gain | cutouts run in fp32, so densifying the operators adds FLOPs that offset the saved autograd nodes |
+| Stream overlap (UNet ∥ guidance) | no gain, and 11 dB | the real `cond_fn` serializes on `.item()` syncs, and concurrency reorders the nondeterministic reductions below the floor |
+| Shared cutouts across CLIP models | 1.4× on guidance, but 9.8 dB | reusing identical cutouts across all three models collapses gradient diversity (about the same as halving `cutn-batches`) |
 
 ## Opt-in speed levers (lossy)
 
-Getting *under* the faithful floor requires a measured fidelity tradeoff. All are **off by
-default** — the default stays faithful.
+Going below the floor requires giving up some fidelity, so these are off by default.
 
 | Flag | Effect | Cost |
 | --- | --- | --- |
 | `--fast-fp16-secondary` | secondary guidance model in fp16 | mild ~3 dB departure (borderline-faithful) |
-| `--fast` | enables all `--fast-*` levers above | |
-| `--cutn-batches 2` | fewer CLIP guidance samples | ~11 dB — a different (still good) sample |
+| `--fast` | enables all the `--fast-*` levers above | |
+| `--cutn-batches 2` | fewer CLIP guidance samples | ~11 dB, a different but still good sample |
 | `--guidance-every N` | recompute CLIP guidance every N steps | see below |
 
-`--guidance-every N` reuses the CLIP guidance gradient between recomputes (it drifts slowly
-step-to-step). Unlike the precision levers, it doesn't *degrade* the image — it produces a
-**different but equally coherent sample**, like a seed change:
+`--guidance-every N` reuses the CLIP guidance gradient between recomputes, which drifts slowly from step to step. Rather than degrading the image, it changes it: the result is a different but equally coherent sample, closer to a different seed.
 
 | N | speedup | sampling | PSNR vs faithful | note |
 | ---: | ---: | ---: | ---: | --- |
@@ -130,13 +83,8 @@ step-to-step). Unlike the precision levers, it doesn't *degrade* the image — i
 | 3 | 1.60× | ~40 s | 8.2 dB | slight style drift |
 | 4 | 1.73× | ~37 s | 7.4 dB | more saturated / posterized |
 
-It is deliberately **not** bundled into `--fast` (it's a more visible departure than the
-~3 dB fp16-secondary), and the faithful default (`N=1`) is a verified no-op.
+It is not bundled into `--fast` (a more visible change than the fp16 secondary), and `N=1` is a verified no-op.
 
-## Reproducing these measurements
+## Reproducing the numbers
 
-Each milestone was measured by checking out the commit and timing every `ddim_sample` call
-(GPU-synchronized), taking the mean of the steady-state steps (first 10 skipped to exclude
-the first-run compile), at the default config with `seed=1234`. The `uv.lock` is identical
-across all milestones, so the environment (torch 2.11.0+cu128) is held constant and the
-deltas are purely from code.
+Each milestone was measured by checking out the commit and timing every `ddim_sample` call (GPU-synchronized), averaging the steady-state steps and dropping the first ten to skip the first-run compile, at the default config with seed 1234.

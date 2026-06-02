@@ -1,26 +1,15 @@
 # Disco Diffusion (typed `uv` port)
 
-A durable, strongly-typed port of the semi-famous 2022 [Disco Diffusion]
-CLIP-guided diffusion art generator. The original was a Google Colab notebook that
-bootstrapped itself with runtime `pip install` / `git clone` and pinned a long-dead
-ML stack. This version is:
+A durable, strongly-typed port of the semi-famous 2022 [Disco Diffusion] CLIP-guided diffusion art generator. The original was a Google Colab notebook that bootstrapped itself with runtime `pip install` / `git clone` and pinned a long-dead ML stack.
 
-- a proper Python **library + CLI**, managed with [`uv`](https://docs.astral.sh/uv/);
-- **strongly typed** (`mypy --strict`), linted and formatted (`ruff`);
-- running on a **modern PyTorch stack** with CUDA 12.8 wheels, so it uses recent
-  NVIDIA GPUs (developed on an RTX 5090; works on Ampere such as the 3090 too);
-- **self-contained**: every fragile 2022 research repo it depended on is vendored
-  in-tree under `src/disco_diffusion/vendor/`, so it keeps working even if those
-  upstream repositories disappear. Only model *weights* are downloaded at runtime.
+This version is a proper Python library and CLI, managed with [`uv`](https://docs.astral.sh/uv/), typed under `mypy --strict`, and linted and formatted with `ruff`. It runs on a current PyTorch stack with CUDA 12.8 wheels, so it works on recent NVIDIA GPUs (developed on an RTX 5090, but Ampere cards like the 3090 are fine too). It's also self-contained: every fragile 2022 research repo it depended on is vendored in-tree under `src/disco_diffusion/vendor/`, so it keeps working even if those upstream repositories disappear. Only model weights are downloaded at runtime.
 
-The 3D, video, turbo, VR and 2D-animation modes from the original have been removed;
-this port focuses on generating still images.
+The 3D, video, turbo, VR and 2D-animation modes from the original are gone; this port only generates still images.
 
 ## Requirements
 
 - `uv`
-- An NVIDIA GPU with recent drivers (CUDA 12.8-capable). CPU works but is extremely
-  slow. On NixOS, the provided `shell.nix` wires up CUDA/Triton.
+- An NVIDIA GPU with recent drivers (CUDA 12.8-capable). CPU works but is extremely slow. On NixOS, the provided `shell.nix` wires up CUDA/Triton.
 
 ## Setup
 
@@ -28,8 +17,7 @@ this port focuses on generating still images.
 uv sync
 ```
 
-This installs PyTorch from the CUDA 12.8 wheel index along with the rest of the
-dependencies. Verify the GPU is visible:
+This installs PyTorch from the CUDA 12.8 wheel index along with everything else. Check that the GPU is visible:
 
 ```sh
 uv run python -c "import torch; print(torch.cuda.get_device_name(0), torch.cuda.is_available())"
@@ -37,9 +25,7 @@ uv run python -c "import torch; print(torch.cuda.get_device_name(0), torch.cuda.
 
 ## Usage
 
-Generate the canonical lighthouse image (faithful defaults — 1280×768, 250 steps,
-ViT-B/32 + ViT-B/16 + RN50, secondary model). This downloads ~2.5 GB of model weights
-into `models/` on first run:
+Generate the canonical lighthouse image with the faithful defaults (1280×768, 250 steps, ViT-B/32 + ViT-B/16 + RN50, secondary model). The first run downloads ~2.5 GB of model weights into `models/`:
 
 ```sh
 uv run disco-diffusion generate
@@ -85,20 +71,11 @@ print(paths)
 
 ## Performance
 
-The default 1280×768 / 250-step run takes **~59 s once warm** on an RTX 5090 — about **2.1×**
-faster than the post-port baseline (~124 s), with no loss of fidelity (output stays within
-the run-to-run noise floor). The speedups come from `torch.compile` (with `max-autotune`),
-batched CLIP guidance, TF32, and a cached resize matrix for the cutouts.
+The default 1280×768 / 250-step run takes about 59 seconds once warm on an RTX 5090, down from ~124 seconds right after the port. That's roughly 2.1× faster with no visible change to the output, since it stays within the run-to-run noise floor. The speedups come from `torch.compile` (with `max-autotune`), batched CLIP guidance, TF32, and a cached resize matrix for the cutouts.
 
-`torch.compile` is on by default; the first run with a given configuration pays a one-time
-compile/autotune cost (cached on disk under `models/.inductor_cache`), so later runs are
-fast. Pass `--no-compile` to skip it. The optional `--fast`, `--cutn-batches`, and
-`--guidance-every` levers trade a measured amount of fidelity for more speed (all off by
-default — the default stays faithful).
+`torch.compile` is on by default. The first run with a given configuration pays a one-time compile and autotune cost, which is cached on disk under `models/.inductor_cache`, so later runs are fast; pass `--no-compile` to skip it. The optional `--fast`, `--cutn-batches`, and `--guidance-every` levers trade a measured amount of fidelity for more speed, and are all off by default.
 
-See **[PERFORMANCE.md](PERFORMANCE.md)** for the per-optimization breakdown, measured impact
-at each milestone, why ~59 s is the faithful floor (and what was tried and rejected), and the
-opt-in levers.
+See [PERFORMANCE.md](PERFORMANCE.md) for the per-optimization breakdown, the measured impact at each milestone, why ~59 s is the faithful floor (and what got tried and dropped), and the opt-in levers.
 
 ## Development
 
@@ -109,9 +86,6 @@ uv run mypy src
 
 ## Credits & license
 
-Disco Diffusion is the work of many people — see [`CREDITS.md`](CREDITS.md) for the
-full provenance and the licensing of each vendored component. The project is
-MIT-licensed (© 2021 Katherine Crowson); see [`LICENSE`](LICENSE). This port retains
-that license and all original attribution.
+Disco Diffusion is the work of many people; see [`CREDITS.md`](CREDITS.md) for the full provenance and the licensing of each vendored component. The project is MIT-licensed (© 2021 Katherine Crowson); see [`LICENSE`](LICENSE). This port keeps that license and all the original attribution.
 
 [Disco Diffusion]: https://github.com/alembics/disco-diffusion
