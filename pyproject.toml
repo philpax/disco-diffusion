@@ -59,14 +59,21 @@ select = ["E", "F", "I", "UP", "B", "W"]
 python_version = "3.11"
 strict = true
 files = ["src/disco_diffusion"]
+# Relaxations appropriate for a torch-heavy codebase that leans on untyped vendored
+# research code: torch ops and vendored calls routinely surface as Any.
+warn_return_any = false
+disallow_untyped_calls = false
 
-# The vendored 2022 research code is intentionally not held to strict typing.
+# The vendored 2022 research code is intentionally not held to strict typing, and is
+# treated as an opaque (Any) boundary by the typed code that imports it.
 [[tool.mypy.overrides]]
 module = "disco_diffusion.vendor.*"
 ignore_errors = true
+follow_imports = "skip"
 
+# Third-party packages without type stubs / py.typed markers.
 [[tool.mypy.overrides]]
-module = ["lpips.*", "resize_right.*", "clip.*", "guided_diffusion.*"]
+module = ["torchvision.*", "tqdm.*", "lpips.*", "resize_right.*", "clip.*", "guided_diffusion.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
