@@ -399,7 +399,9 @@ class Sampler:
         img_t = self._last["pred_xstart"][0].add(1).div(2).clamp(0, 1).detach().cpu()
         return TF.to_pil_image(img_t)
 
-    def paint(self, rgb01: np.ndarray, alpha01: np.ndarray) -> None:
+    def paint(
+        self, rgb01: np.ndarray, alpha01: np.ndarray, tint01: np.ndarray | None = None
+    ) -> None:
         """Blend painted pixels into the live sample so the next step incorporates them.
 
         ``rgb01`` is an ``(H, W, 3)`` image in ``[0, 1]`` and ``alpha01`` an ``(H, W)`` mask
@@ -408,6 +410,14 @@ class Sampler:
         alpha-blended into ``self._last["sample"]`` **in place** — the vendor loop reads that
         same tensor as the next step's input (``img = out["sample"]``), so the paint sticks
         and is then evolved by the diffusion + CLIP guidance. No-op before the first step.
+
+        ``tint01`` (optional, ``(H, W)`` in ``[0, 1]``) selects a *fresh-noise* mode: the
+        region is replaced with brand-new noise at the current level (``sqrt(1-ᾱ)·randn``, so
+        the model invents new structure there rather than reworking the existing content) with
+        the painted colour as that structure's target. A plain colour stroke imposes the
+        colour only at its physical weight ``sqrt(ᾱ)``, which is ~0 early and gets washed out;
+        ``tint`` boosts that weight toward full strength so the new structure actually takes
+        the colour. tint=0 is the physical renoise; tint=1 imposes the colour fully.
         """
         if self._last is None:
             return
@@ -418,7 +428,11 @@ class Sampler:
         tt = max(0, int(self._cur_t[0]))
         sa = float(self.diffusion.sqrt_alphas_cumprod[tt])
         soma = float(self.diffusion.sqrt_one_minus_alphas_cumprod[tt])
+        # Fresh current-level noise (new structure) with the colour as its clean target.
         noised = sa * paint + soma * torch.randn_like(paint)
+        if tint01 is not None:
+            tint = torch.from_numpy(tint01).to(x.device, x.dtype).unsqueeze(0).unsqueeze(0)
+            noised = noised + tint * (1.0 - sa) * paint  # boost colour weight: sqrt(ᾱ) -> 1
         x.mul_(1 - mask).add_(noised * mask)
 
     def _make_generator(self) -> Any:

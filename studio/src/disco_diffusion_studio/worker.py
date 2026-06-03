@@ -57,7 +57,7 @@ class GenerationWorker(threading.Thread):
 
         self._lock = threading.Lock()
         self._pending: list[tuple[str, float]] | None = None  # prompts awaiting (re)encode
-        self._pending_paint: tuple[np.ndarray, np.ndarray] | None = None  # (rgb, alpha)
+        self._pending_paint: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None
         self._frame: Frame | None = None
         self.finished = False
         self.paint_applied_count = 0  # bumps each time a paint batch is injected
@@ -82,9 +82,9 @@ class GenerationWorker(threading.Thread):
         with self._lock:
             return self._frame
 
-    def set_paint(self, rgb: np.ndarray, alpha: np.ndarray) -> None:
+    def set_paint(self, rgb: np.ndarray, alpha: np.ndarray, tint: np.ndarray) -> None:
         with self._lock:
-            self._pending_paint = (rgb, alpha)
+            self._pending_paint = (rgb, alpha, tint)
 
     def has_pending_paint(self) -> bool:
         with self._lock:
@@ -116,7 +116,7 @@ class GenerationWorker(threading.Thread):
             self._pending_paint = None
         if paint is None:
             return
-        sampler.paint(paint[0], paint[1])  # injects into the current sample, in place
+        sampler.paint(paint[0], paint[1], paint[2])  # injects into the current sample, in place
         self.paint_applied_count += 1
 
     # -- run loop --

@@ -45,6 +45,7 @@ class PaintLayer:
         self.h = height
         self.rgb = np.zeros((height, width, 3), dtype=np.float32)
         self.alpha = np.zeros((height, width), dtype=np.float32)
+        self.tint = np.zeros((height, width), dtype=np.float32)  # per-pixel tinted-noise amount
         self.dirty = False  # new strokes awaiting hand-off to the worker
         self._nonempty = False
         self._surf_dirty = True
@@ -58,6 +59,7 @@ class PaintLayer:
             return
         self.rgb.fill(0.0)
         self.alpha.fill(0.0)
+        self.tint.fill(0.0)
         self._nonempty = False
         self.dirty = False
         self._surf_dirty = True
@@ -70,8 +72,12 @@ class PaintLayer:
         color01: tuple[float, float, float],
         strength: float,
         brush: str,
+        tint: float = 0.0,
     ) -> None:
-        """Composite one brush dab centred at (cx, cy) into the layer."""
+        """Composite one brush dab centred at (cx, cy) into the layer.
+
+        ``tint`` (0..1) marks these pixels for the tinted-noise injection mode.
+        """
         r = max(1, int(round(radius)))
         x0, x1 = max(0, int(cx) - r), min(self.w, int(cx) + r + 1)
         y0, y1 = max(0, int(cy) - r), min(self.h, int(cy) + r + 1)
@@ -88,7 +94,7 @@ class PaintLayer:
         a *= float(strength)
         if not a.any():
             return
-        # Alpha-over composite of `color01` onto the existing sub-region.
+        # Alpha-over composite of `color01` (and the tint flag) onto the existing sub-region.
         sub_rgb = self.rgb[y0:y1, x0:x1]
         sub_a = self.alpha[y0:y1, x0:x1]
         out_a = a + sub_a * (1.0 - a)
@@ -98,6 +104,8 @@ class PaintLayer:
         blended[safe] /= out_a[safe][..., None]
         self.rgb[y0:y1, x0:x1] = blended
         self.alpha[y0:y1, x0:x1] = out_a
+        sub_t = self.tint[y0:y1, x0:x1]
+        self.tint[y0:y1, x0:x1] = float(tint) * a + sub_t * (1.0 - a)
         self._nonempty = True
         self.dirty = True
         self._surf_dirty = True
@@ -110,6 +118,7 @@ class PaintLayer:
         color01: tuple[float, float, float],
         strength: float,
         brush: str,
+        tint: float = 0.0,
     ) -> None:
         """Stamp the brush along the segment p0->p1 so fast drags stay continuous."""
         (x0, y0), (x1, y1) = p0, p1
@@ -118,11 +127,13 @@ class PaintLayer:
         steps = int(dist / spacing) + 1
         for i in range(steps + 1):
             t = i / max(1, steps)
-            self.stamp(x0 + (x1 - x0) * t, y0 + (y1 - y0) * t, radius, color01, strength, brush)
+            self.stamp(
+                x0 + (x1 - x0) * t, y0 + (y1 - y0) * t, radius, color01, strength, brush, tint
+            )
 
-    def snapshot(self) -> tuple[np.ndarray, np.ndarray]:
-        """A copy of (rgb, alpha) to hand to the worker thread."""
-        return self.rgb.copy(), self.alpha.copy()
+    def snapshot(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """A copy of (rgb, alpha, tint) to hand to the worker thread."""
+        return self.rgb.copy(), self.alpha.copy(), self.tint.copy()
 
     def to_surface(self) -> pygame.Surface:
         """A cached RGBA pygame surface of the layer, for the on-canvas overlay."""

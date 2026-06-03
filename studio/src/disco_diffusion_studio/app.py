@@ -107,6 +107,7 @@ class App:
     brush_type: str = "Soft"
     brush_size: float = 48.0  # radius in generation pixels
     brush_strength: float = 0.7
+    noise_mode: bool = False  # paint fresh tinted noise (new structure) vs plain colour
 
     def __post_init__(self) -> None:
         self.width = snap_side(self.width)
@@ -306,6 +307,12 @@ class App:
             self._brush_buttons[button] = name
             if name == self.brush_type:
                 button.select()
+        # Toggle: deposit fresh tinted noise (new structure) instead of plain colour.
+        self.noise_button = ui.UIButton(
+            r.left(74), "Noise", self.manager, object_id="#brush_button"
+        )
+        if self.noise_mode:
+            self.noise_button.select()
         ui.UILabel(r.left(36), "Size", self.manager)
         self.size_slider = ui.UIHorizontalSlider(
             r.left(104), self.brush_size, (4.0, 160.0), self.manager
@@ -663,6 +670,9 @@ class App:
                 self.brush_type = self._brush_buttons[event.ui_element]
                 for button, name in self._brush_buttons.items():
                     (button.select if name == self.brush_type else button.unselect)()
+            elif event.ui_element == self.noise_button:
+                self.noise_mode = not self.noise_mode
+                (self.noise_button.select if self.noise_mode else self.noise_button.unselect)()
             elif event.ui_element == self.clear_paint_button:
                 self._paint_layer.clear()
 
@@ -794,13 +804,20 @@ class App:
             return
         c = self.brush_color
         color01 = (c[0] / 255.0, c[1] / 255.0, c[2] / 255.0)
+        tint = 1.0 if self.noise_mode else 0.0
         if self._last_gen is None:
             self._paint_layer.stamp(
-                gen[0], gen[1], self.brush_size, color01, self.brush_strength, self.brush_type
+                gen[0], gen[1], self.brush_size, color01, self.brush_strength, self.brush_type, tint
             )
         else:
             self._paint_layer.stroke(
-                self._last_gen, gen, self.brush_size, color01, self.brush_strength, self.brush_type
+                self._last_gen,
+                gen,
+                self.brush_size,
+                color01,
+                self.brush_strength,
+                self.brush_type,
+                tint,
             )
         self._last_gen = gen
 

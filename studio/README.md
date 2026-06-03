@@ -29,6 +29,11 @@ the image respond.
   the current step and injected into the live latent, so the painted region pulls the image
   toward your colours/shapes and then evolves with the prompts. Strokes show as an overlay
   until a step bakes them in; **Clear** discards unbaked strokes.
+  - Toggle **Noise** to deposit *fresh tinted noise* instead of plain colour: the region is
+    replaced with new noise at the current level, biased to your colour, so the model invents
+    **new structure** there. This is what you want early on — a plain colour stroke is washed
+    out by the renoise at high noise levels, whereas tinted noise survives and gets resolved
+    into shapes of that colour.
 - **Save** the current frame — opens a file dialog (the frame is frozen when you click, so it
   won't change while you pick a location); a `.png` extension is added if you omit one.
 
