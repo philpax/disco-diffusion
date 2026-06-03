@@ -7,6 +7,8 @@ every step. The image is shown at the top; the panel below holds the controls:
   * a list of prompts, each with a live weight slider (0-2) and a remove button; text applies
     on Enter or when focus leaves the box, and each row shows the normalised mix it contributes
   * width / height (snapped to multiples of 64) and a landscape/portrait flip
+  * painting tools (brush kind/size/opacity + palette) that inject onto the canvas to steer
+    the diffusion — strokes are noised to the current step and blended into the live latent
   * save
 
 Steps are deliberately slow at full quality: each one is an opportunity to retune the prompt
@@ -46,6 +48,7 @@ from .layout import (
     Stack,
     snap_side,
 )
+from .paint import BRUSHES, PALETTE, PaintLayer
 from .theme import (
     DIVIDER,
     IMAGE_BG,
@@ -89,6 +92,11 @@ class App:
     _file_dialog: UIFileDialog | None = None  # open Save dialog, if any
     _save_surface: pygame.Surface | None = None  # frame frozen when Save was clicked
 
+    # painting tools
+    brush_type: str = "Soft"
+    brush_size: float = 48.0  # radius in generation pixels
+    brush_strength: float = 0.7
+
     def __post_init__(self) -> None:
         self.width = snap_side(self.width)
         self.height = snap_side(self.height)
@@ -122,6 +130,20 @@ class App:
         # The prompt entry that last held keyboard focus, so we can auto-apply its text
         # when focus moves away (no need to press Enter).
         self._focused_entry: pygame_gui.elements.UITextEntryLine | None = None
+
+        # Painting state. The paint layer is generation-resolution and persists across runs
+        # (re-created only on a size change); strokes are injected into the latent by the
+        # worker and the overlay clears once a step has baked them.
+        self.brush_color: tuple[int, int, int] = PALETTE[3]
+        self._paint_layer = PaintLayer(self.width, self.height)
+        self._mouse_pos: tuple[int, int] = (0, 0)
+        self._painting = False
+        self._last_gen: tuple[float, float] | None = None
+        self._paint_awaiting_bake = False
+        self._paint_baseline = 0
+        self._brush_buttons: dict[pygame_gui.elements.UIButton, str] = {}
+        self._swatch_rects: list[tuple[pygame.Rect, tuple[int, int, int]]] = []
+        self._color_preview_rect = pygame.Rect(0, 0, 0, 0)
         self._build_ui()
 
     # -- geometry --
@@ -130,6 +152,38 @@ class App:
 
     def _window_size(self) -> tuple[int, int]:
         return (self.win_w, self.win_h)
+
+    def _image_rect(self) -> tuple[pygame.Rect, int, int]:
+        """On-screen rect of the letterboxed image, plus its (gen_w, gen_h)."""
+        region = pygame.Rect(0, 0, self.win_w, self._image_area_h())
+        if self._frame_surface is not None:
+            iw, ih = self._frame_surface.get_size()
+        else:
+            iw, ih = self.width, self.height
+        scale = min(region.width / iw, region.height / ih) if iw and ih else 1.0
+        size = (max(1, int(iw * scale)), max(1, int(ih * scale)))
+        rect = pygame.Rect(0, 0, *size)
+        rect.center = region.center
+        return rect, iw, ih
+
+    def _screen_to_gen(self, pos: tuple[int, int]) -> tuple[float, float] | None:
+        """Map a screen position to generation-pixel coords, or None if off-canvas."""
+        rect, iw, ih = self._image_rect()
+        if not rect.collidepoint(pos):
+            return None
+        return ((pos[0] - rect.x) / rect.width * iw, (pos[1] - rect.y) / rect.height * ih)
+
+    def _build_palette(self, rect: pygame.Rect) -> None:
+        """Lay out the current-colour preview + swatch rects within ``rect`` (drawn custom)."""
+        self._swatch_rects = []
+        self._color_preview_rect = pygame.Rect(rect.x, rect.y, CTRL_H, CTRL_H)
+        x = rect.x + CTRL_H + 10
+        n = len(PALETTE)
+        gap = 4
+        sw = max(10, min(CTRL_H, (rect.right - x - (n - 1) * gap) // n))
+        y = rect.y + (CTRL_H - sw) // 2
+        for i, color in enumerate(PALETTE):
+            self._swatch_rects.append((pygame.Rect(x + i * (sw + gap), y, sw, sw), color))
 
     @property
     def running(self) -> bool:
@@ -169,12 +223,31 @@ class App:
         self.apply_button = ui.UIButton(r.left(96), "Apply size", self.manager)
         self.swap_button = ui.UIButton(r.left(96), "Flip W/H", self.manager)
 
-        # Row 3: status line (fills the width)
+        # Row 3: painting tools — brush kind, size, opacity, palette, clear
+        r = stack.row(CTRL_H)
+        self._brush_buttons = {}
+        for name in BRUSHES:
+            button = ui.UIButton(r.left(64), name, self.manager, object_id="#brush_button")
+            self._brush_buttons[button] = name
+            if name == self.brush_type:
+                button.select()
+        ui.UILabel(r.left(36), "Size", self.manager)
+        self.size_slider = ui.UIHorizontalSlider(
+            r.left(104), self.brush_size, (4.0, 160.0), self.manager
+        )
+        ui.UILabel(r.left(56), "Opacity", self.manager)
+        self.strength_slider = ui.UIHorizontalSlider(
+            r.left(104), self.brush_strength, (0.05, 1.0), self.manager
+        )
+        self.clear_paint_button = ui.UIButton(r.right(64), "Clear", self.manager)
+        self._build_palette(r.fill())  # custom-drawn swatches fill the middle
+
+        # Row 4: status line (fills the width)
         self.status_label = ui.UILabel(
             stack.row(LABEL_H).fill(), "", self.manager, object_id="#status_label"
         )
 
-        # Row 4: prompt list header + add + hint (hint fills the remaining width)
+        # Row 5: prompt list header + add + hint (hint fills the remaining width)
         r = stack.row(LABEL_H)
         ui.UILabel(r.left(90), "PROMPTS", self.manager, object_id="#section_label")
         self.add_button = ui.UIButton(
@@ -317,6 +390,8 @@ class App:
             cache_lock=self._cache_lock,
         )
         self.worker.set_prompts(self._prompt_snapshot())
+        if not self._paint_layer.empty():
+            self._paint_layer.dirty = True  # re-send any standing strokes to the new run
         self.paused = False
         self.worker.start()
         self._status("Generating… (first step compiles kernels if --compile)")
@@ -352,6 +427,9 @@ class App:
         self.height = snap_side(height)
         self.width_entry.set_text(str(self.width))
         self.height_entry.set_text(str(self.height))
+        # The paint layer is generation-resolution, so rebuild it for the new size.
+        self._paint_layer = PaintLayer(self.width, self.height)
+        self._paint_awaiting_bake = False
         self._status(f"Size set to {self.width}x{self.height} - press Play")
 
     def _resize_window(self, w: int, h: int) -> None:
@@ -425,6 +503,21 @@ class App:
             self._pending_size = (event.w, event.h)
             return True
 
+        if event.type == pygame.MOUSEMOTION:
+            self._mouse_pos = event.pos
+            if self._painting:
+                self._paint_to(event.pos)
+            return True
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            if not self._on_swatch(event.pos) and self._screen_to_gen(event.pos) is not None:
+                self._painting = True  # left-drag on the canvas paints
+                self._last_gen = None
+                self._paint_to(event.pos)
+            return True
+        if event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+            self._painting = False
+            self._last_gen = None
+
         if event.type == pygame_gui.UI_BUTTON_PRESSED:
             if event.ui_element == self.play_button:
                 self._toggle_play()
@@ -450,13 +543,24 @@ class App:
                     self.prompts.pop(idx)
                     self._rebuild_prompt_rows()
                     self._push_prompts()
+            elif event.ui_element in self._brush_buttons:
+                self.brush_type = self._brush_buttons[event.ui_element]
+                for button, name in self._brush_buttons.items():
+                    (button.select if name == self.brush_type else button.unselect)()
+            elif event.ui_element == self.clear_paint_button:
+                self._paint_layer.clear()
 
         elif event.type == pygame_gui.UI_HORIZONTAL_SLIDER_MOVED:
-            slider_idx = self._weight_sliders.get(event.ui_element)
-            if slider_idx is not None and 0 <= slider_idx < len(self.prompts):
-                self.prompts[slider_idx].weight = float(event.value)
-                self._refresh_rows()
-                self._push_prompts()
+            if event.ui_element == self.size_slider:
+                self.brush_size = float(event.value)
+            elif event.ui_element == self.strength_slider:
+                self.brush_strength = float(event.value)
+            else:
+                slider_idx = self._weight_sliders.get(event.ui_element)
+                if slider_idx is not None and 0 <= slider_idx < len(self.prompts):
+                    self.prompts[slider_idx].weight = float(event.value)
+                    self._refresh_rows()
+                    self._push_prompts()
 
         elif event.type == pygame_gui.UI_TEXT_ENTRY_FINISHED:
             if event.ui_element == self.steps_entry:
@@ -513,14 +617,71 @@ class App:
         self.screen.fill(WINDOW_BG)
         pygame.draw.rect(self.screen, IMAGE_BG, (0, 0, win_w, img_h))
         pygame.draw.rect(self.screen, PANEL_BG, (0, img_h, win_w, win_h - img_h))
+        rect, _, _ = self._image_rect()
         if self._frame_surface is not None:
-            iw, ih = self._frame_surface.get_size()
-            region = pygame.Rect(0, 0, win_w, img_h)
-            scale = min(region.width / iw, region.height / ih)
-            size = (max(1, int(iw * scale)), max(1, int(ih * scale)))
-            scaled = pygame.transform.smoothscale(self._frame_surface, size)
-            self.screen.blit(scaled, scaled.get_rect(center=region.center))
+            self.screen.blit(pygame.transform.smoothscale(self._frame_surface, rect.size), rect)
+        # Unbaked paint strokes, overlaid in place on the image.
+        if not self._paint_layer.empty():
+            overlay = pygame.transform.smoothscale(self._paint_layer.to_surface(), rect.size)
+            self.screen.blit(overlay, rect)
         pygame.draw.line(self.screen, DIVIDER, (0, img_h), (win_w, img_h))
+
+    def _draw_tools(self) -> None:
+        """Draw the colour palette and the brush-preview ring (over everything else)."""
+        # Palette: current-colour preview + swatches (selected one outlined).
+        pygame.draw.rect(self.screen, self.brush_color, self._color_preview_rect, border_radius=5)
+        pygame.draw.rect(self.screen, DIVIDER, self._color_preview_rect, width=1, border_radius=5)
+        for sr, color in self._swatch_rects:
+            pygame.draw.rect(self.screen, color, sr, border_radius=4)
+            if color == self.brush_color:
+                pygame.draw.rect(self.screen, (255, 255, 255), sr, width=2, border_radius=4)
+        # Brush ring: shown while the cursor is over the canvas.
+        rect, iw, _ = self._image_rect()
+        if rect.collidepoint(self._mouse_pos) and iw:
+            ring = max(2, int(self.brush_size * rect.width / iw))
+            pygame.draw.circle(self.screen, self.brush_color, self._mouse_pos, ring, 2)
+            pygame.draw.circle(self.screen, (255, 255, 255), self._mouse_pos, ring + 1, 1)
+
+    # -- painting --
+    def _on_swatch(self, pos: tuple[int, int]) -> bool:
+        for sr, color in self._swatch_rects:
+            if sr.collidepoint(pos):
+                self.brush_color = color
+                return True
+        return False
+
+    def _paint_to(self, pos: tuple[int, int]) -> None:
+        gen = self._screen_to_gen(pos)
+        if gen is None:
+            return
+        c = self.brush_color
+        color01 = (c[0] / 255.0, c[1] / 255.0, c[2] / 255.0)
+        if self._last_gen is None:
+            self._paint_layer.stamp(
+                gen[0], gen[1], self.brush_size, color01, self.brush_strength, self.brush_type
+            )
+        else:
+            self._paint_layer.stroke(
+                self._last_gen, gen, self.brush_size, color01, self.brush_strength, self.brush_type
+            )
+        self._last_gen = gen
+
+    def _sync_paint(self) -> None:
+        """Hand new strokes to the worker, and clear the overlay once a step has baked them."""
+        layer = self._paint_layer
+        if layer.dirty and self.worker is not None and self.worker.is_alive():
+            layer.dirty = False
+            self.worker.set_paint(*layer.snapshot())
+            self._paint_awaiting_bake = True
+            self._paint_baseline = self.worker.paint_applied_count
+        # Clear the overlay only when a *published frame* that incorporated the paint arrives —
+        # not merely when the worker started applying it. The injecting step takes seconds, so
+        # clearing on apply would make the stroke vanish before the baked image catches up.
+        if self._paint_awaiting_bake and not self._painting and self.worker is not None:
+            frame = self.worker.latest_frame()
+            if frame is not None and frame.paint_applied > self._paint_baseline:
+                layer.clear()
+                self._paint_awaiting_bake = False
 
     # -- main loop --
     def run(self) -> None:
@@ -543,10 +704,12 @@ class App:
             self._auto_apply_on_blur()
             # Live "edited · Enter" badge while typing (cheap; only mutates on change).
             self._refresh_rows()
+            self._sync_paint()
             self._update_frame_surface()
             self.manager.update(dt)
             self._draw()
             self.manager.draw_ui(self.screen)
+            self._draw_tools()
             pygame.display.flip()
         self._stop_run()
 

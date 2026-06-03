@@ -25,6 +25,7 @@ class Frame:
     image: np.ndarray  # (H, W, 3) uint8
     index: int
     total: int
+    paint_applied: int = 0  # value of paint_applied_count when this frame was produced
 
 
 class GenerationWorker(threading.Thread):
@@ -56,8 +57,10 @@ class GenerationWorker(threading.Thread):
 
         self._lock = threading.Lock()
         self._pending: list[tuple[str, float]] | None = None  # prompts awaiting (re)encode
+        self._pending_paint: tuple[np.ndarray, np.ndarray] | None = None  # (rgb, alpha)
         self._frame: Frame | None = None
         self.finished = False
+        self.paint_applied_count = 0  # bumps each time a paint batch is injected
         self.total = session.diffusion_for(steps).num_timesteps  # skip_steps=0 below
 
     # -- control (called from UI thread) --
@@ -79,6 +82,14 @@ class GenerationWorker(threading.Thread):
         with self._lock:
             return self._frame
 
+    def set_paint(self, rgb: np.ndarray, alpha: np.ndarray) -> None:
+        with self._lock:
+            self._pending_paint = (rgb, alpha)
+
+    def has_pending_paint(self) -> bool:
+        with self._lock:
+            return self._pending_paint is not None
+
     # -- encoding (worker thread) --
     def _encode(self, text: str) -> EncodedPrompt:
         with self._cache_lock:
@@ -99,6 +110,15 @@ class GenerationWorker(threading.Thread):
         items = [(self._encode(t), w) for t, w in pending if t.strip()]
         sampler.set_conditioning(items)
 
+    def _apply_pending_paint(self, sampler: Any) -> None:
+        with self._lock:
+            paint = self._pending_paint
+            self._pending_paint = None
+        if paint is None:
+            return
+        sampler.paint(paint[0], paint[1])  # injects into the current sample, in place
+        self.paint_applied_count += 1
+
     # -- run loop --
     def run(self) -> None:
         # skip_steps=0 so any total-step count >= 1 is valid (no init image to skip toward).
@@ -113,6 +133,7 @@ class GenerationWorker(threading.Thread):
             if self._stop_event.is_set():
                 break
             self._apply_pending(sampler)  # re-mix before computing the step
+            self._apply_pending_paint(sampler)  # inject painted pixels into the live latent
             try:
                 step = next(sampler)
             except StopIteration:
@@ -122,4 +143,6 @@ class GenerationWorker(threading.Thread):
             pil = sampler.current_pil()
             if pil is not None:
                 with self._lock:
-                    self._frame = Frame(np.asarray(pil), step.index, step.total)
+                    self._frame = Frame(
+                        np.asarray(pil), step.index, step.total, self.paint_applied_count
+                    )

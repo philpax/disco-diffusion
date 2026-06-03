@@ -18,10 +18,18 @@ the image respond.
 - **Steps**: set the total step count (while paused/stopped).
 - **Size**: width/height (snapped to multiples of 64) and a landscape/portrait flip. The image
   is letterboxed into the window, so changing it never resizes or re-tiles the window.
+- **Paint** directly onto the canvas to steer the diffusion. Left-drag with a brush (Soft /
+  Hard / Spray), adjustable size and opacity, and a colour palette; a brush-preview ring
+  follows the cursor. Strokes are noised to the current step and injected into the live
+  latent, so the painted region pulls the image toward your colours/shapes and then evolves
+  with the prompts. Strokes show as an overlay until a step bakes them in; **Clear** discards
+  unbaked strokes.
 - **Save** the current frame — opens a file dialog (the frame is frozen when you click, so it
   won't change while you pick a location); a `.png` extension is added if you omit one.
 
 Generation runs on a background thread, so the UI stays responsive while the GPU works.
+
+![painting onto the canvas to steer the diffusion](docs/painting.png)
 
 ## Running
 
@@ -43,6 +51,7 @@ Options: `disco-studio --help` (`--steps`, `--width`, `--height`, `--compile`, `
 src/disco_diffusion_studio/
   app.py      # the App: window, widgets, event loop, run lifecycle
   worker.py   # GenerationWorker: the background thread driving a Sampler
+  paint.py    # brushes, colour palette, and the paintable RGBA layer
   layout.py   # sizing tokens + a tiny flow layout (Row / Stack)
   theme.py    # palette + pygame_gui theme
 ```

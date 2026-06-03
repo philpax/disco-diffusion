@@ -10,7 +10,7 @@ from __future__ import annotations
 import pygame
 
 # Window / image sizing.
-PANEL_H = 360  # height of the control panel below the image
+PANEL_H = 408  # height of the control panel below the image
 MIN_WINDOW_W = 940  # never let the window get narrower than the controls need
 MIN_IMAGE_H = 360  # minimum height of the image region (image is centered within it)
 DEFAULT_W, DEFAULT_H = 1280, 768

@@ -399,6 +399,28 @@ class Sampler:
         img_t = self._last["pred_xstart"][0].add(1).div(2).clamp(0, 1).detach().cpu()
         return TF.to_pil_image(img_t)
 
+    def paint(self, rgb01: np.ndarray, alpha01: np.ndarray) -> None:
+        """Blend painted pixels into the live sample so the next step incorporates them.
+
+        ``rgb01`` is an ``(H, W, 3)`` image in ``[0, 1]`` and ``alpha01`` an ``(H, W)`` mask
+        in ``[0, 1]``, both at the sampler's resolution. The painted RGB is noised to the
+        current timestep (DD works in pixel space, so paint maps 1:1 onto the latent) and
+        alpha-blended into ``self._last["sample"]`` **in place** — the vendor loop reads that
+        same tensor as the next step's input (``img = out["sample"]``), so the paint sticks
+        and is then evolved by the diffusion + CLIP guidance. No-op before the first step.
+        """
+        if self._last is None:
+            return
+        x = self._last["sample"]
+        paint = torch.from_numpy(rgb01).to(x.device, x.dtype).permute(2, 0, 1).unsqueeze(0)
+        paint = paint.mul(2).sub(1)  # [0,1] -> [-1,1]
+        mask = torch.from_numpy(alpha01).to(x.device, x.dtype).unsqueeze(0).unsqueeze(0)
+        tt = max(0, int(self._cur_t[0]))
+        sa = float(self.diffusion.sqrt_alphas_cumprod[tt])
+        soma = float(self.diffusion.sqrt_one_minus_alphas_cumprod[tt])
+        noised = sa * paint + soma * torch.randn_like(paint)
+        x.mul_(1 - mask).add_(noised * mask)
+
     def _make_generator(self) -> Any:
         cfg = self.config
         shape = (1, 3, self.height, self.width)
