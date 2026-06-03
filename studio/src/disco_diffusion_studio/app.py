@@ -22,6 +22,7 @@ import argparse
 import io
 import json
 import logging
+import math
 import threading
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -64,6 +65,15 @@ from .worker import GenerationWorker
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger("disco_diffusion_studio")
+
+MIN_ZOOM, MAX_ZOOM = 0.1, 16.0  # view zoom bounds
+# Help HUD text per interaction mode (hold right mouse = navigate, release = draw).
+DRAW_HELP = (
+    "left-drag: paint · scroll: size · shift+scroll: opacity · hold right: pan/zoom · F: fit"
+)
+NAV_HELP = "right-drag: pan · scroll: zoom · release right: draw · F: fit"
+CANVAS_EMPTY_BG = (18, 20, 26)  # placeholder canvas fill shown before the first frame
+CANVAS_BORDER = (70, 78, 92)
 
 
 # --- app ---------------------------------------------------------------------
@@ -146,7 +156,16 @@ class App:
         self._swatch_rects: list[tuple[pygame.Rect, tuple[int, int, int]]] = []
         self._color_preview_rect = pygame.Rect(0, 0, 0, 0)
         self._list_inner_w = 0  # row width inside the prompt list (set in _build_ui)
+
+        # View transform: the canvas is decoupled from the window, which is just a viewport
+        # onto it. zoom = screen px per canvas px; pan = screen pos of canvas pixel (0, 0).
+        self._zoom = 1.0
+        self._pan = pygame.Vector2(0, 0)
+        self._panning = False
+        self._navigating = False  # right mouse held: canvas-navigation mode (pan + scroll-zoom)
+        self._hud_font = pygame.font.SysFont(None, 19)
         self._build_ui()
+        self._fit_view()
 
     # -- geometry --
     def _image_area_h(self) -> int:
@@ -155,25 +174,79 @@ class App:
     def _window_size(self) -> tuple[int, int]:
         return (self.win_w, self.win_h)
 
-    def _image_rect(self) -> tuple[pygame.Rect, int, int]:
-        """On-screen rect of the letterboxed image, plus its (gen_w, gen_h)."""
-        region = pygame.Rect(0, 0, self.win_w, self._image_area_h())
-        if self._frame_surface is not None:
-            iw, ih = self._frame_surface.get_size()
-        else:
-            iw, ih = self.width, self.height
-        scale = min(region.width / iw, region.height / ih) if iw and ih else 1.0
-        size = (max(1, int(iw * scale)), max(1, int(ih * scale)))
-        rect = pygame.Rect(0, 0, *size)
-        rect.center = region.center
-        return rect, iw, ih
+    def _image_region(self) -> pygame.Rect:
+        """The screen area the canvas viewport occupies (above the panel)."""
+        return pygame.Rect(0, 0, self.win_w, self._image_area_h())
 
-    def _screen_to_gen(self, pos: tuple[int, int]) -> tuple[float, float] | None:
-        """Map a screen position to generation-pixel coords, or None if off-canvas."""
-        rect, iw, ih = self._image_rect()
-        if not rect.collidepoint(pos):
+    def _canvas_size(self) -> tuple[int, int]:
+        return (self.width, self.height)
+
+    def _canvas_screen_rect(self) -> pygame.Rect:
+        """The canvas bounds in screen coords under the current view transform."""
+        w, h = self._canvas_size()
+        return pygame.Rect(
+            int(self._pan.x), int(self._pan.y), int(w * self._zoom), int(h * self._zoom)
+        )
+
+    def _fit_view(self) -> None:
+        """Reset the view so the whole canvas fits the viewport, centred."""
+        region = self._image_region()
+        w, h = self._canvas_size()
+        self._zoom = min(region.width / w, region.height / h) if w and h else 1.0
+        self._pan = pygame.Vector2(
+            region.x + (region.width - w * self._zoom) / 2,
+            region.y + (region.height - h * self._zoom) / 2,
+        )
+
+    def _zoom_at(self, pos: tuple[int, int], factor: float) -> None:
+        """Multiply the zoom by ``factor``, keeping the canvas point under ``pos`` fixed."""
+        new_zoom = max(MIN_ZOOM, min(MAX_ZOOM, self._zoom * factor))
+        ratio = new_zoom / self._zoom
+        anchor = pygame.Vector2(pos)
+        self._pan = anchor - (anchor - self._pan) * ratio
+        self._zoom = new_zoom
+        self._clamp_pan()
+
+    def _clamp_pan(self) -> None:
+        """Keep the canvas centre within the viewport so the canvas can't be lost off-screen."""
+        region = self._image_region()
+        w, h = self._canvas_size()
+        cw, ch = w * self._zoom, h * self._zoom
+        cx = max(region.left, min(region.right, self._pan.x + cw / 2))
+        cy = max(region.top, min(region.bottom, self._pan.y + ch / 2))
+        self._pan = pygame.Vector2(cx - cw / 2, cy - ch / 2)
+
+    def _screen_to_canvas(self, pos: tuple[int, int]) -> tuple[float, float] | None:
+        """Map a screen position to canvas-pixel coords, or None if outside the canvas."""
+        if not self._image_region().collidepoint(pos):
             return None
-        return ((pos[0] - rect.x) / rect.width * iw, (pos[1] - rect.y) / rect.height * ih)
+        cx = (pos[0] - self._pan.x) / self._zoom
+        cy = (pos[1] - self._pan.y) / self._zoom
+        w, h = self._canvas_size()
+        return (cx, cy) if 0 <= cx < w and 0 <= cy < h else None
+
+    def _blit_canvas(self, surf: pygame.Surface) -> None:
+        """Blit only the visible part of a canvas-resolution surface under the view transform."""
+        w, h = surf.get_size()
+        z = self._zoom
+        region = self._image_region()
+        cx0 = max(0, int((region.left - self._pan.x) / z))
+        cy0 = max(0, int((region.top - self._pan.y) / z))
+        cx1 = min(w, math.ceil((region.right - self._pan.x) / z))
+        cy1 = min(h, math.ceil((region.bottom - self._pan.y) / z))
+        if cx1 <= cx0 or cy1 <= cy0:
+            return
+        sub = surf.subsurface(pygame.Rect(cx0, cy0, cx1 - cx0, cy1 - cy0))
+        dest = (max(1, int((cx1 - cx0) * z)), max(1, int((cy1 - cy0) * z)))
+        scaled = pygame.transform.smoothscale(sub, dest)
+        self.screen.blit(scaled, (self._pan.x + cx0 * z, self._pan.y + cy0 * z))
+
+    def _typing(self) -> bool:
+        """True while a text box has keyboard focus (so shortcut keys don't steal input)."""
+        focus = self.manager.get_focus_set()
+        return bool(focus) and any(
+            isinstance(e, pygame_gui.elements.UITextEntryLine) for e in focus
+        )
 
     def _build_palette(self, rect: pygame.Rect) -> None:
         """Lay out the current-colour preview + swatch rects within ``rect`` (drawn custom)."""
@@ -399,7 +472,7 @@ class App:
             self._paint_layer.dirty = True  # re-send any standing strokes to the new run
         self.paused = False
         self.worker.start()
-        self._status("Generating… (first step compiles kernels if --compile)")
+        self._status("Generating…")
         self._sync_enabled()
 
     def _stop_run(self) -> None:
@@ -435,6 +508,10 @@ class App:
         # The paint layer is generation-resolution, so rebuild it for the new size.
         self._paint_layer = PaintLayer(self.width, self.height)
         self._paint_awaiting_bake = False
+        # The canvas changed shape: drop the stale frame and refit the view.
+        self._frame_surface = None
+        self._frame_key = None
+        self._fit_view()
         self._status(f"Size set to {self.width}x{self.height} - press Play")
 
     def _resize_window(self, w: int, h: int) -> None:
@@ -449,6 +526,7 @@ class App:
             self.screen = surface
         self.manager.set_window_resolution((w, h))
         self._build_ui()
+        self._clamp_pan()  # keep the canvas in view after the viewport changed
 
     def _commit_steps(self) -> None:
         try:
@@ -510,18 +588,51 @@ class App:
 
         if event.type == pygame.MOUSEMOTION:
             self._mouse_pos = event.pos
-            if self._painting:
+            if self._panning:
+                self._pan += pygame.Vector2(event.rel)
+                self._clamp_pan()
+            elif self._painting:
                 self._paint_to(event.pos)
             return True
-        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-            if not self._on_swatch(event.pos) and self._screen_to_gen(event.pos) is not None:
-                self._painting = True  # left-drag on the canvas paints
+        if event.type == pygame.MOUSEBUTTONDOWN:
+            on_canvas = self._image_region().collidepoint(event.pos)
+            if event.button == 3 and on_canvas:  # right held = navigate mode (pan + scroll-zoom)
+                self._navigating = True
+                self._panning = True
+                return True
+            if event.button == 2 and on_canvas:  # middle-drag also pans
+                self._panning = True
+                return True
+            if event.button == 1:  # left-drag on the canvas paints
+                if not self._on_swatch(event.pos) and self._screen_to_canvas(event.pos) is not None:
+                    self._painting = True
+                    self._last_gen = None
+                    self._paint_to(event.pos)
+                return True
+        if event.type == pygame.MOUSEBUTTONUP:
+            if event.button == 1:
+                self._painting = False
                 self._last_gen = None
-                self._paint_to(event.pos)
+            elif event.button == 3:
+                self._navigating = False
+                self._panning = False
+            elif event.button == 2:
+                self._panning = False
+        if event.type == pygame.MOUSEWHEEL and self._image_region().collidepoint(self._mouse_pos):
+            if self._navigating:  # canvas mode: wheel zooms toward the cursor
+                self._zoom_at(self._mouse_pos, 1.15**event.y)
+            elif pygame.key.get_mods() & pygame.KMOD_SHIFT:
+                self.brush_strength = max(0.05, min(1.0, self.brush_strength + event.y * 0.05))
+                self.strength_slider.set_current_value(self.brush_strength)
+            else:
+                self.brush_size = max(4.0, min(160.0, self.brush_size * (1.1**event.y)))
+                self.size_slider.set_current_value(self.brush_size)
             return True
-        if event.type == pygame.MOUSEBUTTONUP and event.button == 1:
-            self._painting = False
-            self._last_gen = None
+        if event.type == pygame.KEYDOWN and not self._typing():
+            if event.key == pygame.K_f:
+                self._fit_view()
+            elif event.key == pygame.K_0:
+                self._zoom_at(self._image_region().center, 1.0 / self._zoom)
 
         if event.type == pygame_gui.UI_BUTTON_PRESSED:
             if event.ui_element == self.play_button:
@@ -622,17 +733,27 @@ class App:
         self.screen.fill(WINDOW_BG)
         pygame.draw.rect(self.screen, IMAGE_BG, (0, 0, win_w, img_h))
         pygame.draw.rect(self.screen, PANEL_BG, (0, img_h, win_w, win_h - img_h))
-        rect, _, _ = self._image_rect()
+        # Draw the canvas (and unbaked paint overlay) under the view transform, clipped to
+        # the viewport so a zoomed/panned canvas never spills into the panel.
+        self.screen.set_clip(self._image_region())
+        crect = self._canvas_screen_rect()
         if self._frame_surface is not None:
-            self.screen.blit(pygame.transform.smoothscale(self._frame_surface, rect.size), rect)
-        # Unbaked paint strokes, overlaid in place on the image.
+            self._blit_canvas(self._frame_surface)
+        else:
+            # No frame yet: show the canvas bounds so the size/aspect is clear before Play.
+            pygame.draw.rect(self.screen, CANVAS_EMPTY_BG, crect)
+            label = self._hud_font.render(
+                f"{self.width} × {self.height} — press Play", True, (140, 147, 160)
+            )
+            self.screen.blit(label, label.get_rect(center=crect.center))
         if not self._paint_layer.empty():
-            overlay = pygame.transform.smoothscale(self._paint_layer.to_surface(), rect.size)
-            self.screen.blit(overlay, rect)
+            self._blit_canvas(self._paint_layer.to_surface())
+        pygame.draw.rect(self.screen, CANVAS_BORDER, crect, 1)  # canvas outline at any zoom
+        self.screen.set_clip(None)
         pygame.draw.line(self.screen, DIVIDER, (0, img_h), (win_w, img_h))
 
     def _draw_tools(self) -> None:
-        """Draw the colour palette and the brush-preview ring (over everything else)."""
+        """Draw the colour palette, the brush-preview ring, and the canvas help HUD."""
         # Palette: current-colour preview + swatches (selected one outlined).
         pygame.draw.rect(self.screen, self.brush_color, self._color_preview_rect, border_radius=5)
         pygame.draw.rect(self.screen, DIVIDER, self._color_preview_rect, width=1, border_radius=5)
@@ -640,12 +761,24 @@ class App:
             pygame.draw.rect(self.screen, color, sr, border_radius=4)
             if color == self.brush_color:
                 pygame.draw.rect(self.screen, (255, 255, 255), sr, width=2, border_radius=4)
-        # Brush ring: shown while the cursor is over the canvas.
-        rect, iw, _ = self._image_rect()
-        if rect.collidepoint(self._mouse_pos) and iw:
-            ring = max(2, int(self.brush_size * rect.width / iw))
+        region = self._image_region()
+        # Brush ring (scaled by zoom) — only in draw mode, while the cursor is over the canvas.
+        if not self._navigating and region.collidepoint(self._mouse_pos):
+            ring = max(2, int(self.brush_size * self._zoom))
             pygame.draw.circle(self.screen, self.brush_color, self._mouse_pos, ring, 2)
             pygame.draw.circle(self.screen, (255, 255, 255), self._mouse_pos, ring + 1, 1)
+        # Help HUD in the corner of the canvas (doesn't cost panel height), per mode.
+        text = self._hud_font.render(
+            NAV_HELP if self._navigating else DRAW_HELP, True, (210, 214, 222)
+        )
+        pad = 6
+        chip = pygame.Surface(
+            (text.get_width() + 2 * pad, text.get_height() + 2 * pad), pygame.SRCALPHA
+        )
+        chip.fill((0, 0, 0, 120))
+        pos = (10, region.bottom - chip.get_height() - 10)
+        self.screen.blit(chip, pos)
+        self.screen.blit(text, (pos[0] + pad, pos[1] + pad))
 
     # -- painting --
     def _on_swatch(self, pos: tuple[int, int]) -> bool:
@@ -656,7 +789,7 @@ class App:
         return False
 
     def _paint_to(self, pos: tuple[int, int]) -> None:
-        gen = self._screen_to_gen(pos)
+        gen = self._screen_to_canvas(pos)
         if gen is None:
             return
         c = self.brush_color
