@@ -65,13 +65,39 @@ Images and a JSON settings dump are written to `images_out/<batch_name>/`.
 
 ### Library API
 
+For a one-shot batch run, mirror the CLI with a `RunConfig`:
+
 ```python
-from disco_diffusion.config import RunConfig
-from disco_diffusion.generate import generate
+from disco_diffusion import RunConfig, generate
 
 paths = generate(RunConfig(prompts=["a serene mountain lake at dawn"], steps=100))
 print(paths)
 ```
+
+### External-control API (drive the loop yourself)
+
+`DiscoSession` lets you take the sampling loop apart: load the models once, encode as many
+prompts as you like, then step the loop manually and choose which encoded prompts — and at
+what weights — to apply at *each* step. Encoding is paid once; mixing per step is cheap, so
+you can crossfade, swap, or blend prompts live while the image is forming.
+
+```python
+from disco_diffusion import DiscoSession, RunConfig
+
+session = DiscoSession(RunConfig(compile=False))
+sky = session.encode("a clear blue sky")
+storm = session.encode("a violent thunderstorm")
+
+sampler = session.sampler(width=512, height=512, steps=100, seed=42)
+for step in sampler:                       # one diffusion step per iteration
+    w = step.index / step.total            # crossfade sky -> storm over the run
+    sampler.set_conditioning([(sky, 1 - w), (storm, w)])
+sampler.current_pil().save("out.png")
+```
+
+`set_conditioning` may be called between any two steps; the guidance reads the active mix
+every step. The batch `Generator` is built on exactly these primitives, so both paths share
+one copy of the model-loading and guidance code.
 
 ## Performance
 
