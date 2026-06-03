@@ -99,6 +99,21 @@ sampler.current_pil().save("out.png")
 every step. The batch `Generator` is built on exactly these primitives, so both paths share
 one copy of the model-loading and guidance code.
 
+### Interactive app: Disco Diffusion Studio
+
+[`studio/`](studio/README.md) is a [pygame-ce](https://pyga.me/) + `pygame_gui` desktop app
+built on this external-control API. It shows the image as it forms and lets you add/remove
+prompts, drag per-prompt weight sliders (with a live normalised-mix readout), play/pause/stop,
+set the step count and size, and save — all live, between steps. Full-quality steps are slow
+on purpose, so each one is a window to retune the mix and watch the image respond.
+
+It's a [`uv` workspace](https://docs.astral.sh/uv/concepts/projects/workspaces/) member, so
+it runs straight from the repo root (it shares the library's environment and model weights):
+
+```sh
+uv run disco-studio
+```
+
 ## Performance
 
 The default 1280×768 / 250-step run takes about 59 seconds once warm on an RTX 5090, down from ~124 seconds right after the port. That's roughly 2.1× faster with no visible change to the output, since it stays within the run-to-run noise floor. The speedups come from `torch.compile` (with `max-autotune`), batched CLIP guidance, TF32, and a cached resize matrix for the cutouts.
