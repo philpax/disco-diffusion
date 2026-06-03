@@ -43,6 +43,7 @@ from .layout import (
     MIN_WINDOW_W,
     PAD,
     PANEL_H,
+    PROMPT_LIST_H,
     ROW_PITCH,
     Row,
     Stack,
@@ -144,6 +145,7 @@ class App:
         self._brush_buttons: dict[pygame_gui.elements.UIButton, str] = {}
         self._swatch_rects: list[tuple[pygame.Rect, tuple[int, int, int]]] = []
         self._color_preview_rect = pygame.Rect(0, 0, 0, 0)
+        self._list_inner_w = 0  # row width inside the prompt list (set in _build_ui)
         self._build_ui()
 
     # -- geometry --
@@ -191,7 +193,7 @@ class App:
 
     # -- UI construction --
     def _build_ui(self) -> None:
-        win_w, win_h = self._window_size()
+        win_w, _ = self._window_size()
         self.manager.clear_and_reset()
         self._remove_buttons.clear()
         self._prompt_entries.clear()
@@ -260,9 +262,12 @@ class App:
             object_id="#hint_label",
         )
 
-        # Scrolling prompt list fills the rest of the panel down to the window bottom.
-        list_rect = pygame.Rect(MARGIN, stack.y, win_w - 2 * MARGIN, win_h - PAD - stack.y)
+        # Fixed-height scrolling prompt list (extra rows scroll); keeps the panel compact.
+        list_rect = pygame.Rect(MARGIN, stack.y, win_w - 2 * MARGIN, PROMPT_LIST_H)
         self.prompt_panel = ui.UIScrollingContainer(list_rect, self.manager)
+        # Lay rows out narrower than the viewport so the vertical scrollbar never forces a
+        # horizontal one (a horizontal bar appears only when content is wider than the view).
+        self._list_inner_w = list_rect.width - 24
         self._rebuild_prompt_rows()
         self._sync_enabled()
 
@@ -275,7 +280,7 @@ class App:
         self._weight_sliders.clear()
 
         container = self.prompt_panel
-        inner_w = int(container.get_container().get_size()[0])
+        inner_w = self._list_inner_w
         ui = pygame_gui.elements
         v_pad = (ROW_PITCH - CTRL_H) // 2  # vertically centre widgets in their row pitch
         for i, prompt in enumerate(self.prompts):

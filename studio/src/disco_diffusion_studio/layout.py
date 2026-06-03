@@ -9,20 +9,26 @@ from __future__ import annotations
 
 import pygame
 
-# Window / image sizing.
-PANEL_H = 408  # height of the control panel below the image
-MIN_WINDOW_W = 940  # never let the window get narrower than the controls need
-MIN_IMAGE_H = 360  # minimum height of the image region (image is centered within it)
-DEFAULT_W, DEFAULT_H = 1280, 768
-MAX_SIDE = 1280  # cap each dimension (snapped to x64); the UNet accepts any multiple of 64
-MIN_SIDE = 64
-
 # Layout tokens (sizes only — positions come from the flow layout).
 PAD = 10  # gap between adjacent widgets
 MARGIN = 16  # panel inset from the window edge
 CTRL_H = 32  # height of a control (button / text box)
 LABEL_H = 24  # height of a standalone label line
 ROW_PITCH = 46  # vertical pitch of one prompt row
+
+# The prompt list is a fixed-height scrolling area (shows ~2 rows; more rows scroll), which
+# keeps the control panel compact. The panel height is derived from the rows it contains —
+# 3 control rows (transport / size / tools), 2 label rows (status / prompt header), then the
+# list — so the panel exactly fits its contents and the window isn't taller than it needs.
+PROMPT_LIST_H = 2 * ROW_PITCH + 12
+PANEL_H = PAD + 3 * (CTRL_H + PAD) + 2 * (LABEL_H + PAD) + PROMPT_LIST_H + PAD
+
+# Window / image sizing.
+MIN_WINDOW_W = 940  # never let the window get narrower than the controls need
+MIN_IMAGE_H = 320  # minimum height of the image region (image is centered within it)
+DEFAULT_W, DEFAULT_H = 1280, 768
+MAX_SIDE = 1280  # cap each dimension (snapped to x64); the UNet accepts any multiple of 64
+MIN_SIDE = 64
 
 
 def snap_side(value: int) -> int:
