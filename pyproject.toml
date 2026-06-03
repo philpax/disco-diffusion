@@ -18,6 +18,10 @@ dependencies = [
     "regex>=2024.0",
     "packaging>=23.0",
     "certifi>=2024.0",
+    # torch.compile's Inductor backend needs Triton. On Linux, torch pulls Triton in
+    # automatically; on Windows it does not, so the matching triton-windows wheel must
+    # be installed explicitly (version tracks torch's pinned triton, currently 3.6).
+    "triton-windows>=3.6,<3.7 ; sys_platform == 'win32'",
 ]
 
 [project.scripts]
