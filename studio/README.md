@@ -33,7 +33,9 @@ the image respond.
     replaced with new noise at the current level, biased to your colour, so the model invents
     **new structure** there. This is what you want early on — a plain colour stroke is washed
     out by the renoise at high noise levels, whereas tinted noise survives and gets resolved
-    into shapes of that colour.
+    into shapes of that colour. Opacity is mapped through a gentle curve into a capped range,
+    so the low end is subtle and even a full stroke re-rolls a controlled fraction (the overlay
+    stays full so you can see what you painted). Paint with steps remaining so it can resolve.
 - **Save** the current frame — opens a file dialog (the frame is frozen when you click, so it
   won't change while you pick a location); a `.png` extension is added if you omit one.
 

@@ -28,6 +28,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
+import numpy as np
 import pygame
 import pygame_gui
 from disco_diffusion import DiscoSession, EncodedPrompt, RunConfig
@@ -74,6 +75,12 @@ DRAW_HELP = (
 NAV_HELP = "right-drag: pan · scroll: zoom · release right: draw · F: fit"
 CANVAS_EMPTY_BG = (18, 20, 26)  # placeholder canvas fill shown before the first frame
 CANVAS_BORDER = (70, 78, 92)
+# Noise-mode re-rolls the patch from fresh noise, which is potent, so its opacity is mapped
+# through a gamma curve into a capped injection range: gentle at the low end, and bounded at
+# the top so even a full-opacity stroke re-rolls a controlled fraction rather than wiping the
+# region. injection = NOISE_MAX_INJECT * opacity**gamma. Overlay stays at the raw opacity.
+NOISE_MAX_INJECT = 0.2
+NOISE_OPACITY_GAMMA = 2.0
 
 
 # --- app ---------------------------------------------------------------------
@@ -826,7 +833,13 @@ class App:
         layer = self._paint_layer
         if layer.dirty and self.worker is not None and self.worker.is_alive():
             layer.dirty = False
-            self.worker.set_paint(*layer.snapshot())
+            rgb, alpha, tint = layer.snapshot()
+            # Gamma-shape the *injected* mask for noise-mode pixels (tint/alpha = how much of
+            # the pixel is noise-mode), keeping the on-screen overlay at the raw opacity.
+            frac_noise = np.divide(tint, alpha, out=np.zeros_like(tint), where=alpha > 1e-6)
+            shaped = NOISE_MAX_INJECT * alpha**NOISE_OPACITY_GAMMA
+            alpha = alpha * (1.0 - frac_noise) + shaped * frac_noise
+            self.worker.set_paint(rgb, alpha, tint)
             self._paint_awaiting_bake = True
             self._paint_baseline = self.worker.paint_applied_count
         # Clear the overlay only when a *published frame* that incorporated the paint arrives —
