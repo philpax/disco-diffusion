@@ -11,7 +11,8 @@ the image respond.
 
 ## What you can do
 
-- **Play / Pause / Stop** the diffusion loop; a step counter shows progress.
+- **Play / Pause / Stop** the diffusion loop (Space toggles play/pause); a step counter shows
+  progress.
 - **Prompts**: add/remove rows, each with a live **weight slider (0–2)**. Text applies on
   Enter *or* when you click away; an amber `edited · Enter` badge shows when a box hasn't been
   applied yet. Each row shows the **normalised %** it actually contributes to guidance.

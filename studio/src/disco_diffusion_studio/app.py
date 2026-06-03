@@ -70,9 +70,10 @@ log = logging.getLogger("disco_diffusion_studio")
 MIN_ZOOM, MAX_ZOOM = 0.1, 16.0  # view zoom bounds
 # Help HUD text per interaction mode (hold right mouse = navigate, release = draw).
 DRAW_HELP = (
-    "left-drag: paint · scroll: size · shift+scroll: opacity · hold right: pan/zoom · F: fit"
+    "left-drag: paint · scroll: size · shift+scroll: opacity · hold right: pan/zoom"
+    " · F: fit · space: play/pause"
 )
-NAV_HELP = "right-drag: pan · scroll: zoom · release right: draw · F: fit"
+NAV_HELP = "right-drag: pan · scroll: zoom · release right: draw · F: fit · space: play/pause"
 CANVAS_EMPTY_BG = (18, 20, 26)  # placeholder canvas fill shown before the first frame
 CANVAS_BORDER = (70, 78, 92)
 # Noise-mode re-rolls the patch from fresh noise, which is potent, so its opacity is mapped
@@ -643,7 +644,9 @@ class App:
                 self.size_slider.set_current_value(self.brush_size)
             return True
         if event.type == pygame.KEYDOWN and not self._typing():
-            if event.key == pygame.K_f:
+            if event.key == pygame.K_SPACE:
+                self._toggle_play()
+            elif event.key == pygame.K_f:
                 self._fit_view()
             elif event.key == pygame.K_0:
                 self._zoom_at(self._image_region().center, 1.0 / self._zoom)
