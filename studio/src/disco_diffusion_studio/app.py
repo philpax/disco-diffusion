@@ -62,7 +62,7 @@ from .theme import (
     THEME,
     WINDOW_BG,
 )
-from .worker import GenerationWorker
+from .worker import GenerationWorker, HistoryEntry
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger("disco_diffusion_studio")
@@ -173,6 +173,16 @@ class App:
         self._panning = False
         self._navigating = False  # right mouse held: canvas-navigation mode (pan + scroll-zoom)
         self._hud_font = pygame.font.SysFont(None, 19)
+
+        # Edit history / revert preview. _preview_index None = showing the live frame; an int
+        # = showing that checkpoint's image (non-destructive) until Revert commits it.
+        self._history: list[HistoryEntry] = []
+        self._hist_len = 0
+        self._preview_index: int | None = None
+        self._preview_prompts: list[PromptRow] | None = None  # prompts shown while previewing
+        self._preview_surface: pygame.Surface | None = None
+        self._preview_key: int | None = None
+        self._history_slider_rect = pygame.Rect(0, 0, 10, 10)
         self._build_ui()
         self._fit_view()
 
@@ -271,7 +281,12 @@ class App:
 
     @property
     def running(self) -> bool:
-        return self.worker is not None and self.worker.is_alive() and not self.paused
+        return (
+            self.worker is not None
+            and self.worker.is_alive()
+            and not self.paused
+            and not self.worker.finished
+        )
 
     # -- UI construction --
     def _build_ui(self) -> None:
@@ -332,12 +347,27 @@ class App:
         self.clear_paint_button = ui.UIButton(r.right(64), "Clear", self.manager)
         self._build_palette(r.fill())  # custom-drawn swatches fill the middle
 
-        # Row 4: status line (fills the width)
+        # Row 4: history scrubber — drag to preview an earlier checkpoint, then Revert/Cancel.
+        r = stack.row(CTRL_H)
+        ui.UILabel(r.left(54), "History", self.manager)
+        self.cancel_button = ui.UIButton(r.right(70), "Cancel", self.manager)
+        self.revert_button = ui.UIButton(r.right(70), "Revert", self.manager)
+        self.history_label = ui.UILabel(r.right(150), "live", self.manager)
+        self._history_slider_rect = r.fill()
+        n = len(self._history)
+        self.history_slider = ui.UIHorizontalSlider(
+            self._history_slider_rect,
+            start_value=float(self._preview_index if self._preview_index is not None else n),
+            value_range=(0.0, float(max(n, 1))),
+            manager=self.manager,
+        )
+
+        # Row 5: status line (fills the width)
         self.status_label = ui.UILabel(
             stack.row(LABEL_H).fill(), "", self.manager, object_id="#status_label"
         )
 
-        # Row 5: prompt list header + add + hint (hint fills the remaining width)
+        # Row 6: prompt list header + add + hint (hint fills the remaining width)
         r = stack.row(LABEL_H)
         ui.UILabel(r.left(90), "PROMPTS", self.manager, object_id="#section_label")
         self.add_button = ui.UIButton(
@@ -359,6 +389,10 @@ class App:
         self._rebuild_prompt_rows()
         self._sync_enabled()
 
+    def _displayed_prompts(self) -> list[PromptRow]:
+        """The prompts shown in the rows: a previewed checkpoint's, else the live set."""
+        return self._preview_prompts if self._preview_prompts is not None else self.prompts
+
     def _rebuild_prompt_rows(self) -> None:
         for el in self._row_elements:
             el.kill()
@@ -371,7 +405,8 @@ class App:
         inner_w = self._list_inner_w
         ui = pygame_gui.elements
         v_pad = (ROW_PITCH - CTRL_H) // 2  # vertically centre widgets in their row pitch
-        for i, prompt in enumerate(self.prompts):
+        prompts = self._displayed_prompts()
+        for i, prompt in enumerate(prompts):
             # Pack: [text fills] [slider] [weight readout] [X]. Right-side widgets are taken
             # first so the text entry flexes into whatever width is left.
             r = Row(0, i * ROW_PITCH + v_pad, inner_w, CTRL_H)
@@ -399,9 +434,7 @@ class App:
             prompt._wlabel = wlabel  # type: ignore[attr-defined]  # stash for live updates
             prompt._entry = entry  # type: ignore[attr-defined]
             prompt._label_state = None  # type: ignore[attr-defined]  # last (text, colour) shown
-        container.set_scrollable_area_dimensions(
-            (inner_w, max(len(self.prompts), 1) * ROW_PITCH + 6)
-        )
+        container.set_scrollable_area_dimensions((inner_w, max(len(prompts), 1) * ROW_PITCH + 6))
         self._refresh_rows()
 
     def _refresh_rows(self) -> None:
@@ -413,10 +446,11 @@ class App:
         is the live "not yet applied" signal. Labels are only mutated when their state
         changes, so this is cheap to call every frame.
         """
-        active = [(i, r.weight) for i, r in enumerate(self.prompts) if r.text.strip()]
+        prompts = self._displayed_prompts()
+        active = [(i, r.weight) for i, r in enumerate(prompts) if r.text.strip()]
         total = sum(w for _, w in active)
         shares = {i: w / total for i, w in active} if total > 1e-3 else {}
-        for i, row in enumerate(self.prompts):
+        for i, row in enumerate(prompts):
             wlabel = getattr(row, "_wlabel", None)
             entry = getattr(row, "_entry", None)
             if wlabel is None or entry is None:
@@ -447,7 +481,18 @@ class App:
             self.swap_button,
         ):
             (el.enable if editable else el.disable)()
+        # History controls are usable only while paused/stopped and there's history to scrub.
+        hist_on = editable and len(self._history) > 0
+        for hist_el in (self.history_slider, self.revert_button, self.cancel_button):
+            (hist_el.enable if hist_on else hist_el.disable)()
+        # Prompt rows are read-only while previewing a checkpoint (they show its prompts).
+        prompts_on = self._preview_index is None
+        prompt_widgets = [self.add_button, *self._prompt_entries, *self._weight_sliders]
+        for pw in (*prompt_widgets, *self._remove_buttons):
+            (pw.enable if prompts_on else pw.disable)()
         self.play_button.set_text("Pause" if self.running else "Play")
+        # Can't resume mid-preview — you must Revert or Cancel first.
+        (self.play_button.disable if self._preview_index is not None else self.play_button.enable)()
 
     def _status(self, text: str) -> None:
         self.status_label.set_text(text)
@@ -470,6 +515,7 @@ class App:
         self.prompts[idx].text = entry.get_text()
         self._refresh_rows()
         self._push_prompts()
+        self._request_checkpoint("prompt")
 
     # -- run lifecycle --
     def _start_run(self) -> None:
@@ -485,6 +531,9 @@ class App:
         self.worker.set_prompts(self._prompt_snapshot())
         if not self._paint_layer.empty():
             self._paint_layer.dirty = True  # re-send any standing strokes to the new run
+        self._history = []
+        self._hist_len = 0
+        self._preview_index = None
         self.paused = False
         self.worker.start()
         self._status("Generating…")
@@ -496,13 +545,20 @@ class App:
             self.worker.join(timeout=5.0)
         self.worker = None
         self.paused = False
+        self._history = []
+        self._hist_len = 0
+        self._preview_index = None
         self._sync_enabled()
 
     def _toggle_play(self) -> None:
-        if self.worker is None or not self.worker.is_alive():
-            self._start_run()
+        if self._preview_index is not None:
+            self._status("Revert or Cancel the history preview before resuming")
+            return
+        if self.worker is None or not self.worker.is_alive() or self.worker.finished:
+            self._start_run()  # finished -> Play starts a fresh run (Revert continues a branch)
         elif self.paused:
             self.paused = False
+            self._preview_index = None  # resume from live, drop any history preview
             self.worker.resume()
             self._status("Generating…")
             self._sync_enabled()
@@ -590,6 +646,75 @@ class App:
         self._status(f"Saved {path}")
         log.info("saved %s", path)
 
+    # -- history / revert --
+    def _request_checkpoint(self, label: str) -> None:
+        if self.worker is not None and self.worker.is_alive():
+            self.worker.checkpoint(label)
+
+    def _set_history_label(self) -> None:
+        if self._preview_index is not None and self._preview_index < len(self._history):
+            e = self._history[self._preview_index]
+            text = f"{e.label} {e.index}/{e.total}"
+        else:
+            frame = self.worker.latest_frame() if self.worker is not None else None
+            text = f"live {frame.index}/{frame.total}" if frame is not None else "live"
+        if self.history_label.text != text:  # avoid re-rendering when unchanged
+            self.history_label.set_text(text)
+
+    def _sync_preview_prompts(self) -> None:
+        """Show the previewed checkpoint's prompts in the rows (live set when not previewing)."""
+        want: list[tuple[str, float]] | None = None
+        if self._preview_index is not None and self._preview_index < len(self._history):
+            want = self._history[self._preview_index].prompts
+        cur = (
+            [(p.text, p.weight) for p in self._preview_prompts]
+            if self._preview_prompts is not None
+            else None
+        )
+        if (list(want) if want is not None else None) == cur:
+            return  # already showing the right prompts
+        self._preview_prompts = [PromptRow(t, w) for t, w in want] if want is not None else None
+        self._rebuild_prompt_rows()
+        self._sync_enabled()
+
+    def _refresh_preview_state(self) -> None:
+        """Update the prompt rows, label, and Play gating whenever the preview changes."""
+        self._sync_preview_prompts()
+        self._set_history_label()
+        (self.play_button.disable if self._preview_index is not None else self.play_button.enable)()
+
+    def _rebuild_history_slider(self, n: int) -> None:
+        """Recreate the history slider when the number of checkpoints changes."""
+        self.history_slider.kill()
+        start = float(self._preview_index if self._preview_index is not None else n)
+        self.history_slider = pygame_gui.elements.UIHorizontalSlider(
+            self._history_slider_rect,
+            start_value=start,
+            value_range=(0.0, float(max(n, 1))),
+            manager=self.manager,
+        )
+
+    def _sync_history(self) -> None:
+        """Pull the worker's history each frame; rebuild the slider when it changes length."""
+        self._history = self.worker.get_history() if self.worker is not None else []
+        if len(self._history) != self._hist_len:
+            self._hist_len = len(self._history)
+            if self._preview_index is not None and self._preview_index >= self._hist_len:
+                self._preview_index = None
+            self._rebuild_history_slider(self._hist_len)
+            self._sync_enabled()
+        self._set_history_label()  # keep the live step current as it ticks
+
+    def _displayed_surface(self) -> pygame.Surface | None:
+        """The canvas surface to show: a previewed checkpoint, else the live frame."""
+        if self._preview_index is not None and self._preview_index < len(self._history):
+            entry = self._history[self._preview_index]
+            if self._preview_key != id(entry.preview):
+                self._preview_key = id(entry.preview)
+                self._preview_surface = pygame.surfarray.make_surface(entry.preview.swapaxes(0, 1))
+            return self._preview_surface
+        return self._frame_surface
+
     # -- events --
     def _handle_event(self, event: pygame.event.Event) -> bool:
         if event.type == pygame.QUIT:
@@ -619,7 +744,10 @@ class App:
                 self._panning = True
                 return True
             if event.button == 1:  # left-drag on the canvas paints
-                if not self._on_swatch(event.pos) and self._screen_to_canvas(event.pos) is not None:
+                if self._on_swatch(event.pos):
+                    return True
+                # No painting while previewing history — it would be invisible and unapplied.
+                if self._preview_index is None and self._screen_to_canvas(event.pos) is not None:
                     self._painting = True
                     self._last_gen = None
                     self._paint_to(event.pos)
@@ -663,6 +791,7 @@ class App:
                 self.prompts.append(PromptRow("", 1.0))
                 self._rebuild_prompt_rows()
                 self._push_prompts()
+                self._request_checkpoint("add prompt")
             elif event.ui_element == self.apply_button:
                 self._apply_size(
                     int_or(self.width_entry.get_text(), self.width),
@@ -676,6 +805,7 @@ class App:
                     self.prompts.pop(idx)
                     self._rebuild_prompt_rows()
                     self._push_prompts()
+                    self._request_checkpoint("remove prompt")
             elif event.ui_element in self._brush_buttons:
                 self.brush_type = self._brush_buttons[event.ui_element]
                 for button, name in self._brush_buttons.items():
@@ -685,12 +815,34 @@ class App:
                 (self.noise_button.select if self.noise_mode else self.noise_button.unselect)()
             elif event.ui_element == self.clear_paint_button:
                 self._paint_layer.clear()
+            elif event.ui_element == self.revert_button:
+                if self._preview_index is not None and self.worker is not None:
+                    # Adopt the checkpoint's prompts as the live set, then branch from it.
+                    self.prompts = [
+                        PromptRow(t, w) for t, w in self._history[self._preview_index].prompts
+                    ]
+                    self.worker.seek(self._preview_index)
+                    self._preview_index = None
+                    self._preview_prompts = None
+                    self.history_slider.set_current_value(float(len(self._history)))
+                    self._rebuild_prompt_rows()  # now-live (reverted) prompts
+                    self._push_prompts()  # apply them to the resumed run
+                    self._sync_enabled()  # re-enable prompt editing
+                    self._refresh_preview_state()
+            elif event.ui_element == self.cancel_button:
+                self._preview_index = None
+                self.history_slider.set_current_value(float(len(self._history)))
+                self._refresh_preview_state()
 
         elif event.type == pygame_gui.UI_HORIZONTAL_SLIDER_MOVED:
             if event.ui_element == self.size_slider:
                 self.brush_size = float(event.value)
             elif event.ui_element == self.strength_slider:
                 self.brush_strength = float(event.value)
+            elif event.ui_element == self.history_slider:
+                idx = int(round(event.value))  # rightmost = live; left = older checkpoints
+                self._preview_index = None if idx >= len(self._history) else idx
+                self._refresh_preview_state()
             else:
                 slider_idx = self._weight_sliders.get(event.ui_element)
                 if slider_idx is not None and 0 <= slider_idx < len(self.prompts):
@@ -732,9 +884,6 @@ class App:
         # pygame.surfarray expects (W, H, 3), so swap the first two axes.
         self._frame_surface = pygame.surfarray.make_surface(frame.image.swapaxes(0, 1))
         self.step_label.set_text(f"step {frame.index} / {frame.total}")
-        if self.worker.finished:
-            self._status("Done — Save, or change settings and Play again")
-            self._sync_enabled()
 
     def _auto_apply_on_blur(self) -> None:
         """Apply a prompt text box when keyboard focus leaves it (no Enter needed)."""
@@ -757,8 +906,9 @@ class App:
         # the viewport so a zoomed/panned canvas never spills into the panel.
         self.screen.set_clip(self._image_region())
         crect = self._canvas_screen_rect()
-        if self._frame_surface is not None:
-            self._blit_canvas(self._frame_surface)
+        surface = self._displayed_surface()
+        if surface is not None:
+            self._blit_canvas(surface)
         else:
             # No frame yet: show the canvas bounds so the size/aspect is clear before Play.
             pygame.draw.rect(self.screen, CANVAS_EMPTY_BG, crect)
@@ -766,7 +916,8 @@ class App:
                 f"{self.width} × {self.height} — press Play", True, (140, 147, 160)
             )
             self.screen.blit(label, label.get_rect(center=crect.center))
-        if not self._paint_layer.empty():
+        # Paint overlay only on the live view (hidden while previewing history).
+        if self._preview_index is None and not self._paint_layer.empty():
             self._blit_canvas(self._paint_layer.to_surface())
         pygame.draw.rect(self.screen, CANVAS_BORDER, crect, 1)  # canvas outline at any zoom
         self.screen.set_clip(None)
@@ -782,8 +933,12 @@ class App:
             if color == self.brush_color:
                 pygame.draw.rect(self.screen, (255, 255, 255), sr, width=2, border_radius=4)
         region = self._image_region()
-        # Brush ring (scaled by zoom) — only in draw mode, while the cursor is over the canvas.
-        if not self._navigating and region.collidepoint(self._mouse_pos):
+        # Brush ring (scaled by zoom) — only in draw mode (not navigating, not previewing).
+        if (
+            not self._navigating
+            and self._preview_index is None
+            and region.collidepoint(self._mouse_pos)
+        ):
             ring = max(2, int(self.brush_size * self._zoom))
             pygame.draw.circle(self.screen, self.brush_color, self._mouse_pos, ring, 2)
             pygame.draw.circle(self.screen, (255, 255, 255), self._mouse_pos, ring + 1, 1)
@@ -869,13 +1024,20 @@ class App:
                 w, h = self._pending_size
                 self._pending_size = None
                 self._resize_window(w, h)
-            # Reflect a worker that finished/exited on its own.
-            if self.worker is not None and not self.worker.is_alive() and not self.paused:
+            # When the run finishes (worker idles) or exits unexpectedly, drop to a paused
+            # state so controls/history are usable and the image can still be reverted.
+            wk = self.worker
+            if wk is not None and not self.paused and (wk.finished or not wk.is_alive()):
+                self.paused = True
+                if wk.is_alive():
+                    wk.pause()
+                self._status("Done — scrub History to revert, Save, or Play to start over")
                 self._sync_enabled()
             self._auto_apply_on_blur()
             # Live "edited · Enter" badge while typing (cheap; only mutates on change).
             self._refresh_rows()
             self._sync_paint()
+            self._sync_history()
             self._update_frame_surface()
             self.manager.update(dt)
             self._draw()

@@ -37,6 +37,11 @@ the image respond.
     into shapes of that colour. Opacity is mapped through a gentle curve into a capped range,
     so the low end is subtle and even a full stroke re-rolls a controlled fraction (the overlay
     stays full so you can see what you painted). Paint with steps remaining so it can resolve.
+- **Edit history / revert**: each edit (paint, prompt change) drops a checkpoint. While paused
+  *or after the run finishes*, drag the **History** slider to preview an earlier checkpoint —
+  its image *and* prompts (the prompt list is read-only while scrubbing). **Revert** branches
+  the run from there (resumes from that latent, restores those prompts, and continues forward)
+  or **Cancel** returns to the live state. After finishing, **Play** starts a fresh run.
 - **Save** the current frame — opens a file dialog (the frame is frozen when you click, so it
   won't change while you pick a location); a `.png` extension is added if you omit one.
 

@@ -234,6 +234,8 @@ class DiscoSession:
         init_image: str | Image.Image | torch.Tensor | None = None,
         skip_steps: int | None = None,
         perlin: bool = False,
+        resume_latent: torch.Tensor | None = None,
+        resume_step: int | None = None,
     ) -> Sampler:
         """Build a :class:`Sampler` for a fresh run at the given size/step count.
 
@@ -241,9 +243,30 @@ class DiscoSession:
         models are reused. ``init_image`` may be a path, a PIL image, or an already-built
         ``[1, 3, H, W]`` tensor in ``[-1, 1]``. Pass ``perlin=True`` for a Perlin-noise
         init (ignored when an ``init_image`` is given).
+
+        ``resume_latent``/``resume_step`` (from :meth:`Sampler.state`) continue a run from a
+        saved latent at that internal step instead of starting fresh — the loop picks up
+        there and runs to the end. The latent is fed as pre-scaled noise so the vendor loop
+        reconstructs it exactly. DDIM only (PLMS keeps history the snapshot doesn't carry).
         """
         side_x = (width // 64) * 64
         side_y = (height // 64) * 64
+        if resume_latent is not None and resume_step is not None:
+            diffusion = self.diffusion_for(steps)
+            # Pre-scale so the loop's q_sample(zeros, t, noise) at resume_step yields the latent.
+            soma = max(float(diffusion.sqrt_one_minus_alphas_cumprod[resume_step]), 1e-3)
+            resume_noise = resume_latent.to(self.device, torch.float32) / soma
+            return Sampler(
+                self,
+                width=side_x,
+                height=side_y,
+                steps=steps,
+                seed=seed,
+                init=None,
+                skip_steps=0,
+                resume_noise=resume_noise,
+                resume_step=resume_step,
+            )
         init = self._build_init(side_x, side_y, init_image, perlin)
         return Sampler(
             self,
@@ -303,6 +326,8 @@ class Sampler:
         seed: int | None,
         init: torch.Tensor | None,
         skip_steps: int,
+        resume_noise: torch.Tensor | None = None,
+        resume_step: int | None = None,
     ) -> None:
         self.session = session
         self.config = session.config
@@ -310,9 +335,13 @@ class Sampler:
         self.width = width
         self.height = height
         self.steps = steps
-        self.skip_steps = skip_steps
         self.diffusion = session.diffusion_for(steps)
-        self._init = init
+        num = self.diffusion.num_timesteps
+        # Resuming: start the loop at resume_step fed the (pre-scaled) saved latent; otherwise
+        # a normal fresh run honouring skip_steps.
+        self._resume_noise = resume_noise
+        self.skip_steps = (num - 1 - resume_step) if resume_step is not None else skip_steps
+        self._init = None if resume_noise is not None else init
 
         # Reseeding here would make every batch identical, so it is opt-in: the batch path
         # seeds once and creates each Sampler with seed=None to keep advancing the stream.
@@ -337,9 +366,14 @@ class Sampler:
 
         # cur_t mirrors the batch path: it starts at num_timesteps - skip - 1 and is
         # decremented *after* each yielded step, so cond_fn sees the right index.
-        self._cur_t = [self.diffusion.num_timesteps - self.skip_steps - 1]
-        self.total = self.diffusion.num_timesteps - self.skip_steps
-        self.index = 0
+        self._cur_t = [num - self.skip_steps - 1]
+        if resume_step is not None:
+            # Keep the displayed progress continuous with the original run.
+            self.total = num
+            self.index = num - 1 - resume_step
+        else:
+            self.total = num - self.skip_steps
+            self.index = 0
         self.done = False
         self._last: dict[str, Any] | None = None
         self._gen: Any = None
@@ -399,6 +433,34 @@ class Sampler:
         img_t = self._last["pred_xstart"][0].add(1).div(2).clamp(0, 1).detach().cpu()
         return TF.to_pil_image(img_t)
 
+    @property
+    def has_output(self) -> bool:
+        """True once a step has produced a sample — required before ``paint``/``state``."""
+        return self._last is not None
+
+    def close(self) -> None:
+        """Close the underlying loop generator so its grad-mode context unwinds now.
+
+        The vendor loop suspends inside ``with torch.no_grad():`` at each ``yield``. If an
+        abandoned sampler (e.g. after a revert) is left for the GC, that context can exit on
+        the worker thread mid-``cond_fn`` and corrupt the thread-local autograd state, so we
+        close it deterministically instead.
+        """
+        if self._gen is not None:
+            self._gen.close()
+            self._gen = None
+        self.done = True
+
+    def state(self) -> tuple[torch.Tensor, int] | None:
+        """Snapshot ``(cpu latent, internal step)`` to resume from later (``None`` pre-first-step).
+
+        The latent is the input to the *next* step; pass it back via
+        ``DiscoSession.sampler(resume_latent=..., resume_step=...)`` to continue from here.
+        """
+        if self._last is None:
+            return None
+        return self._last["sample"].detach().cpu().clone(), int(self._cur_t[0])
+
     def paint(
         self, rgb01: np.ndarray, alpha01: np.ndarray, tint01: np.ndarray | None = None
     ) -> None:
@@ -438,10 +500,13 @@ class Sampler:
     def _make_generator(self) -> Any:
         cfg = self.config
         shape = (1, 3, self.height, self.width)
+        # When resuming, the saved (pre-scaled) latent is fed as the loop's noise.
+        noise = self._resume_noise
         if cfg.diffusion_sampling_mode == SamplingMode.ddim:
             return self.diffusion.ddim_sample_loop_progressive(
                 self.session.model,
                 shape,
+                noise=noise,
                 clip_denoised=cfg.clip_denoised,
                 model_kwargs={},
                 cond_fn=self._cond_fn,
@@ -454,6 +519,7 @@ class Sampler:
         return self.diffusion.plms_sample_loop_progressive(
             self.session.model,
             shape,
+            noise=noise,
             clip_denoised=cfg.clip_denoised,
             model_kwargs={},
             cond_fn=self._cond_fn,
@@ -520,6 +586,11 @@ class Sampler:
                 fac = diffusion.sqrt_one_minus_alphas_cumprod[cur_t[0]]
                 x_in = out["pred_xstart"] * fac + x * (1 - fac)
                 x_in_grad = torch.zeros_like(x_in)
+
+            # Defensive: if the autograd graph wasn't built (grad mode disturbed), skip
+            # guidance this step rather than crashing the worker thread.
+            if not x_in.requires_grad:
+                return torch.zeros_like(x)
 
             t_int = int(t.item()) + 1
             overview_n = int(cut_overview[1000 - t_int])

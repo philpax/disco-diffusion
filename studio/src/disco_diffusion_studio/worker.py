@@ -1,21 +1,24 @@
 """Background generation thread that drives a Disco Diffusion Sampler.
 
 All torch/CUDA work — encoding prompts, stepping the sampler, converting frames — happens
-on this one thread. The UI thread only reads the latest published :class:`Frame` and toggles
-the pause / stop / pending-prompts flags.
+on this one thread. The UI thread only reads the latest published :class:`Frame`, the edit
+history, and toggles the pause / stop / pending flags.
 """
 
 from __future__ import annotations
 
 import logging
 import threading
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
 from disco_diffusion import DiscoSession, EncodedPrompt
 
 log = logging.getLogger("disco_diffusion_studio.worker")
+
+MAX_HISTORY = 60  # cap on edit-history checkpoints (each holds a CPU latent)
 
 
 @dataclass
@@ -28,8 +31,21 @@ class Frame:
     paint_applied: int = 0  # value of paint_applied_count when this frame was produced
 
 
+@dataclass
+class HistoryEntry:
+    """A revertible checkpoint: the latent to resume from, plus a preview + label."""
+
+    latent: Any  # CPU torch tensor (the sampler's latent at `step`)
+    step: int  # internal diffusion step the latent belongs to
+    index: int  # display step index when captured
+    total: int
+    preview: np.ndarray  # (H, W, 3) uint8 — the image at this checkpoint
+    label: str
+    prompts: list[tuple[str, float]] = field(default_factory=list)  # (text, weight) at capture
+
+
 class GenerationWorker(threading.Thread):
-    """Drives one Sampler run on a background thread."""
+    """Drives a Sampler on a background thread, with a revertible edit history."""
 
     def __init__(
         self,
@@ -58,7 +74,14 @@ class GenerationWorker(threading.Thread):
         self._lock = threading.Lock()
         self._pending: list[tuple[str, float]] | None = None  # prompts awaiting (re)encode
         self._pending_paint: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None
+        self._pending_seek: int | None = None  # history index to revert to
+        self._checkpoint_label: str | None = None  # request a checkpoint before the next step
         self._frame: Frame | None = None
+        self._sampler: Any = None
+        self._last_items: list[tuple[EncodedPrompt, float]] = []  # conditioning to re-apply
+        self._last_prompts: list[tuple[str, float]] = []  # (text, weight) shown in the UI
+        self.history: list[HistoryEntry] = []
+        self._started_history = False
         self.finished = False
         self.paint_applied_count = 0  # bumps each time a paint batch is injected
         self.total = session.diffusion_for(steps).num_timesteps  # skip_steps=0 below
@@ -76,7 +99,7 @@ class GenerationWorker(threading.Thread):
 
     def stop(self) -> None:
         self._stop_event.set()
-        self._resume.set()  # unblock if paused so the thread can exit
+        self._resume.set()
 
     def latest_frame(self) -> Frame | None:
         with self._lock:
@@ -90,6 +113,20 @@ class GenerationWorker(threading.Thread):
         with self._lock:
             return self._pending_paint is not None
 
+    def checkpoint(self, label: str) -> None:
+        """Request an edit checkpoint (captured before the next step)."""
+        with self._lock:
+            self._checkpoint_label = label
+
+    def seek(self, index: int) -> None:
+        """Revert to history[index] — resume the run from that checkpoint's latent."""
+        with self._lock:
+            self._pending_seek = index
+
+    def get_history(self) -> list[HistoryEntry]:
+        with self._lock:
+            return list(self.history)
+
     # -- encoding (worker thread) --
     def _encode(self, text: str) -> EncodedPrompt:
         with self._cache_lock:
@@ -101,48 +138,117 @@ class GenerationWorker(threading.Thread):
             self._encode_cache[text] = encoded
         return encoded
 
-    def _apply_pending(self, sampler: Any) -> None:
+    def _apply_pending(self) -> None:
         with self._lock:
             pending = self._pending
             self._pending = None
         if pending is None:
             return
-        items = [(self._encode(t), w) for t, w in pending if t.strip()]
-        sampler.set_conditioning(items)
+        self._last_prompts = list(pending)
+        self._last_items = [(self._encode(t), w) for t, w in pending if t.strip()]
+        self._sampler.set_conditioning(self._last_items)
 
-    def _apply_pending_paint(self, sampler: Any) -> None:
+    def _apply_pending_paint(self) -> None:
+        # Needs a stepped latent to inject into; just after a revert there isn't one yet, so
+        # keep the paint pending (don't drop it) until the resumed sampler has produced a step.
+        if not self._sampler.has_output:
+            return
         with self._lock:
             paint = self._pending_paint
             self._pending_paint = None
         if paint is None:
             return
-        sampler.paint(paint[0], paint[1], paint[2])  # injects into the current sample, in place
+        self._sampler.paint(paint[0], paint[1], paint[2])  # injects into the sample, in place
         self.paint_applied_count += 1
+
+    def _add_checkpoint(self, label: str) -> None:
+        state = self._sampler.state()
+        pil = self._sampler.current_pil()
+        if state is None or pil is None:
+            return
+        latent, step = state
+        entry = HistoryEntry(
+            latent=latent,
+            step=step,
+            index=self._sampler.index,
+            total=self._sampler.total,
+            preview=np.asarray(pil),
+            label=label,
+            prompts=list(self._last_prompts),
+        )
+        with self._lock:
+            self.history.append(entry)
+            if len(self.history) > MAX_HISTORY:
+                self.history.pop(0)
+
+    def _process_seek(self) -> None:
+        """If a revert is pending, rebuild the sampler resuming from that checkpoint."""
+        with self._lock:
+            index = self._pending_seek
+            self._pending_seek = None
+        if index is None or not (0 <= index < len(self.history)):
+            return
+        entry = self.history[index]
+        if self._sampler is not None:
+            self._sampler.close()  # unwind the abandoned loop's grad context deterministically
+        self._sampler = self._session.sampler(
+            width=self._width,
+            height=self._height,
+            steps=self._steps,
+            resume_latent=entry.latent,
+            resume_step=entry.step,
+        )
+        self._sampler.set_conditioning(self._last_items)
+        self.total = self._sampler.total
+        self.finished = False
+        with self._lock:
+            del self.history[index + 1 :]  # branched: drop the abandoned future
+            self._frame = Frame(entry.preview, entry.index, entry.total, self.paint_applied_count)
+        log.info("reverted to '%s' (step %d/%d)", entry.label, entry.index, entry.total)
 
     # -- run loop --
     def run(self) -> None:
         # skip_steps=0 so any total-step count >= 1 is valid (no init image to skip toward).
-        sampler = self._session.sampler(
+        self._sampler = self._session.sampler(
             width=self._width, height=self._height, steps=self._steps, seed=None, skip_steps=0
         )
-        self.total = sampler.total
-        log.info("worker started: %dx%d, %d steps", self._width, self._height, sampler.total)
+        self.total = self._sampler.total
+        log.info("worker started: %dx%d, %d steps", self._width, self._height, self.total)
 
-        while not self._stop_event.is_set():
-            self._resume.wait()  # blocks while paused
-            if self._stop_event.is_set():
-                break
-            self._apply_pending(sampler)  # re-mix before computing the step
-            self._apply_pending_paint(sampler)  # inject painted pixels into the live latent
-            try:
-                step = next(sampler)
-            except StopIteration:
-                self.finished = True
-                log.info("worker finished")
-                break
-            pil = sampler.current_pil()
-            if pil is not None:
+        try:
+            while not self._stop_event.is_set():
+                self._process_seek()  # revert works while paused, playing, or finished
+                if self.finished or not self._resume.is_set():
+                    time.sleep(0.03)  # idle (done/paused) but stay responsive to seek/stop
+                    continue
+                # Checkpoint the pre-edit state before applying paint or a flagged prompt edit.
                 with self._lock:
-                    self._frame = Frame(
-                        np.asarray(pil), step.index, step.total, self.paint_applied_count
-                    )
+                    label = self._checkpoint_label
+                    self._checkpoint_label = None
+                    has_paint = self._pending_paint is not None
+                if label is not None or has_paint:
+                    self._add_checkpoint(label or "paint")
+
+                self._apply_pending()  # re-mix conditioning
+                self._apply_pending_paint()  # inject painted pixels
+                try:
+                    step = next(self._sampler)
+                except StopIteration:
+                    self.finished = True  # idle (don't exit) so reverts can still resume it
+                    log.info("worker finished")
+                    continue
+                if not self._started_history:  # baseline checkpoint after the first step
+                    self._started_history = True
+                    self._add_checkpoint("start")
+                pil = self._sampler.current_pil()
+                if pil is not None:
+                    with self._lock:
+                        self._frame = Frame(
+                            np.asarray(pil), step.index, step.total, self.paint_applied_count
+                        )
+        except Exception:  # don't die silently and freeze the UI — log and stop the run
+            log.exception("generation step failed; stopping")
+            self.finished = True
+        finally:
+            if self._sampler is not None:
+                self._sampler.close()  # unwind the loop's grad context on this thread

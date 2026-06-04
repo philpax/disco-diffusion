@@ -18,10 +18,11 @@ ROW_PITCH = 46  # vertical pitch of one prompt row
 
 # The prompt list is a fixed-height scrolling area (shows ~2 rows; more rows scroll), which
 # keeps the control panel compact. The panel height is derived from the rows it contains —
-# 3 control rows (transport / size / tools), 2 label rows (status / prompt header), then the
-# list — so the panel exactly fits its contents and the window isn't taller than it needs.
+# 4 control rows (transport / size / tools / history), 2 label rows (status / prompt header),
+# then the list — so the panel exactly fits its contents and the window isn't taller than it
+# needs.
 PROMPT_LIST_H = 2 * ROW_PITCH + 12
-PANEL_H = PAD + 3 * (CTRL_H + PAD) + 2 * (LABEL_H + PAD) + PROMPT_LIST_H + PAD
+PANEL_H = PAD + 4 * (CTRL_H + PAD) + 2 * (LABEL_H + PAD) + PROMPT_LIST_H + PAD
 
 # Window / image sizing.
 MIN_WINDOW_W = 940  # never let the window get narrower than the controls need
