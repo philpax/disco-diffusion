@@ -28,6 +28,7 @@ import threading
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pygame
@@ -107,20 +108,46 @@ SCHEDULES: list[tuple[str, str]] = [
     ("cut_icgray_p", "IC grey prob"),
 ]
 
-# One-click fills for the schedule boxes. "Default" is the port's faithful schedule; "2022
-# sauce" is the high-detail, hard composition->detail handoff (ic_pow 15) from the archive.
-SCHEDULE_PRESETS: dict[str, dict[str, str]] = {
+# One-click full-recipe presets. "config" holds every config-only knob (the sliders +
+# eta/perlin + the four schedules); "clip_models"/"use_secondary_model" stage the model set
+# (applied on Reload). "Default" is the port's faithful recipe; "2022 sauce" is the
+# high-detail, heavily-regularised, multi-CLIP look from the archive (ic_pow 15, six models).
+PRESETS: dict[str, dict[str, Any]] = {
     "Default": {
-        "cut_overview": "[12]*400+[4]*600",
-        "cut_innercut": "[4]*400+[12]*600",
-        "cut_ic_pow": "[1]*1000",
-        "cut_icgray_p": "[0.2]*400+[0]*600",
+        "config": {
+            "clip_guidance_scale": 5000,
+            "tv_scale": 0.0,
+            "range_scale": 150.0,
+            "sat_scale": 0.0,
+            "clamp_max": 0.05,
+            "cutn_batches": 4,
+            "eta": 0.8,
+            "perlin_init": False,
+            "cut_overview": "[12]*400+[4]*600",
+            "cut_innercut": "[4]*400+[12]*600",
+            "cut_ic_pow": "[1]*1000",
+            "cut_icgray_p": "[0.2]*400+[0]*600",
+        },
+        "clip_models": ["ViT-B/32", "ViT-B/16", "RN50"],
+        "use_secondary_model": True,
     },
     "2022 sauce": {
-        "cut_overview": "[18]*200+[14]*200+[4]*400+[2]*200",
-        "cut_innercut": "[2]*200+[6]*200+[8]*400+[18]*200",
-        "cut_ic_pow": "[15]*1000",
-        "cut_icgray_p": "[0.2]*200+[0.1]*200+[0.1]*200+[0.1]*200+[0.1]*200",
+        "config": {
+            "clip_guidance_scale": 15000,
+            "tv_scale": 250000.0,
+            "range_scale": 10000.0,
+            "sat_scale": 50000.0,
+            "clamp_max": 0.09,
+            "cutn_batches": 1,
+            "eta": 0.8,
+            "perlin_init": True,
+            "cut_overview": "[18]*200+[14]*200+[4]*400+[2]*200",
+            "cut_innercut": "[2]*200+[6]*200+[8]*400+[18]*200",
+            "cut_ic_pow": "[15]*1000",
+            "cut_icgray_p": "[0.2]*200+[0.1]*200+[0.1]*200+[0.1]*200+[0.1]*200",
+        },
+        "clip_models": ["ViT-B/32", "ViT-B/16", "ViT-L/14", "RN101", "RN50", "RN50x4"],
+        "use_secondary_model": False,
     },
 }
 
@@ -605,7 +632,7 @@ class App:
         # Cut-schedule presets + raw schedule-string boxes.
         r = Row(0, y, inner_w, CTRL_H)
         ui.UILabel(r.left(54), "Preset", self.manager, container=container)
-        for name in SCHEDULE_PRESETS:
+        for name in PRESETS:
             button = ui.UIButton(r.left(110), name, self.manager, container=container)
             self._preset_buttons[button] = name
         y += pitch
@@ -698,16 +725,39 @@ class App:
         setattr(self.session.config, attr, text)
         self._status(f"{attr} set — applies on next Play")
 
-    def _apply_schedule_preset(self, name: str) -> None:
-        """Fill the schedule boxes (and config) from a named preset."""
-        preset = SCHEDULE_PRESETS.get(name)
+    def _refresh_advanced_widgets(self) -> None:
+        """Re-sync every Advanced widget from the current config (after a preset load)."""
+        cfg = self.session.config
+        for slider, (attr, _is_int, vlabel, fmt) in self._scale_sliders.items():
+            value = float(getattr(cfg, attr))
+            slider.set_current_value(value)
+            vlabel.set_text(fmt.format(value))
+        self._eta_slider.set_current_value(min(max(float(cfg.eta), 0.0), 1.0))
+        self._eta_label.set_text(f"{cfg.eta:.2f}")
+        (self.perlin_button.select if cfg.perlin_init else self.perlin_button.unselect)()
+        for entry, attr in self._schedule_entries.items():
+            entry.set_text(str(getattr(cfg, attr)))
+
+    def _apply_preset(self, name: str) -> None:
+        """Load a full-recipe preset: config-only knobs apply now; models are staged for Reload."""
+        preset = PRESETS.get(name)
         if preset is None:
             return
-        for entry, attr in self._schedule_entries.items():
-            if attr in preset:
-                setattr(self.session.config, attr, preset[attr])
-                entry.set_text(preset[attr])
-        self._status(f"Loaded '{name}' cut schedules — press Play to apply")
+        cfg = self.session.config
+        for attr, value in preset["config"].items():
+            setattr(cfg, attr, value)
+        self._refresh_advanced_widgets()
+        # Stage the model set (CLIP + secondary) — these only take effect on Reload.
+        self._clip_selected = set(preset["clip_models"])
+        self._secondary_on = preset["use_secondary_model"]
+        for button, mname in self._clip_buttons.items():
+            (button.select if mname in self._clip_selected else button.unselect)()
+        (self.secondary_button.select if self._secondary_on else self.secondary_button.unselect)()
+        models_match = set(self._clip_selected) == set(cfg.clip_models) and (
+            self._secondary_on == cfg.use_secondary_model
+        )
+        tail = "press Play" if models_match else "press Reload for models, then Play"
+        self._status(f"Loaded '{name}' — {tail}")
 
     def _toggle_clip_model(self, button: pygame_gui.elements.UIButton) -> None:
         """Stage a CLIP model in/out of the pending selection (applied on Reload)."""
@@ -1117,7 +1167,7 @@ class App:
                 self._active_tab = "prompts" if event.ui_element == self.tab_prompts else "advanced"
                 self._sync_tabs()
             elif event.ui_element in self._preset_buttons:
-                self._apply_schedule_preset(self._preset_buttons[event.ui_element])
+                self._apply_preset(self._preset_buttons[event.ui_element])
             elif event.ui_element == self.perlin_button:
                 self.session.config.perlin_init = not self.session.config.perlin_init
                 on = self.session.config.perlin_init

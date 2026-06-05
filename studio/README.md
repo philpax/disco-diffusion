@@ -23,10 +23,13 @@ the image respond.
   so dragging one retunes the run on the next step (no restart) — and seeds the next run when
   stopped. Higher CLIP guidance = stronger prompt adherence; TV/range/sat are the regularisers
   that keep detail from turning to mush.
-- **Advanced — cut schedules**: raw schedule strings for `cut_overview` / `cut_innercut` /
-  `cut_ic_pow` / `cut_icgray_p` (e.g. `[12]*400+[4]*600`), plus one-click **presets**
-  (`Default`, `2022 sauce`). These are snapshotted when a run starts, so they **apply on the
-  next Play**. Edits are validated (and must cover the 1000-step timeline) before they take —
+- **Advanced — cut schedules + presets**: raw schedule strings for `cut_overview` /
+  `cut_innercut` / `cut_ic_pow` / `cut_icgray_p` (e.g. `[12]*400+[4]*600`), plus one-click
+  **full-recipe presets** (`Default`, `2022 sauce`). A preset sets *everything* — the guidance
+  sliders, eta/Perlin, and all four schedules at once — and stages its CLIP model set +
+  secondary toggle (press **Reload** to actually load those). The schedules are snapshotted
+  when a run starts, so they **apply on the next Play**. Edits are validated (and must cover
+  the 1000-step timeline) before they take —
   a malformed or too-short schedule is rejected and the previous value kept. `cut_ic_pow` is
   the detail knob (higher = more fine texture); overview vs inner cuts trade global
   composition for local detail across the run.
