@@ -23,6 +23,7 @@ import io
 import json
 import logging
 import math
+import os
 import threading
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -1110,6 +1111,12 @@ def main() -> None:
     ap.add_argument("--out", type=Path, default=Path("images_out"), help="Where Save writes PNGs.")
     args = ap.parse_args()
 
+    # By default SDL swallows the mouse click that brings an unfocused window to the
+    # foreground: that click only focuses the window and is never delivered to the app, so
+    # the first click on the studio after another window had focus is silently dropped
+    # (buttons highlight on hover but don't fire until a second click). This hint passes that
+    # focusing click through as a normal click. Must be set before the video subsystem inits.
+    os.environ.setdefault("SDL_MOUSE_FOCUS_CLICKTHROUGH", "1")
     pygame.init()
     config = RunConfig(
         compile=args.compile,
