@@ -33,6 +33,7 @@ import numpy as np
 import pygame
 import pygame_gui
 from disco_diffusion import DiscoSession, EncodedPrompt, RunConfig
+from disco_diffusion.config import parse_schedule
 from pygame_gui.core import ObjectID
 from pygame_gui.windows import UIFileDialog
 
@@ -95,6 +96,33 @@ LIVE_SCALES: list[tuple[str, str, float, float, bool, str]] = [
     ("clamp_max", "Clamp max", 0.0, 0.3, False, "{:.3f}"),
     ("cutn_batches", "Cutn batches", 1.0, 8.0, True, "{:.0f}"),
 ]
+
+# Cut-schedule knobs surfaced as raw schedule strings (e.g. "[12]*400+[4]*600"). These are
+# snapshotted when a Sampler is built, so editing them applies on the *next* Play, not live.
+# (config attr, label).
+SCHEDULES: list[tuple[str, str]] = [
+    ("cut_overview", "Overview cuts"),
+    ("cut_innercut", "Inner cuts"),
+    ("cut_ic_pow", "IC power (detail)"),
+    ("cut_icgray_p", "IC grey prob"),
+]
+
+# One-click fills for the schedule boxes. "Default" is the port's faithful schedule; "2022
+# sauce" is the high-detail, hard composition->detail handoff (ic_pow 15) from the archive.
+SCHEDULE_PRESETS: dict[str, dict[str, str]] = {
+    "Default": {
+        "cut_overview": "[12]*400+[4]*600",
+        "cut_innercut": "[4]*400+[12]*600",
+        "cut_ic_pow": "[1]*1000",
+        "cut_icgray_p": "[0.2]*400+[0]*600",
+    },
+    "2022 sauce": {
+        "cut_overview": "[18]*200+[14]*200+[4]*400+[2]*200",
+        "cut_innercut": "[2]*200+[6]*200+[8]*400+[18]*200",
+        "cut_ic_pow": "[15]*1000",
+        "cut_icgray_p": "[0.2]*200+[0.1]*200+[0.1]*200+[0.1]*200+[0.1]*200",
+    },
+}
 
 
 # --- app ---------------------------------------------------------------------
@@ -175,6 +203,11 @@ class App:
             pygame_gui.elements.UIHorizontalSlider,
             tuple[str, bool, pygame_gui.elements.UILabel, str],
         ] = {}
+        # Cut-schedule text boxes -> config attr (validated, applied on next Play).
+        self._schedule_entries: dict[pygame_gui.elements.UITextEntryLine, str] = {}
+        self._preset_buttons: dict[pygame_gui.elements.UIButton, str] = {}
+        # The schedule box that last held focus, so its text is committed on blur (like steps).
+        self._focused_schedule: pygame_gui.elements.UITextEntryLine | None = None
 
         # Painting state. The paint layer is generation-resolution and persists across runs
         # (re-created only on a size change); strokes are injected into the latent by the
@@ -499,19 +532,24 @@ class App:
             wlabel.set_text(text)
 
     def _build_advanced_rows(self) -> None:
-        """Build the Advanced tab: a live slider per guidance scale, seeded from the config.
+        """Build the Advanced tab: live guidance sliders, then per-run cut-schedule boxes.
 
         The container is recreated on every _build_ui, so we just populate it fresh (no kill).
-        Each slider writes straight to ``session.config``; the worker reads it next step.
+        Sliders write straight to ``session.config`` (read live by the worker each step); the
+        schedule boxes are validated and stored on the config, applying on the next Play.
         """
         self._scale_sliders = {}
+        self._schedule_entries = {}
+        self._preset_buttons = {}
         ui = pygame_gui.elements
         container = self.advanced_panel
         inner_w = self._adv_inner_w
         pitch = CTRL_H + 8
         cfg = self.session.config
-        for i, (attr, label_text, lo, hi, is_int, fmt) in enumerate(LIVE_SCALES):
-            r = Row(0, i * pitch + 2, inner_w, CTRL_H)
+
+        y = 2
+        for attr, label_text, lo, hi, is_int, fmt in LIVE_SCALES:
+            r = Row(0, y, inner_w, CTRL_H)
             ui.UILabel(r.left(124), label_text, self.manager, container=container)
             vlabel = ui.UILabel(r.right(84), "", self.manager, container=container)
             cur = float(getattr(cfg, attr))
@@ -524,7 +562,33 @@ class App:
             )
             vlabel.set_text(fmt.format(cur))
             self._scale_sliders[slider] = (attr, is_int, vlabel, fmt)
-        container.set_scrollable_area_dimensions((inner_w, len(LIVE_SCALES) * pitch + 8))
+            y += pitch
+
+        # Cut-schedule section (per-run): a section label, preset buttons, then a box per knob.
+        y += 6
+        ui.UILabel(
+            Row(0, y, inner_w, LABEL_H).fill(),
+            "Cut schedules — apply on next Play",
+            self.manager,
+            container=container,
+            object_id="#section_label",
+        )
+        y += LABEL_H + 6
+        r = Row(0, y, inner_w, CTRL_H)
+        ui.UILabel(r.left(54), "Preset", self.manager, container=container)
+        for name in SCHEDULE_PRESETS:
+            button = ui.UIButton(r.left(110), name, self.manager, container=container)
+            self._preset_buttons[button] = name
+        y += pitch
+        for attr, label_text in SCHEDULES:
+            r = Row(0, y, inner_w, CTRL_H)
+            ui.UILabel(r.left(124), label_text, self.manager, container=container)
+            entry = ui.UITextEntryLine(r.fill(), self.manager, container=container)
+            entry.set_text(str(getattr(cfg, attr)))
+            self._schedule_entries[entry] = attr
+            y += pitch
+
+        container.set_scrollable_area_dimensions((inner_w, y + 8))
 
     def _sync_tabs(self) -> None:
         """Show exactly one of the prompt rows / advanced panel for the active tab."""
@@ -537,8 +601,46 @@ class App:
         self.hint_label.set_text(
             "weight 0-2 applies instantly · text applies on Enter or click-away · % = mix used"
             if prompts
-            else "live guidance knobs · drag to retune the run between steps"
+            else "sliders retune live · cut schedules apply on next Play"
         )
+
+    def _commit_schedule_entry(self, entry: pygame_gui.elements.UITextEntryLine) -> None:
+        """Validate a cut-schedule box and store it on the config (applies on next Play).
+
+        Schedules are parsed with the library's own parser; on a malformed string we flag it
+        and restore the previous value rather than letting the worker blow up at run start.
+        """
+        attr = self._schedule_entries.get(entry)
+        if attr is None:
+            return
+        text = entry.get_text().strip()
+        if text == str(getattr(self.session.config, attr)):
+            return
+        try:
+            parsed = parse_schedule(text)
+        except ValueError:
+            self._status(f"Invalid {attr} schedule — keeping previous")
+            entry.set_text(str(getattr(self.session.config, attr)))
+            return
+        # cond_fn indexes these over the full 1000-step internal timeline, so a short schedule
+        # would IndexError mid-run. Require it to cover 1000 (extra entries are harmless).
+        if len(parsed) < 1000:
+            self._status(f"{attr}: schedule must cover 1000 steps (got {len(parsed)})")
+            entry.set_text(str(getattr(self.session.config, attr)))
+            return
+        setattr(self.session.config, attr, text)
+        self._status(f"{attr} set — applies on next Play")
+
+    def _apply_schedule_preset(self, name: str) -> None:
+        """Fill the schedule boxes (and config) from a named preset."""
+        preset = SCHEDULE_PRESETS.get(name)
+        if preset is None:
+            return
+        for entry, attr in self._schedule_entries.items():
+            if attr in preset:
+                setattr(self.session.config, attr, preset[attr])
+                entry.set_text(preset[attr])
+        self._status(f"Loaded '{name}' cut schedules — press Play to apply")
 
     def _sync_enabled(self) -> None:
         """Total-steps + size boxes are editable only when not actively generating."""
@@ -872,6 +974,8 @@ class App:
             elif event.ui_element in (self.tab_prompts, self.tab_advanced):
                 self._active_tab = "prompts" if event.ui_element == self.tab_prompts else "advanced"
                 self._sync_tabs()
+            elif event.ui_element in self._preset_buttons:
+                self._apply_schedule_preset(self._preset_buttons[event.ui_element])
             elif event.ui_element == self.add_button:
                 self.prompts.append(PromptRow("", 1.0))
                 self._rebuild_prompt_rows()
@@ -949,6 +1053,8 @@ class App:
                 pass  # applied via the Apply button
             elif event.ui_element in self._prompt_entries:
                 self._commit_prompt_entry(event.ui_element)
+            elif event.ui_element in self._schedule_entries:
+                self._commit_schedule_entry(event.ui_element)
 
         elif event.type == pygame_gui.UI_FILE_DIALOG_PATH_PICKED:
             if event.ui_element is self._file_dialog:
@@ -994,6 +1100,12 @@ class App:
         if self._steps_focused and not steps_focused:
             self._commit_steps()
         self._steps_focused = steps_focused
+        sched = next((e for e in self._schedule_entries if e in focus), None)
+        if sched is not self._focused_schedule:
+            previous = self._focused_schedule
+            self._focused_schedule = sched
+            if previous is not None and previous.alive():
+                self._commit_schedule_entry(previous)
 
     def _draw(self) -> None:
         win_w, win_h = self._window_size()
