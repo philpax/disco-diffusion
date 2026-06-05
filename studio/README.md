@@ -13,9 +13,16 @@ the image respond.
 
 - **Play / Pause / Stop** the diffusion loop (Space toggles play/pause); a step counter shows
   progress.
+- **Prompts / Advanced tabs**: the panel's lower area switches between the prompt list and an
+  **Advanced** panel of guidance controls (same footprint — no taller window).
 - **Prompts**: add/remove rows, each with a live **weight slider (0–2)**. Text applies on
   Enter *or* when you click away; an amber `edited · Enter` badge shows when a box hasn't been
   applied yet. Each row shows the **normalised %** it actually contributes to guidance.
+- **Advanced — live guidance**: sliders for `clip_guidance_scale`, `tv_scale` (smoothing),
+  `range_scale`, `sat_scale`, `clamp_max`, and `cutn_batches`. These are read **every step**,
+  so dragging one retunes the run on the next step (no restart) — and seeds the next run when
+  stopped. Higher CLIP guidance = stronger prompt adherence; TV/range/sat are the regularisers
+  that keep detail from turning to mush.
 - **Steps**: set the total step count (while paused/stopped).
 - **Size**: width/height (snapped to multiples of 64) and a landscape/portrait flip. The
   canvas (at the chosen size) is shown before you generate, so you can see the aspect — and

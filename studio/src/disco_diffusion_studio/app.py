@@ -84,6 +84,18 @@ CANVAS_BORDER = (70, 78, 92)
 NOISE_MAX_INJECT = 0.2
 NOISE_OPACITY_GAMMA = 2.0
 
+# Live guidance knobs surfaced as sliders on the Advanced tab. Each is read fresh every step
+# by Sampler._cond_fn (it reads session.config directly), so dragging one retunes the run on
+# the next step — no restart needed. (attr, label, min, max, is_int, value format).
+LIVE_SCALES: list[tuple[str, str, float, float, bool, str]] = [
+    ("clip_guidance_scale", "CLIP guidance", 0.0, 30000.0, True, "{:.0f}"),
+    ("tv_scale", "TV / smoothing", 0.0, 300000.0, False, "{:.0f}"),
+    ("range_scale", "Range", 0.0, 20000.0, False, "{:.0f}"),
+    ("sat_scale", "Saturation", 0.0, 100000.0, False, "{:.0f}"),
+    ("clamp_max", "Clamp max", 0.0, 0.3, False, "{:.3f}"),
+    ("cutn_batches", "Cutn batches", 1.0, 8.0, True, "{:.0f}"),
+]
+
 
 # --- app ---------------------------------------------------------------------
 
@@ -154,6 +166,15 @@ class App:
         # Whether the steps box held focus last frame, so we can commit it on blur (mirrors
         # the prompt boxes; without this, typing a value and clicking away wouldn't apply it).
         self._steps_focused = False
+
+        # The prompt-list region is shared by two tabs: the prompt rows and an "Advanced"
+        # panel of guidance controls. Only one is shown at a time (no extra window height).
+        self._active_tab = "prompts"
+        # Live guidance-scale sliders -> (config attr, is_int, value label, value format).
+        self._scale_sliders: dict[
+            pygame_gui.elements.UIHorizontalSlider,
+            tuple[str, bool, pygame_gui.elements.UILabel, str],
+        ] = {}
 
         # Painting state. The paint layer is generation-resolution and persists across runs
         # (re-created only on a size change); strokes are injected into the latent by the
@@ -371,26 +392,29 @@ class App:
             stack.row(LABEL_H).fill(), "", self.manager, object_id="#status_label"
         )
 
-        # Row 6: prompt list header + add + hint (hint fills the remaining width)
+        # Row 6: tab switch (Prompts / Advanced) + add + hint (hint fills the remaining width)
         r = stack.row(LABEL_H)
-        ui.UILabel(r.left(90), "PROMPTS", self.manager, object_id="#section_label")
+        self.tab_prompts = ui.UIButton(r.left(86), "Prompts", self.manager, object_id="#tab_button")
+        self.tab_advanced = ui.UIButton(
+            r.left(86), "Advanced", self.manager, object_id="#tab_button"
+        )
         self.add_button = ui.UIButton(
             r.left(120), "+ Add prompt", self.manager, object_id="#add_button"
         )
-        ui.UILabel(
-            r.fill(),
-            "weight 0-2 applies instantly · text applies on Enter or click-away · % = mix used",
-            self.manager,
-            object_id="#hint_label",
-        )
+        self.hint_label = ui.UILabel(r.fill(), "", self.manager, object_id="#hint_label")
 
-        # Fixed-height scrolling prompt list (extra rows scroll); keeps the panel compact.
+        # Fixed-height scrolling region shared by the two tabs (extra rows scroll); keeps the
+        # panel compact. Both containers occupy the same rect; _sync_tabs shows exactly one.
         list_rect = pygame.Rect(MARGIN, stack.y, win_w - 2 * MARGIN, PROMPT_LIST_H)
         self.prompt_panel = ui.UIScrollingContainer(list_rect, self.manager)
         # Lay rows out narrower than the viewport so the vertical scrollbar never forces a
         # horizontal one (a horizontal bar appears only when content is wider than the view).
         self._list_inner_w = list_rect.width - 24
+        self.advanced_panel = ui.UIScrollingContainer(list_rect, self.manager)
+        self._adv_inner_w = list_rect.width - 24
         self._rebuild_prompt_rows()
+        self._build_advanced_rows()
+        self._sync_tabs()
         self._sync_enabled()
 
     def _displayed_prompts(self) -> list[PromptRow]:
@@ -473,6 +497,48 @@ class App:
             row._label_state = state  # type: ignore[attr-defined]
             wlabel.text_colour = pygame.Color(*colour)
             wlabel.set_text(text)
+
+    def _build_advanced_rows(self) -> None:
+        """Build the Advanced tab: a live slider per guidance scale, seeded from the config.
+
+        The container is recreated on every _build_ui, so we just populate it fresh (no kill).
+        Each slider writes straight to ``session.config``; the worker reads it next step.
+        """
+        self._scale_sliders = {}
+        ui = pygame_gui.elements
+        container = self.advanced_panel
+        inner_w = self._adv_inner_w
+        pitch = CTRL_H + 8
+        cfg = self.session.config
+        for i, (attr, label_text, lo, hi, is_int, fmt) in enumerate(LIVE_SCALES):
+            r = Row(0, i * pitch + 2, inner_w, CTRL_H)
+            ui.UILabel(r.left(124), label_text, self.manager, container=container)
+            vlabel = ui.UILabel(r.right(84), "", self.manager, container=container)
+            cur = float(getattr(cfg, attr))
+            slider = ui.UIHorizontalSlider(
+                r.fill(),
+                start_value=min(max(cur, lo), hi),
+                value_range=(lo, hi),
+                manager=self.manager,
+                container=container,
+            )
+            vlabel.set_text(fmt.format(cur))
+            self._scale_sliders[slider] = (attr, is_int, vlabel, fmt)
+        container.set_scrollable_area_dimensions((inner_w, len(LIVE_SCALES) * pitch + 8))
+
+    def _sync_tabs(self) -> None:
+        """Show exactly one of the prompt rows / advanced panel for the active tab."""
+        prompts = self._active_tab == "prompts"
+        (self.prompt_panel.show if prompts else self.prompt_panel.hide)()
+        (self.advanced_panel.show if not prompts else self.advanced_panel.hide)()
+        (self.add_button.show if prompts else self.add_button.hide)()
+        (self.tab_prompts.select if prompts else self.tab_prompts.unselect)()
+        (self.tab_advanced.select if not prompts else self.tab_advanced.unselect)()
+        self.hint_label.set_text(
+            "weight 0-2 applies instantly · text applies on Enter or click-away · % = mix used"
+            if prompts
+            else "live guidance knobs · drag to retune the run between steps"
+        )
 
     def _sync_enabled(self) -> None:
         """Total-steps + size boxes are editable only when not actively generating."""
@@ -803,6 +869,9 @@ class App:
                 self._status("Stopped")
             elif event.ui_element == self.save_button:
                 self._open_save_dialog()
+            elif event.ui_element in (self.tab_prompts, self.tab_advanced):
+                self._active_tab = "prompts" if event.ui_element == self.tab_prompts else "advanced"
+                self._sync_tabs()
             elif event.ui_element == self.add_button:
                 self.prompts.append(PromptRow("", 1.0))
                 self._rebuild_prompt_rows()
@@ -859,6 +928,13 @@ class App:
                 idx = int(round(event.value))  # rightmost = live; left = older checkpoints
                 self._preview_index = None if idx >= len(self._history) else idx
                 self._refresh_preview_state()
+            elif event.ui_element in self._scale_sliders:
+                attr, is_int, vlabel, fmt = self._scale_sliders[event.ui_element]
+                value: float | int = int(round(event.value)) if is_int else float(event.value)
+                # session.config is the live config the running Sampler reads each step, so
+                # this retunes guidance on the next step (and seeds the next run when stopped).
+                setattr(self.session.config, attr, value)
+                vlabel.set_text(fmt.format(value))
             else:
                 slider_idx = self._weight_sliders.get(event.ui_element)
                 if slider_idx is not None and 0 <= slider_idx < len(self.prompts):
