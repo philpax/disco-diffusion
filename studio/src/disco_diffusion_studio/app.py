@@ -33,7 +33,7 @@ import numpy as np
 import pygame
 import pygame_gui
 from disco_diffusion import DiscoSession, EncodedPrompt, RunConfig
-from disco_diffusion.config import parse_schedule
+from disco_diffusion.config import AVAILABLE_CLIP_MODELS, parse_schedule
 from pygame_gui.core import ObjectID
 from pygame_gui.windows import UIFileDialog
 
@@ -208,6 +208,16 @@ class App:
         self._preset_buttons: dict[pygame_gui.elements.UIButton, str] = {}
         # The schedule box that last held focus, so its text is committed on blur (like steps).
         self._focused_schedule: pygame_gui.elements.UITextEntryLine | None = None
+
+        # Model selection (CLIP set + secondary). Changing these needs a full weight reload,
+        # so the toggles only stage a pending selection; a Reload button rebuilds the session
+        # on a background thread. _clip_selected / _secondary_on are the staged choice.
+        self._clip_buttons: dict[pygame_gui.elements.UIButton, str] = {}
+        self._clip_selected: set[str] = set(self.session.config.clip_models)
+        self._secondary_on: bool = self.session.config.use_secondary_model
+        self._reloading = False
+        self._reload_thread: threading.Thread | None = None
+        self._reload_result: dict[str, object] | None = None
 
         # Painting state. The paint layer is generation-resolution and persists across runs
         # (re-created only on a size change); strokes are injected into the latent by the
@@ -607,6 +617,44 @@ class App:
             self._schedule_entries[entry] = attr
             y += pitch
 
+        # Models section (needs a reload): CLIP toggles, secondary toggle, Reload button.
+        y += 6
+        ui.UILabel(
+            Row(0, y, inner_w, LABEL_H).fill(),
+            "Models — reload to apply",
+            self.manager,
+            container=container,
+            object_id="#section_label",
+        )
+        y += LABEL_H + 6
+        per_row = 3
+        bw = (inner_w - (per_row - 1) * PAD) // per_row
+        for i, name in enumerate(AVAILABLE_CLIP_MODELS):
+            if i % per_row == 0:
+                r = Row(0, y, inner_w, CTRL_H)
+            button = ui.UIButton(
+                r.left(bw), name, self.manager, container=container, object_id="#brush_button"
+            )
+            self._clip_buttons[button] = name
+            if name in self._clip_selected:
+                button.select()
+            if i % per_row == per_row - 1:
+                y += pitch
+        if len(AVAILABLE_CLIP_MODELS) % per_row != 0:
+            y += pitch
+        r = Row(0, y, inner_w, CTRL_H)
+        self.secondary_button = ui.UIButton(
+            r.left(150),
+            "Secondary model",
+            self.manager,
+            container=container,
+            object_id="#brush_button",
+        )
+        if self._secondary_on:
+            self.secondary_button.select()
+        self.reload_button = ui.UIButton(r.right(110), "Reload", self.manager, container=container)
+        y += pitch
+
         container.set_scrollable_area_dimensions((inner_w, y + 8))
 
     def _sync_tabs(self) -> None:
@@ -661,6 +709,77 @@ class App:
                 entry.set_text(preset[attr])
         self._status(f"Loaded '{name}' cut schedules — press Play to apply")
 
+    def _toggle_clip_model(self, button: pygame_gui.elements.UIButton) -> None:
+        """Stage a CLIP model in/out of the pending selection (applied on Reload)."""
+        name = self._clip_buttons[button]
+        if name in self._clip_selected:
+            self._clip_selected.discard(name)
+            button.unselect()
+        else:
+            self._clip_selected.add(name)
+            button.select()
+
+    def _start_reload(self) -> None:
+        """Rebuild the session with the staged CLIP set / secondary toggle on a worker thread.
+
+        Reloading weights takes ~a minute, so it runs off the UI thread; the run loop polls
+        :meth:`_poll_reload` and swaps the session in when it's done. Play stays disabled and
+        the staged selection is locked (via _sync_enabled) until then.
+        """
+        if self._reloading:
+            return
+        selected = [m for m in AVAILABLE_CLIP_MODELS if m in self._clip_selected]
+        if not selected:
+            self._status("Pick at least one CLIP model")
+            return
+        cfg = self.session.config
+        # Order is irrelevant for the CLIP set (guidance sums over all models), so compare as
+        # sets — otherwise a reselection in a different order would look like a change.
+        if set(selected) == set(cfg.clip_models) and self._secondary_on == cfg.use_secondary_model:
+            self._status("Models already loaded — nothing to reload")
+            return
+        self._stop_run()  # the worker holds the old session; tear it down first
+        new_cfg = cfg.model_copy(
+            update={"clip_models": selected, "use_secondary_model": self._secondary_on}
+        )
+        device = self.session.device
+        self._reload_result = None
+        self._reloading = True
+        self._status("Reloading models… (this can take a minute)")
+        self._sync_enabled()
+
+        def work() -> None:
+            try:
+                # Pass the existing device so there's no interactive CPU-fallback prompt.
+                new_session = DiscoSession(new_cfg, device=device)
+                self._reload_result = {"session": new_session}
+            except Exception as exc:  # surfaced on the UI thread by _poll_reload
+                log.exception("model reload failed")
+                self._reload_result = {"error": str(exc)}
+
+        self._reload_thread = threading.Thread(target=work, daemon=True)
+        self._reload_thread.start()
+
+    def _poll_reload(self) -> None:
+        """Swap in a reloaded session once the background reload finishes (called per frame)."""
+        if not self._reloading or self._reload_thread is None or self._reload_thread.is_alive():
+            return
+        self._reloading = False
+        self._reload_thread = None
+        result = self._reload_result
+        self._reload_result = None
+        if result and "session" in result:
+            self.session = result["session"]  # type: ignore[assignment]
+            self._encode_cache.clear()  # embeds came from the old CLIP set — now stale
+            self._clip_selected = set(self.session.config.clip_models)
+            self._secondary_on = self.session.config.use_secondary_model
+            self._status("Models reloaded — press Play")
+        else:
+            err = result.get("error", "unknown error") if result else "unknown error"
+            self._status(f"Reload failed: {err}")
+        self._build_ui()  # rebuild so the advanced controls reflect the (new) session config
+        self._sync_enabled()
+
     def _sync_enabled(self) -> None:
         """Total-steps + size boxes are editable only when not actively generating."""
         editable = not self.running
@@ -682,8 +801,11 @@ class App:
         for pw in (*prompt_widgets, *self._remove_buttons):
             (pw.enable if prompts_on else pw.disable)()
         self.play_button.set_text("Pause" if self.running else "Play")
-        # Can't resume mid-preview — you must Revert or Cancel first.
-        (self.play_button.disable if self._preview_index is not None else self.play_button.enable)()
+        # Can't resume mid-preview or mid-reload — Revert/Cancel, or wait for the reload.
+        play_off = self._preview_index is not None or self._reloading
+        (self.play_button.disable if play_off else self.play_button.enable)()
+        # The Reload button locks while a reload is already in flight.
+        (self.reload_button.disable if self._reloading else self.reload_button.enable)()
 
     def _status(self, text: str) -> None:
         self.status_label.set_text(text)
@@ -1001,6 +1123,17 @@ class App:
                 on = self.session.config.perlin_init
                 (self.perlin_button.select if on else self.perlin_button.unselect)()
                 self._status(f"Perlin init {'on' if on else 'off'} — applies on next Play")
+            elif event.ui_element in self._clip_buttons:
+                self._toggle_clip_model(event.ui_element)
+            elif event.ui_element == self.secondary_button:
+                self._secondary_on = not self._secondary_on
+                (
+                    self.secondary_button.select
+                    if self._secondary_on
+                    else self.secondary_button.unselect
+                )()
+            elif event.ui_element == self.reload_button:
+                self._start_reload()
             elif event.ui_element == self.add_button:
                 self.prompts.append(PromptRow("", 1.0))
                 self._rebuild_prompt_rows()
@@ -1273,6 +1406,7 @@ class App:
                     wk.pause()
                 self._status("Done — scrub History to revert, Save, or Play to start over")
                 self._sync_enabled()
+            self._poll_reload()  # swap in a reloaded session once its background thread finishes
             self._auto_apply_on_blur()
             # Live "edited · Enter" badge while typing (cheap; only mutates on change).
             self._refresh_rows()

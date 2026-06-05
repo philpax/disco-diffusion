@@ -33,6 +33,11 @@ the image respond.
 - **Advanced — eta / Perlin init**: `eta` (DDIM stochasticity, 0 = deterministic) and a
   **Perlin init** toggle that seeds a fresh run from Perlin noise instead of flat gaussian.
   Both are per-run — they take effect on the next Play.
+- **Advanced — models**: toggle the **CLIP model set** (add ViT-L/14, RN50x4, …) and the
+  **secondary model**, then press **Reload**. Reloading rebuilds the session (loads weights,
+  ~a minute; longer if a model still needs downloading) on a **background thread**, so the UI
+  stays responsive — Play and Reload lock until it's ready. More/larger CLIP models = stronger,
+  higher-quality guidance at a real speed cost.
 - **Steps**: set the total step count (while paused/stopped).
 - **Size**: width/height (snapped to multiples of 64) and a landscape/portrait flip. The
   canvas (at the chosen size) is shown before you generate, so you can see the aspect — and
