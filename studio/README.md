@@ -30,6 +30,9 @@ the image respond.
   a malformed or too-short schedule is rejected and the previous value kept. `cut_ic_pow` is
   the detail knob (higher = more fine texture); overview vs inner cuts trade global
   composition for local detail across the run.
+- **Advanced — eta / Perlin init**: `eta` (DDIM stochasticity, 0 = deterministic) and a
+  **Perlin init** toggle that seeds a fresh run from Perlin noise instead of flat gaussian.
+  Both are per-run — they take effect on the next Play.
 - **Steps**: set the total step count (while paused/stopped).
 - **Size**: width/height (snapped to multiples of 64) and a landscape/portrait flip. The
   canvas (at the chosen size) is shown before you generate, so you can see the aspect — and

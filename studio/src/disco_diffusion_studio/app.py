@@ -564,16 +564,35 @@ class App:
             self._scale_sliders[slider] = (attr, is_int, vlabel, fmt)
             y += pitch
 
-        # Cut-schedule section (per-run): a section label, preset buttons, then a box per knob.
+        # Per-run section (snapshotted at run start): eta + perlin, then schedule presets/boxes.
         y += 6
         ui.UILabel(
             Row(0, y, inner_w, LABEL_H).fill(),
-            "Cut schedules — apply on next Play",
+            "Per-run — apply on next Play",
             self.manager,
             container=container,
             object_id="#section_label",
         )
         y += LABEL_H + 6
+        # eta (DDIM stochasticity) slider + Perlin-init toggle.
+        r = Row(0, y, inner_w, CTRL_H)
+        ui.UILabel(r.left(54), "eta", self.manager, container=container)
+        self.perlin_button = ui.UIButton(
+            r.right(104), "Perlin init", self.manager, container=container
+        )
+        self._eta_label = ui.UILabel(r.right(56), "", self.manager, container=container)
+        self._eta_slider = ui.UIHorizontalSlider(
+            r.fill(),
+            start_value=min(max(float(cfg.eta), 0.0), 1.0),
+            value_range=(0.0, 1.0),
+            manager=self.manager,
+            container=container,
+        )
+        self._eta_label.set_text(f"{cfg.eta:.2f}")
+        if cfg.perlin_init:
+            self.perlin_button.select()
+        y += pitch
+        # Cut-schedule presets + raw schedule-string boxes.
         r = Row(0, y, inner_w, CTRL_H)
         ui.UILabel(r.left(54), "Preset", self.manager, container=container)
         for name in SCHEDULE_PRESETS:
@@ -703,6 +722,7 @@ class App:
             steps=self.steps,
             encode_cache=self._encode_cache,
             cache_lock=self._cache_lock,
+            perlin=self.session.config.perlin_init,
         )
         self.worker.set_prompts(self._prompt_snapshot())
         if not self._paint_layer.empty():
@@ -976,6 +996,11 @@ class App:
                 self._sync_tabs()
             elif event.ui_element in self._preset_buttons:
                 self._apply_schedule_preset(self._preset_buttons[event.ui_element])
+            elif event.ui_element == self.perlin_button:
+                self.session.config.perlin_init = not self.session.config.perlin_init
+                on = self.session.config.perlin_init
+                (self.perlin_button.select if on else self.perlin_button.unselect)()
+                self._status(f"Perlin init {'on' if on else 'off'} — applies on next Play")
             elif event.ui_element == self.add_button:
                 self.prompts.append(PromptRow("", 1.0))
                 self._rebuild_prompt_rows()
@@ -1032,6 +1057,10 @@ class App:
                 idx = int(round(event.value))  # rightmost = live; left = older checkpoints
                 self._preview_index = None if idx >= len(self._history) else idx
                 self._refresh_preview_state()
+            elif event.ui_element == self._eta_slider:
+                # eta is read when the loop's generator is built, so this lands on the next run.
+                self.session.config.eta = float(event.value)
+                self._eta_label.set_text(f"{event.value:.2f}")
             elif event.ui_element in self._scale_sliders:
                 attr, is_int, vlabel, fmt = self._scale_sliders[event.ui_element]
                 value: float | int = int(round(event.value)) if is_int else float(event.value)

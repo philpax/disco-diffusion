@@ -56,6 +56,7 @@ class GenerationWorker(threading.Thread):
         steps: int,
         encode_cache: dict[str, EncodedPrompt],
         cache_lock: threading.Lock,
+        perlin: bool = False,
     ) -> None:
         super().__init__(daemon=True)
         self._session = session
@@ -64,6 +65,7 @@ class GenerationWorker(threading.Thread):
         self._steps = steps
         self._encode_cache = encode_cache
         self._cache_lock = cache_lock
+        self._perlin = perlin  # seed the fresh run from Perlin noise instead of flat gaussian
 
         self._resume = threading.Event()
         self._resume.set()  # start running (not paused)
@@ -210,7 +212,12 @@ class GenerationWorker(threading.Thread):
     def run(self) -> None:
         # skip_steps=0 so any total-step count >= 1 is valid (no init image to skip toward).
         self._sampler = self._session.sampler(
-            width=self._width, height=self._height, steps=self._steps, seed=None, skip_steps=0
+            width=self._width,
+            height=self._height,
+            steps=self._steps,
+            seed=None,
+            skip_steps=0,
+            perlin=self._perlin,
         )
         self.total = self._sampler.total
         log.info("worker started: %dx%d, %d steps", self._width, self._height, self.total)
