@@ -503,6 +503,13 @@ class Sampler:
         # When resuming, the saved (pre-scaled) latent is fed as the loop's noise.
         noise = self._resume_noise
         if cfg.diffusion_sampling_mode == SamplingMode.ddim:
+            # With no secondary model the guidance has to run the full UNet to get
+            # pred_xstart. The no-grad loop would then run the UNet *twice* per step
+            # (once for the step, once in cond_fn), so take the grad-enabled DDIM path
+            # instead: it computes the forward once, with grad, and hands it to cond_fn
+            # to reuse. With a secondary model the cheap no-grad path is already optimal
+            # (guidance uses the surrogate, not the UNet), so leave it alone.
+            reuse_forward = self.session.secondary_model is None
             return self.diffusion.ddim_sample_loop_progressive(
                 self.session.model,
                 shape,
@@ -515,6 +522,7 @@ class Sampler:
                 init_image=self._init,
                 randomize_class=cfg.randomize_class,
                 eta=cfg.eta,
+                cond_fn_with_grad=reuse_forward,
             )
         return self.diffusion.plms_sample_loop_progressive(
             self.session.model,
@@ -531,7 +539,13 @@ class Sampler:
         )
 
     # -- guidance ---------------------------------------------------------
-    def _cond_fn(self, x: torch.Tensor, t: torch.Tensor, y: Any = None) -> torch.Tensor:
+    def _cond_fn(
+        self, x: torch.Tensor, t: torch.Tensor, precomputed_out: Any = None
+    ) -> torch.Tensor:
+        # ``precomputed_out`` is set only on the grad-enabled DDIM path
+        # (``condition_score_with_grad`` passes the model's forward output positionally):
+        # there ``x`` already requires grad and the UNet forward is done, so we reuse it
+        # instead of running the model again. On the no-grad path it stays None.
         # No active conditioning (no prompts, or all-zero weights) => no guidance.
         if not self._model_stats:
             return torch.zeros_like(x)
@@ -559,7 +573,13 @@ class Sampler:
             return guidance_cache["grad"]
         with torch.enable_grad():
             x_is_nan = False
-            x = x.detach().requires_grad_()
+            if precomputed_out is None:
+                x = x.detach().requires_grad_()  # build our own graph for the guidance
+            else:
+                # x already requires grad (from ddim_sample_with_grad); re-detaching here
+                # would sever precomputed_out from it. The cut schedule indexes by the
+                # rescaled timestep, which the no-grad path receives pre-scaled — match it.
+                t = diffusion._scale_timesteps(t)
             n = x.shape[0]
             if secondary_model is not None:
                 alpha = torch.tensor(
@@ -579,10 +599,13 @@ class Sampler:
                 x_in = out * fac + x * (1 - fac)
                 x_in_grad = torch.zeros_like(x_in)
             else:
-                my_t = torch.ones([n], device=device, dtype=torch.long) * cur_t[0]
-                out = diffusion.p_mean_variance(
-                    self.session.model, x, my_t, clip_denoised=False, model_kwargs={"y": y}
-                )
+                if precomputed_out is not None:
+                    out = precomputed_out  # reuse the loop's grad-enabled forward
+                else:
+                    my_t = torch.ones([n], device=device, dtype=torch.long) * cur_t[0]
+                    out = diffusion.p_mean_variance(
+                        self.session.model, x, my_t, clip_denoised=False, model_kwargs={}
+                    )
                 fac = diffusion.sqrt_one_minus_alphas_cumprod[cur_t[0]]
                 x_in = out["pred_xstart"] * fac + x * (1 - fac)
                 x_in_grad = torch.zeros_like(x_in)
