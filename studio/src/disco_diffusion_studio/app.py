@@ -23,6 +23,7 @@ import io
 import json
 import logging
 import math
+import os
 import threading
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -150,6 +151,9 @@ class App:
         # The prompt entry that last held keyboard focus, so we can auto-apply its text
         # when focus moves away (no need to press Enter).
         self._focused_entry: pygame_gui.elements.UITextEntryLine | None = None
+        # Whether the steps box held focus last frame, so we can commit it on blur (mirrors
+        # the prompt boxes; without this, typing a value and clicking away wouldn't apply it).
+        self._steps_focused = False
 
         # Painting state. The paint layer is generation-resolution and persists across runs
         # (re-created only on a size change); strokes are injected into the latent by the
@@ -519,6 +523,10 @@ class App:
 
     # -- run lifecycle --
     def _start_run(self) -> None:
+        # Adopt any step count typed into the box but not yet Enter-applied: clicking Play
+        # moves focus off the box without firing UI_TEXT_ENTRY_FINISHED, so without this the
+        # run would silently use the previous value.
+        self._commit_steps()
         self._stop_run()
         self.worker = GenerationWorker(
             self.session,
@@ -600,17 +608,25 @@ class App:
         self._clamp_pan()  # keep the canvas in view after the viewport changed
 
     def _commit_steps(self) -> None:
+        """Adopt the steps box value (clamped). Safe to call on Enter, on blur, or at Play.
+
+        Idempotent: re-committing the same value is a no-op, so calling it just before a run
+        starts (to pick up a number typed but not Enter-applied) never disturbs anything.
+        """
         try:
-            value = int(self.steps_entry.get_text())
+            value = clamp_steps(self.steps_entry.get_text())
         except ValueError:
             self.steps_entry.set_text(str(self.steps))
             return
-        self.steps = max(1, min(1000, value))
-        self.steps_entry.set_text(str(self.steps))
+        self.steps_entry.set_text(str(value))
+        if value == self.steps:
+            return
+        changed = value
+        self.steps = value
         # If a run is paused, changing steps abandons it (respacing is fixed per run).
         if self.worker is not None and self.worker.is_alive():
             self._stop_run()
-            self._status(f"Steps set to {self.steps} — press Play to start fresh")
+            self._status(f"Steps set to {changed} — press Play to start fresh")
 
     def _open_save_dialog(self) -> None:
         """Freeze the current frame and open a file dialog to choose where to write it."""
@@ -886,15 +902,22 @@ class App:
         self.step_label.set_text(f"step {frame.index} / {frame.total}")
 
     def _auto_apply_on_blur(self) -> None:
-        """Apply a prompt text box when keyboard focus leaves it (no Enter needed)."""
+        """Apply a text box when keyboard focus leaves it (no Enter needed).
+
+        Covers both the prompt boxes and the steps box, so a value typed and then clicked
+        away from is adopted just as if Enter had been pressed.
+        """
         focus = self.manager.get_focus_set() or set()
         current = next((e for e in self._prompt_entries if e in focus), None)
-        if current is self._focused_entry:
-            return
-        previous = self._focused_entry
-        self._focused_entry = current
-        if previous is not None and previous.alive():
-            self._commit_prompt_entry(previous)
+        if current is not self._focused_entry:
+            previous = self._focused_entry
+            self._focused_entry = current
+            if previous is not None and previous.alive():
+                self._commit_prompt_entry(previous)
+        steps_focused = self.steps_entry in focus
+        if self._steps_focused and not steps_focused:
+            self._commit_steps()
+        self._steps_focused = steps_focused
 
     def _draw(self) -> None:
         win_w, win_h = self._window_size()
@@ -1047,6 +1070,17 @@ class App:
         self._stop_run()
 
 
+STEP_MIN, STEP_MAX = 1, 1000
+
+
+def clamp_steps(text: str) -> int:
+    """Parse a steps box value and clamp it to the supported range.
+
+    Raises ``ValueError`` on non-integer input so the caller can restore the prior value.
+    """
+    return max(STEP_MIN, min(STEP_MAX, int(text)))
+
+
 def int_or(text: str, fallback: int) -> int:
     try:
         return int(text)
@@ -1077,6 +1111,12 @@ def main() -> None:
     ap.add_argument("--out", type=Path, default=Path("images_out"), help="Where Save writes PNGs.")
     args = ap.parse_args()
 
+    # By default SDL swallows the mouse click that brings an unfocused window to the
+    # foreground: that click only focuses the window and is never delivered to the app, so
+    # the first click on the studio after another window had focus is silently dropped
+    # (buttons highlight on hover but don't fire until a second click). This hint passes that
+    # focusing click through as a normal click. Must be set before the video subsystem inits.
+    os.environ.setdefault("SDL_MOUSE_FOCUS_CLICKTHROUGH", "1")
     pygame.init()
     config = RunConfig(
         compile=args.compile,
