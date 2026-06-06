@@ -33,7 +33,7 @@ import numpy as np
 import pygame
 import pygame_gui
 from disco_diffusion import DiscoSession, EncodedPrompt, RunConfig
-from disco_diffusion.config import AVAILABLE_CLIP_MODELS, parse_schedule
+from disco_diffusion.config import AVAILABLE_CLIP_MODELS, Tunable, parse_schedule
 from pydantic import BaseModel, ConfigDict, field_validator
 from pygame_gui.core import ObjectID
 from pygame_gui.windows import UIFileDialog
@@ -42,14 +42,19 @@ from .layout import (
     CTRL_H,
     DEFAULT_H,
     DEFAULT_W,
+    DIVIDER_W,
     LABEL_H,
     MARGIN,
     MIN_IMAGE_H,
+    MIN_LEFT_PANEL_W,
     MIN_WINDOW_W,
     PAD,
     PANEL_H,
     PROMPT_LIST_H,
     ROW_PITCH,
+    SIDEBAR_W_DEFAULT,
+    SIDEBAR_W_MAX,
+    SIDEBAR_W_MIN,
     Row,
     Stack,
     snap_side,
@@ -85,6 +90,9 @@ CANVAS_BORDER = (70, 78, 92)
 # region. injection = NOISE_MAX_INJECT * opacity**gamma. Overlay stays at the raw opacity.
 NOISE_MAX_INJECT = 0.2
 NOISE_OPACITY_GAMMA = 2.0
+# Debounce for the model auto-reload: changing the CLIP set / secondary toggle queues a reload
+# that fires this long after the *last* change, so rapid toggling doesn't reload repeatedly.
+RELOAD_DEBOUNCE_MS = 1200
 
 
 class LiveScale(BaseModel):
@@ -152,6 +160,13 @@ class PresetConfig(BaseModel):
         return value
 
 
+# A preset applies via setattr over model_dump(), so every PresetConfig field must name a real
+# RunConfig field — check at import so a typo fails fast instead of at apply time.
+_UNKNOWN_PRESET_FIELDS = set(PresetConfig.model_fields) - set(RunConfig.model_fields)
+if _UNKNOWN_PRESET_FIELDS:
+    raise RuntimeError(f"PresetConfig fields not on RunConfig: {sorted(_UNKNOWN_PRESET_FIELDS)}")
+
+
 class Preset(BaseModel):
     """A one-click full recipe: config knobs (applied now) + a model set (staged for Reload)."""
 
@@ -162,26 +177,42 @@ class Preset(BaseModel):
     use_secondary_model: bool
 
 
-# Live guidance knobs surfaced as sliders on the Advanced tab. Each is read fresh every step
-# by Sampler._cond_fn (it reads session.config directly), so dragging one retunes the run on
-# the next step — no restart needed.
+# The control tables below are *derived from* the ``Tunable`` metadata on the RunConfig fields
+# (see disco_diffusion.config.Tunable), so the attribute names are the config's own — there's
+# no separate hand-maintained list of strings that could drift from the schema.
+def _tunables(group: str) -> list[tuple[str, Tunable]]:
+    """The (field name, Tunable) pairs in ``group``, in RunConfig declaration order."""
+    out: list[tuple[str, Tunable]] = []
+    for name, info in RunConfig.model_fields.items():
+        for meta in info.metadata:
+            if isinstance(meta, Tunable) and meta.group == group:
+                out.append((name, meta))
+    return out
+
+
+# Live guidance knobs surfaced as sliders. Each drives a RunConfig field that Sampler._cond_fn
+# reads fresh every step, so dragging one retunes the run on the next step — no restart.
 LIVE_SCALES: list[LiveScale] = [
-    LiveScale(
-        attr="clip_guidance_scale", label="CLIP guidance", lo=0, hi=30000, is_int=True, fmt="{:.0f}"
-    ),
-    LiveScale(attr="tv_scale", label="TV / smoothing", lo=0, hi=300000, is_int=False, fmt="{:.0f}"),
-    LiveScale(attr="range_scale", label="Range", lo=0, hi=20000, is_int=False, fmt="{:.0f}"),
-    LiveScale(attr="sat_scale", label="Saturation", lo=0, hi=100000, is_int=False, fmt="{:.0f}"),
-    LiveScale(attr="clamp_max", label="Clamp max", lo=0, hi=0.3, is_int=False, fmt="{:.3f}"),
-    LiveScale(attr="cutn_batches", label="Cutn batches", lo=1, hi=8, is_int=True, fmt="{:.0f}"),
+    LiveScale(attr=n, label=t.label, lo=t.lo or 0.0, hi=t.hi or 0.0, is_int=t.is_int, fmt=t.fmt)
+    for n, t in _tunables("live")
 ]
 
 # Cut-schedule knobs surfaced as raw schedule strings; edits apply on the next Play.
 SCHEDULES: list[ScheduleField] = [
-    ScheduleField(attr="cut_overview", label="Overview cuts"),
-    ScheduleField(attr="cut_innercut", label="Inner cuts"),
-    ScheduleField(attr="cut_ic_pow", label="IC power (detail)"),
-    ScheduleField(attr="cut_icgray_p", label="IC grey prob"),
+    ScheduleField(attr=n, label=t.label) for n, t in _tunables("schedule")
+]
+
+# Per-run settings listed (read-only) in the sidebar "Current" tab. The live guidance knobs
+# (LIVE_SCALES) are shown above these and track session.config every frame; these reflect the
+# active run's snapshot (or the pending values when stopped). Config-backed entries take their
+# label from the field's Tunable metadata; "steps"/"size" and the model set are synthesised.
+CURRENT_PERRUN: list[tuple[str, str]] = [
+    ("steps", "Steps"),
+    ("size", "Size"),
+    *[(n, t.label) for n, t in _tunables("per_run")],
+    *[(n, t.label) for n, t in _tunables("schedule")],
+    ("clip_models", "CLIP models"),
+    ("use_secondary_model", "Secondary"),
 ]
 
 # One-click full-recipe presets. "Default" is the port's faithful recipe; "2022 sauce" is the
@@ -266,11 +297,27 @@ class App:
             self.prompts = [PromptRow("a vast alien landscape, oil painting", 1.0)]
         self._encode_cache: dict[str, EncodedPrompt] = {}
         self._cache_lock = threading.Lock()
-        # The window size is independent of the generation size: it's seeded from the
-        # initial dimensions, then owned by the user (resizable). The image is letterboxed
-        # into the image region, so flipping orientation never changes the window.
-        self.win_w = max(self.width, MIN_WINDOW_W)
-        self.win_h = max(self.height, MIN_IMAGE_H) + PANEL_H
+        # The window size is independent of the generation size: it's seeded once, then owned
+        # by the user (resizable). Seed it so the image region — the window minus the sidebar
+        # and the bottom panel — matches the canvas aspect, so the canvas fills it with minimal
+        # letterboxing, and so the whole thing fits on the desktop. (On a tiling WM the size is
+        # overridden anyway; the image is letterboxed into the region, so a flip never resizes.)
+        self.sidebar_w = SIDEBAR_W_DEFAULT
+        chrome_w = self.sidebar_w + DIVIDER_W  # width taken by the sidebar + its divider
+        try:
+            sizes = pygame.display.get_desktop_sizes()
+            desk_w, desk_h = sizes[0] if sizes and sizes[0][0] > 0 else (1920, 1080)
+        except (pygame.error, IndexError):  # headless / older pygame
+            desk_w, desk_h = 1920, 1080
+        avail_w = max(320, int(desk_w * 0.9) - chrome_w)
+        avail_h = max(240, int(desk_h * 0.9) - PANEL_H)
+        # Fit the canvas into the available image area, never upscaling past 1:1.
+        scale = min(avail_w / self.width, avail_h / self.height, 1.0)
+        img_w, img_h = int(self.width * scale), int(self.height * scale)
+        # The left column is at least MIN_LEFT_PANEL_W wide; the sidebar always gets its full
+        # width on top of that, so the chrome never squeezes either below its minimum.
+        self.win_w = max(MIN_LEFT_PANEL_W, img_w) + chrome_w
+        self.win_h = max(MIN_IMAGE_H, img_h) + PANEL_H
         self.screen = pygame.display.set_mode((self.win_w, self.win_h), pygame.RESIZABLE)
         pygame.display.set_caption("Disco Diffusion - interactive")
         # Enforce the minimum size natively (SDL) instead of by re-calling set_mode on
@@ -296,9 +343,11 @@ class App:
         # the prompt boxes; without this, typing a value and clicking away wouldn't apply it).
         self._steps_focused = False
 
-        # The prompt-list region is shared by two tabs: the prompt rows and an "Advanced"
-        # panel of guidance controls. Only one is shown at a time (no extra window height).
-        self._active_tab = "prompts"
+        # Right-hand sidebar: the active tab and the coalesced "rebuild after a resize" flag
+        # (applied once per frame in run()). Its width (self.sidebar_w) is seeded above.
+        self._sidebar_tab = "settings"  # "settings" | "current"
+        self._dragging_divider = False
+        self._sidebar_dirty = False
         # Live guidance-scale sliders -> (config attr, is_int, value label, value format).
         self._scale_sliders: dict[
             pygame_gui.elements.UIHorizontalSlider,
@@ -311,14 +360,20 @@ class App:
         self._focused_schedule: pygame_gui.elements.UITextEntryLine | None = None
 
         # Model selection (CLIP set + secondary). Changing these needs a full weight reload,
-        # so the toggles only stage a pending selection; a Reload button rebuilds the session
-        # on a background thread. _clip_selected / _secondary_on are the staged choice.
+        # so the toggles stage a pending selection and *queue* an auto-reload (debounced); it
+        # fires after the user stops changing, and un-queues if they revert to the loaded set.
         self._clip_buttons: dict[pygame_gui.elements.UIButton, str] = {}
         self._clip_selected: set[str] = set(self.session.config.clip_models)
         self._secondary_on: bool = self.session.config.use_secondary_model
         self._reloading = False
         self._reload_thread: threading.Thread | None = None
         self._reload_result: dict[str, object] | None = None
+        self._reload_queued_at: int | None = None  # pygame ticks at which to fire the auto-reload
+
+        # "Current" sidebar tab: snapshot of the per-run settings the active run was started
+        # with (live knobs are read straight from session.config), plus the label cache.
+        self._run_snapshot: dict[str, str] = {}
+        self._current_labels: dict[str, pygame_gui.elements.UILabel] = {}
 
         # Painting state. The paint layer is generation-resolution and persists across runs
         # (re-created only on a size change); strokes are injected into the latent by the
@@ -352,10 +407,30 @@ class App:
         self._preview_surface: pygame.Surface | None = None
         self._preview_key: int | None = None
         self._history_slider_rect = pygame.Rect(0, 0, 10, 10)
+        # Fit the canvas to the available area once the real window size is settled. The window
+        # manager may resize the window right after it opens (firing a VIDEORESIZE that only
+        # re-clamps), so we (re)fit on the first run-loop frame, not just here.
+        self._did_initial_fit = False
         self._build_ui()
         self._fit_view()
 
     # -- geometry --
+    # The window is a left column (image on top, bottom control panel below) plus a full-height
+    # right sidebar. A draggable divider at x == _panel_w() sets the split.
+    def _panel_w(self) -> int:
+        """Width of the left column (image + bottom panel) — everything left of the sidebar."""
+        return max(MIN_LEFT_PANEL_W, self.win_w - self.sidebar_w)
+
+    def _divider_x(self) -> int:
+        return self._panel_w()
+
+    def _sidebar_rect(self) -> pygame.Rect:
+        x = self._panel_w() + DIVIDER_W
+        return pygame.Rect(x, 0, max(0, self.win_w - x), self.win_h)
+
+    def _bottom_panel_rect(self) -> pygame.Rect:
+        return pygame.Rect(0, self._image_area_h(), self._panel_w(), PANEL_H)
+
     def _image_area_h(self) -> int:
         return max(0, self.win_h - PANEL_H)
 
@@ -363,8 +438,8 @@ class App:
         return (self.win_w, self.win_h)
 
     def _image_region(self) -> pygame.Rect:
-        """The screen area the canvas viewport occupies (above the panel)."""
-        return pygame.Rect(0, 0, self.win_w, self._image_area_h())
+        """The screen area the canvas viewport occupies (above the panel, left of the sidebar)."""
+        return pygame.Rect(0, 0, self._panel_w(), self._image_area_h())
 
     def _canvas_size(self) -> tuple[int, int]:
         return (self.width, self.height)
@@ -459,39 +534,45 @@ class App:
 
     # -- UI construction --
     def _build_ui(self) -> None:
-        win_w, _ = self._window_size()
         self.manager.clear_and_reset()
         self._remove_buttons.clear()
         self._prompt_entries.clear()
         self._weight_sliders.clear()
         self._row_elements.clear()
+        self._build_bottom_panel()
+        self._build_sidebar()
+        self._sync_enabled()
 
+    def _build_bottom_panel(self) -> None:
+        """The left column's control panel: transport, history, tools, colours, prompts."""
         ui = pygame_gui.elements
-        stack = Stack(MARGIN, self._image_area_h() + PAD, win_w - 2 * MARGIN)
+        panel_w = self._panel_w()
+        stack = Stack(MARGIN, self._image_area_h() + PAD, panel_w - 2 * MARGIN)
 
-        # Row 1: transport — Play / Stop | step counter | (Save, right-aligned)
+        # Row 1: transport — Play / Stop | step (left-aligned) … status (right-aligned) | Save.
         r = stack.row(CTRL_H)
         self.play_button = ui.UIButton(r.left(110), "Play", self.manager, object_id="#play_button")
         self.stop_button = ui.UIButton(r.left(90), "Stop", self.manager, object_id="#stop_button")
         self.save_button = ui.UIButton(r.right(90), "Save", self.manager, object_id="#save_button")
+        self.status_label = ui.UILabel(r.right(170), "", self.manager, object_id="#status_label")
         self.step_label = ui.UILabel(r.fill(), "step 0 / 0", self.manager, object_id="#step_label")
 
-        # Row 2: steps | width / height / apply / orientation swap
+        # Row 2: history scrubber — directly under transport. Drag to preview a checkpoint.
         r = stack.row(CTRL_H)
-        ui.UILabel(r.left(50), "Steps", self.manager)
-        self.steps_entry = ui.UITextEntryLine(r.left(70), self.manager)
-        self.steps_entry.set_text(str(self.steps))
-        r.left(16)  # spacer
-        ui.UILabel(r.left(24), "W", self.manager)
-        self.width_entry = ui.UITextEntryLine(r.left(70), self.manager)
-        self.width_entry.set_text(str(self.width))
-        ui.UILabel(r.left(24), "H", self.manager)
-        self.height_entry = ui.UITextEntryLine(r.left(70), self.manager)
-        self.height_entry.set_text(str(self.height))
-        self.apply_button = ui.UIButton(r.left(96), "Apply size", self.manager)
-        self.swap_button = ui.UIButton(r.left(96), "Flip W/H", self.manager)
+        ui.UILabel(r.left(54), "History", self.manager)
+        self.cancel_button = ui.UIButton(r.right(70), "Cancel", self.manager)
+        self.revert_button = ui.UIButton(r.right(70), "Revert", self.manager)
+        self.history_label = ui.UILabel(r.right(120), "live", self.manager)
+        self._history_slider_rect = r.fill()
+        n = len(self._history)
+        self.history_slider = ui.UIHorizontalSlider(
+            self._history_slider_rect,
+            start_value=float(self._preview_index if self._preview_index is not None else n),
+            value_range=(0.0, float(max(n, 1))),
+            manager=self.manager,
+        )
 
-        # Row 3: painting tools — brush kind, size, opacity, palette, clear
+        # Row 3: painting tools — brush kind, noise toggle, size, opacity, clear
         r = stack.row(CTRL_H)
         self._brush_buttons = {}
         for name in BRUSHES:
@@ -505,61 +586,63 @@ class App:
         )
         if self.noise_mode:
             self.noise_button.select()
+        # Right group (packed right-to-left, so it reads "Opacity [slider] Clear" left-to-right).
+        self.clear_paint_button = ui.UIButton(r.right(64), "Clear", self.manager)
+        self.strength_slider = ui.UIHorizontalSlider(
+            r.right(104), self.brush_strength, (0.05, 1.0), self.manager
+        )
+        ui.UILabel(r.right(56), "Opacity", self.manager)
+        # Size label + slider, the slider flexing into whatever's left between the two groups.
         ui.UILabel(r.left(36), "Size", self.manager)
         self.size_slider = ui.UIHorizontalSlider(
-            r.left(104), self.brush_size, (4.0, 160.0), self.manager
-        )
-        ui.UILabel(r.left(56), "Opacity", self.manager)
-        self.strength_slider = ui.UIHorizontalSlider(
-            r.left(104), self.brush_strength, (0.05, 1.0), self.manager
-        )
-        self.clear_paint_button = ui.UIButton(r.right(64), "Clear", self.manager)
-        self._build_palette(r.fill())  # custom-drawn swatches fill the middle
-
-        # Row 4: history scrubber — drag to preview an earlier checkpoint, then Revert/Cancel.
-        r = stack.row(CTRL_H)
-        ui.UILabel(r.left(54), "History", self.manager)
-        self.cancel_button = ui.UIButton(r.right(70), "Cancel", self.manager)
-        self.revert_button = ui.UIButton(r.right(70), "Revert", self.manager)
-        self.history_label = ui.UILabel(r.right(150), "live", self.manager)
-        self._history_slider_rect = r.fill()
-        n = len(self._history)
-        self.history_slider = ui.UIHorizontalSlider(
-            self._history_slider_rect,
-            start_value=float(self._preview_index if self._preview_index is not None else n),
-            value_range=(0.0, float(max(n, 1))),
-            manager=self.manager,
+            r.fill(), self.brush_size, (4.0, 160.0), self.manager
         )
 
-        # Row 5: status line (fills the width)
-        self.status_label = ui.UILabel(
-            stack.row(LABEL_H).fill(), "", self.manager, object_id="#status_label"
-        )
+        # Row 4: colour palette — current-colour preview + swatches (custom-drawn) on its own row.
+        self._build_palette(stack.row(CTRL_H).fill())
 
-        # Row 6: tab switch (Prompts / Advanced) + add + hint (hint fills the remaining width)
+        # Row 5: prompts header — Add + hint (hint fills the remaining width)
         r = stack.row(LABEL_H)
-        self.tab_prompts = ui.UIButton(r.left(86), "Prompts", self.manager, object_id="#tab_button")
-        self.tab_advanced = ui.UIButton(
-            r.left(86), "Advanced", self.manager, object_id="#tab_button"
-        )
         self.add_button = ui.UIButton(
             r.left(120), "+ Add prompt", self.manager, object_id="#add_button"
         )
-        self.hint_label = ui.UILabel(r.fill(), "", self.manager, object_id="#hint_label")
+        self.hint_label = ui.UILabel(
+            r.fill(),
+            "weight 0-2 applies instantly · text applies on Enter or click-away · % = mix used",
+            self.manager,
+            object_id="#hint_label",
+        )
 
-        # Fixed-height scrolling region shared by the two tabs (extra rows scroll); keeps the
-        # panel compact. Both containers occupy the same rect; _sync_tabs shows exactly one.
-        list_rect = pygame.Rect(MARGIN, stack.y, win_w - 2 * MARGIN, PROMPT_LIST_H)
+        # Fixed-height scrolling prompt list (extra rows scroll), filling the rest of the panel.
+        list_rect = pygame.Rect(MARGIN, stack.y, panel_w - 2 * MARGIN, PROMPT_LIST_H)
         self.prompt_panel = ui.UIScrollingContainer(list_rect, self.manager)
         # Lay rows out narrower than the viewport so the vertical scrollbar never forces a
         # horizontal one (a horizontal bar appears only when content is wider than the view).
         self._list_inner_w = list_rect.width - 24
-        self.advanced_panel = ui.UIScrollingContainer(list_rect, self.manager)
-        self._adv_inner_w = list_rect.width - 24
         self._rebuild_prompt_rows()
-        self._build_advanced_rows()
-        self._sync_tabs()
-        self._sync_enabled()
+
+    def _build_sidebar(self) -> None:
+        """The full-height right sidebar: a Settings / Current tab pair over a scroll area."""
+        ui = pygame_gui.elements
+        sb = self._sidebar_rect()
+        x = sb.x + PAD
+        inner = max(40, sb.width - 2 * PAD)
+
+        r = Row(x, MARGIN, inner, CTRL_H)
+        half = (inner - PAD) // 2
+        self.tab_settings = ui.UIButton(
+            r.left(half), "Settings", self.manager, object_id="#tab_button"
+        )
+        self.tab_current = ui.UIButton(r.fill(), "Current", self.manager, object_id="#tab_button")
+
+        cont_y = MARGIN + CTRL_H + PAD
+        cont_rect = pygame.Rect(x, cont_y, inner, max(60, self.win_h - cont_y - MARGIN))
+        self.settings_panel = ui.UIScrollingContainer(cont_rect, self.manager)
+        self.current_panel = ui.UIScrollingContainer(cont_rect, self.manager)
+        self._sb_inner_w = inner - 24  # leave room for the vertical scrollbar
+        self._build_settings_rows()
+        self._build_current_rows()
+        self._sync_sidebar_tabs()
 
     def _displayed_prompts(self) -> list[PromptRow]:
         """The prompts shown in the rows: a previewed checkpoint's, else the live set."""
@@ -642,27 +725,64 @@ class App:
             wlabel.text_colour = pygame.Color(*colour)
             wlabel.set_text(text)
 
-    def _build_advanced_rows(self) -> None:
-        """Build the Advanced tab: live guidance sliders, then per-run cut-schedule boxes.
+    def _build_settings_rows(self) -> None:
+        """Build the sidebar Settings tab: output size, then the advanced controls.
 
-        The container is recreated on every _build_ui, so we just populate it fresh (no kill).
-        Sliders write straight to ``session.config`` (read live by the worker each step); the
-        schedule boxes are validated and stored on the config, applying on the next Play.
+        Layout order: output (steps / size, per-run) · guidance sliders (retune live) · per-run
+        cut schedules + eta/perlin · model set. Sliders write straight to ``session.config``
+        (read live by the worker each step); schedule boxes are validated and applied next Play;
+        toggling a model queues a (debounced) auto-reload.
         """
         self._scale_sliders = {}
         self._schedule_entries = {}
         self._preset_buttons = {}
+        self._clip_buttons = {}
         ui = pygame_gui.elements
-        container = self.advanced_panel
-        inner_w = self._adv_inner_w
+        container = self.settings_panel
+        inner_w = self._sb_inner_w
         pitch = CTRL_H + 8
         cfg = self.session.config
 
-        y = 2
+        def section(y: int, text: str) -> int:
+            ui.UILabel(
+                Row(0, y, inner_w, LABEL_H).fill(),
+                text,
+                self.manager,
+                container=container,
+                object_id="#section_label",
+            )
+            return y + LABEL_H + 6
+
+        # Output (per-run): steps, width/height, apply / flip.
+        y = section(2, "Output — apply on next Play")
+        r = Row(0, y, inner_w, CTRL_H)
+        ui.UILabel(r.left(54), "Steps", self.manager, container=container)
+        self.steps_entry = ui.UITextEntryLine(r.fill(), self.manager, container=container)
+        self.steps_entry.set_text(str(self.steps))
+        y += pitch
+        r = Row(0, y, inner_w, CTRL_H)
+        ui.UILabel(r.left(20), "W", self.manager, container=container)
+        self.width_entry = ui.UITextEntryLine(
+            r.left((inner_w - 56) // 2), self.manager, container=container
+        )
+        self.width_entry.set_text(str(self.width))
+        ui.UILabel(r.left(20), "H", self.manager, container=container)
+        self.height_entry = ui.UITextEntryLine(r.fill(), self.manager, container=container)
+        self.height_entry.set_text(str(self.height))
+        y += pitch
+        r = Row(0, y, inner_w, CTRL_H)
+        self.apply_button = ui.UIButton(
+            r.left((inner_w - PAD) // 2), "Apply size", self.manager, container=container
+        )
+        self.swap_button = ui.UIButton(r.fill(), "Flip W/H", self.manager, container=container)
+        y += pitch
+
+        # Guidance (live): each slider retunes the running step immediately.
+        y = section(y + 6, "Guidance — retunes live")
         for sc in LIVE_SCALES:
             r = Row(0, y, inner_w, CTRL_H)
-            ui.UILabel(r.left(124), sc.label, self.manager, container=container)
-            vlabel = ui.UILabel(r.right(84), "", self.manager, container=container)
+            ui.UILabel(r.left(108), sc.label, self.manager, container=container)
+            vlabel = ui.UILabel(r.right(66), "", self.manager, container=container)
             cur = float(getattr(cfg, sc.attr))
             slider = ui.UIHorizontalSlider(
                 r.fill(),
@@ -675,23 +795,21 @@ class App:
             self._scale_sliders[slider] = (sc.attr, sc.is_int, vlabel, sc.fmt)
             y += pitch
 
-        # Per-run section (snapshotted at run start): eta + perlin, then schedule presets/boxes.
-        y += 6
-        ui.UILabel(
-            Row(0, y, inner_w, LABEL_H).fill(),
-            "Per-run — apply on next Play",
-            self.manager,
-            container=container,
-            object_id="#section_label",
-        )
-        y += LABEL_H + 6
-        # eta (DDIM stochasticity) slider + Perlin-init toggle.
+        # Per-run: presets, eta + perlin, raw cut schedules.
+        y = section(y + 6, "Per-run — apply on next Play")
         r = Row(0, y, inner_w, CTRL_H)
-        ui.UILabel(r.left(54), "eta", self.manager, container=container)
+        ui.UILabel(r.left(50), "Preset", self.manager, container=container)
+        pw = (inner_w - 50 - PAD - (len(PRESETS) - 1) * PAD) // max(len(PRESETS), 1)
+        for name in PRESETS:
+            button = ui.UIButton(r.left(pw), name, self.manager, container=container)
+            self._preset_buttons[button] = name
+        y += pitch
+        r = Row(0, y, inner_w, CTRL_H)
+        ui.UILabel(r.left(40), "eta", self.manager, container=container)
         self.perlin_button = ui.UIButton(
-            r.right(104), "Perlin init", self.manager, container=container
+            r.right(96), "Perlin init", self.manager, container=container
         )
-        self._eta_label = ui.UILabel(r.right(56), "", self.manager, container=container)
+        self._eta_label = ui.UILabel(r.right(48), "", self.manager, container=container)
         self._eta_slider = ui.UIHorizontalSlider(
             r.fill(),
             start_value=min(max(float(cfg.eta), 0.0), 1.0),
@@ -703,32 +821,24 @@ class App:
         if cfg.perlin_init:
             self.perlin_button.select()
         y += pitch
-        # Cut-schedule presets + raw schedule-string boxes.
-        r = Row(0, y, inner_w, CTRL_H)
-        ui.UILabel(r.left(54), "Preset", self.manager, container=container)
-        for name in PRESETS:
-            button = ui.UIButton(r.left(110), name, self.manager, container=container)
-            self._preset_buttons[button] = name
-        y += pitch
         for sch in SCHEDULES:
-            r = Row(0, y, inner_w, CTRL_H)
-            ui.UILabel(r.left(124), sch.label, self.manager, container=container)
-            entry = ui.UITextEntryLine(r.fill(), self.manager, container=container)
+            ui.UILabel(
+                Row(0, y, inner_w, LABEL_H).left(inner_w),
+                sch.label,
+                self.manager,
+                container=container,
+            )
+            y += LABEL_H + 2
+            entry = ui.UITextEntryLine(
+                Row(0, y, inner_w, CTRL_H).fill(), self.manager, container=container
+            )
             entry.set_text(str(getattr(cfg, sch.attr)))
             self._schedule_entries[entry] = sch.attr
             y += pitch
 
-        # Models section (needs a reload): CLIP toggles, secondary toggle, Reload button.
-        y += 6
-        ui.UILabel(
-            Row(0, y, inner_w, LABEL_H).fill(),
-            "Models — reload to apply",
-            self.manager,
-            container=container,
-            object_id="#section_label",
-        )
-        y += LABEL_H + 6
-        per_row = 3
+        # Models: CLIP toggles + secondary. Changing these queues an auto-reload (no button).
+        y = section(y + 6, "Models — auto-reloads on change")
+        per_row = 2
         bw = (inner_w - (per_row - 1) * PAD) // per_row
         for i, name in enumerate(AVAILABLE_CLIP_MODELS):
             if i % per_row == 0:
@@ -745,7 +855,7 @@ class App:
             y += pitch
         r = Row(0, y, inner_w, CTRL_H)
         self.secondary_button = ui.UIButton(
-            r.left(150),
+            r.fill(),
             "Secondary model",
             self.manager,
             container=container,
@@ -753,24 +863,111 @@ class App:
         )
         if self._secondary_on:
             self.secondary_button.select()
-        self.reload_button = ui.UIButton(r.right(110), "Reload", self.manager, container=container)
         y += pitch
 
         container.set_scrollable_area_dimensions((inner_w, y + 8))
 
-    def _sync_tabs(self) -> None:
-        """Show exactly one of the prompt rows / advanced panel for the active tab."""
-        prompts = self._active_tab == "prompts"
-        (self.prompt_panel.show if prompts else self.prompt_panel.hide)()
-        (self.advanced_panel.show if not prompts else self.advanced_panel.hide)()
-        (self.add_button.show if prompts else self.add_button.hide)()
-        (self.tab_prompts.select if prompts else self.tab_prompts.unselect)()
-        (self.tab_advanced.select if not prompts else self.tab_advanced.unselect)()
-        self.hint_label.set_text(
-            "weight 0-2 applies instantly · text applies on Enter or click-away · % = mix used"
-            if prompts
-            else "sliders retune live · cut schedules apply on next Play"
+    def _build_current_rows(self) -> None:
+        """Build the read-only "Current" tab: name + value label per setting."""
+        ui = pygame_gui.elements
+        container = self.current_panel
+        inner_w = self._sb_inner_w
+        pitch = CTRL_H + 4
+        self._current_labels = {}
+        name_w = 116
+
+        def row(y: int, key: str, name: str) -> int:
+            ui.UILabel(
+                Row(0, y, inner_w, CTRL_H).left(name_w), name, self.manager, container=container
+            )
+            value = ui.UILabel(
+                Row(name_w + PAD, y, inner_w - name_w - PAD, CTRL_H).fill(),
+                "",
+                self.manager,
+                container=container,
+            )
+            self._current_labels[key] = value
+            return y + pitch
+
+        y = 2
+        ui.UILabel(
+            Row(0, y, inner_w, LABEL_H).fill(),
+            "Guidance — live",
+            self.manager,
+            container=container,
+            object_id="#section_label",
         )
+        y += LABEL_H + 6
+        for sc in LIVE_SCALES:
+            y = row(y, sc.attr, sc.label)
+        y += 6
+        self._current_perrun_header = ui.UILabel(
+            Row(0, y, inner_w, LABEL_H).fill(),
+            "Per-run",
+            self.manager,
+            container=container,
+            object_id="#section_label",
+        )
+        y += LABEL_H + 6
+        for key, name in CURRENT_PERRUN:
+            y = row(y, key, name)
+        container.set_scrollable_area_dimensions((inner_w, y + 8))
+        self._refresh_current()
+
+    def _perrun_values(self) -> dict[str, str]:
+        """Display strings for every CURRENT_PERRUN key from the current (pending) state.
+
+        Driven by the key list itself: the two synthesised keys are special-cased, the rest are
+        read off ``session.config`` by name (so they can't drift from the listed keys).
+        """
+        cfg = self.session.config
+        out: dict[str, str] = {}
+        for key, _label in CURRENT_PERRUN:
+            if key == "steps":
+                out[key] = str(self.steps)
+            elif key == "size":
+                out[key] = f"{self.width} × {self.height}"
+            elif key == "clip_models":
+                out[key] = ", ".join(cfg.clip_models)
+            else:
+                value = getattr(cfg, key)
+                if isinstance(value, bool):
+                    out[key] = "on" if value else "off"
+                elif isinstance(value, float):
+                    out[key] = f"{value:.2f}"
+                else:
+                    out[key] = str(value)
+        return out
+
+    def _refresh_current(self) -> None:
+        """Update the Current tab: live knobs from session.config, per-run from the snapshot."""
+        if not self._current_labels:
+            return
+        cfg = self.session.config
+        for sc in LIVE_SCALES:  # live: reflect session.config as sliders move
+            label = self._current_labels.get(sc.attr)
+            if label is not None:
+                text = sc.fmt.format(float(getattr(cfg, sc.attr)))
+                if label.text != text:
+                    label.set_text(text)
+        running = self.running
+        perrun = self._run_snapshot if running else self._perrun_values()
+        header = "Per-run — this run" if running else "Per-run — next run"
+        if self._current_perrun_header.text != header:
+            self._current_perrun_header.set_text(header)
+        for key, _name in CURRENT_PERRUN:
+            label = self._current_labels.get(key)
+            text = perrun.get(key, "—")
+            if label is not None and label.text != text:
+                label.set_text(text)
+
+    def _sync_sidebar_tabs(self) -> None:
+        """Show exactly one of the Settings / Current panels for the active sidebar tab."""
+        settings = self._sidebar_tab == "settings"
+        (self.settings_panel.show if settings else self.settings_panel.hide)()
+        (self.current_panel.show if not settings else self.current_panel.hide)()
+        (self.tab_settings.select if settings else self.tab_settings.unselect)()
+        (self.tab_current.select if not settings else self.tab_current.unselect)()
 
     def _commit_schedule_entry(self, entry: pygame_gui.elements.UITextEntryLine) -> None:
         """Validate a cut-schedule box and store it on the config (applies on next Play).
@@ -787,17 +984,17 @@ class App:
         try:
             parsed = parse_schedule(text)
         except ValueError:
-            self._status(f"Invalid {attr} schedule — keeping previous")
+            self._status("Bad schedule")
             entry.set_text(str(getattr(self.session.config, attr)))
             return
         # cond_fn indexes these over the full 1000-step internal timeline, so a short schedule
         # would IndexError mid-run. Require it to cover 1000 (extra entries are harmless).
         if len(parsed) < 1000:
-            self._status(f"{attr}: schedule must cover 1000 steps (got {len(parsed)})")
+            self._status("Schedule short")
             entry.set_text(str(getattr(self.session.config, attr)))
             return
         setattr(self.session.config, attr, text)
-        self._status(f"{attr} set — applies on next Play")
+        self._status("Schedule set")
 
     def _refresh_advanced_widgets(self) -> None:
         """Re-sync every Advanced widget from the current config (after a preset load)."""
@@ -813,7 +1010,7 @@ class App:
             entry.set_text(str(getattr(cfg, attr)))
 
     def _apply_preset(self, name: str) -> None:
-        """Load a full-recipe preset: config-only knobs apply now; models are staged for Reload."""
+        """Load a full-recipe preset: config knobs apply now; a model change auto-reloads."""
         preset = PRESETS.get(name)
         if preset is None:
             return
@@ -821,20 +1018,17 @@ class App:
         for attr, value in preset.config.model_dump().items():
             setattr(cfg, attr, value)
         self._refresh_advanced_widgets()
-        # Stage the model set (CLIP + secondary) — these only take effect on Reload.
+        # Stage the model set (CLIP + secondary); a change queues the debounced auto-reload.
         self._clip_selected = set(preset.clip_models)
         self._secondary_on = preset.use_secondary_model
         for button, mname in self._clip_buttons.items():
             (button.select if mname in self._clip_selected else button.unselect)()
         (self.secondary_button.select if self._secondary_on else self.secondary_button.unselect)()
-        models_match = set(self._clip_selected) == set(cfg.clip_models) and (
-            self._secondary_on == cfg.use_secondary_model
-        )
-        tail = "press Play" if models_match else "press Reload for models, then Play"
-        self._status(f"Loaded '{name}' — {tail}")
+        self._status("Loaded")
+        self._update_reload_queue()
 
     def _toggle_clip_model(self, button: pygame_gui.elements.UIButton) -> None:
-        """Stage a CLIP model in/out of the pending selection (applied on Reload)."""
+        """Stage a CLIP model in/out of the pending selection (queues the auto-reload)."""
         name = self._clip_buttons[button]
         if name in self._clip_selected:
             self._clip_selected.discard(name)
@@ -842,6 +1036,7 @@ class App:
         else:
             self._clip_selected.add(name)
             button.select()
+        self._update_reload_queue()
 
     def _start_reload(self) -> None:
         """Rebuild the session with the staged CLIP set / secondary toggle on a worker thread.
@@ -854,13 +1049,13 @@ class App:
             return
         selected = [m for m in AVAILABLE_CLIP_MODELS if m in self._clip_selected]
         if not selected:
-            self._status("Pick at least one CLIP model")
+            self._status("Pick a model")
             return
         cfg = self.session.config
         # Order is irrelevant for the CLIP set (guidance sums over all models), so compare as
         # sets — otherwise a reselection in a different order would look like a change.
         if set(selected) == set(cfg.clip_models) and self._secondary_on == cfg.use_secondary_model:
-            self._status("Models already loaded — nothing to reload")
+            self._status("No change")
             return
         self._stop_run()  # the worker holds the old session; tear it down first
         new_cfg = cfg.model_copy(
@@ -869,7 +1064,7 @@ class App:
         device = self.session.device
         self._reload_result = None
         self._reloading = True
-        self._status("Reloading models… (this can take a minute)")
+        self._status("Reloading…")
         self._sync_enabled()
 
         def work() -> None:
@@ -897,10 +1092,9 @@ class App:
             self._encode_cache.clear()  # embeds came from the old CLIP set — now stale
             self._clip_selected = set(self.session.config.clip_models)
             self._secondary_on = self.session.config.use_secondary_model
-            self._status("Models reloaded — press Play")
+            self._status("Reloaded")
         else:
-            err = result.get("error", "unknown error") if result else "unknown error"
-            self._status(f"Reload failed: {err}")
+            self._status("Reload failed")  # the traceback was logged by the reload thread
         self._build_ui()  # rebuild so the advanced controls reflect the (new) session config
         self._sync_enabled()
 
@@ -928,8 +1122,28 @@ class App:
         # Can't resume mid-preview or mid-reload — Revert/Cancel, or wait for the reload.
         play_off = self._preview_index is not None or self._reloading
         (self.play_button.disable if play_off else self.play_button.enable)()
-        # The Reload button locks while a reload is already in flight.
-        (self.reload_button.disable if self._reloading else self.reload_button.enable)()
+
+    def _models_match_session(self) -> bool:
+        """True when the staged CLIP set + secondary toggle equal the loaded session's."""
+        cfg = self.session.config
+        return set(self._clip_selected) == set(cfg.clip_models) and (
+            self._secondary_on == cfg.use_secondary_model
+        )
+
+    def _update_reload_queue(self) -> None:
+        """Queue (or cancel) the debounced auto-reload after a model toggle / preset load.
+
+        Changing the CLIP set or secondary toggle needs a full weight reload. Rather than a
+        button, we queue the reload to fire shortly after the user stops changing things, and
+        cancel it if they land back on the currently-loaded set.
+        """
+        if self._models_match_session():
+            if self._reload_queued_at is not None:
+                self._reload_queued_at = None
+                self._status("Reload cancelled")
+        else:
+            self._reload_queued_at = pygame.time.get_ticks() + RELOAD_DEBOUNCE_MS
+            self._status("Reload queued")
 
     def _status(self, text: str) -> None:
         self.status_label.set_text(text)
@@ -973,12 +1187,14 @@ class App:
         self.worker.set_prompts(self._prompt_snapshot())
         if not self._paint_layer.empty():
             self._paint_layer.dirty = True  # re-send any standing strokes to the new run
+        # Freeze the per-run settings this run uses, for the "Current" tab to show while it runs.
+        self._run_snapshot = self._perrun_values()
         self._history = []
         self._hist_len = 0
         self._preview_index = None
         self.paused = False
         self.worker.start()
-        self._status("Generating…")
+        self._status("Running")
         self._sync_enabled()
 
     def _stop_run(self) -> None:
@@ -994,7 +1210,7 @@ class App:
 
     def _toggle_play(self) -> None:
         if self._preview_index is not None:
-            self._status("Revert or Cancel the history preview before resuming")
+            self._status("Previewing")
             return
         if self.worker is None or not self.worker.is_alive() or self.worker.finished:
             self._start_run()  # finished -> Play starts a fresh run (Revert continues a branch)
@@ -1002,12 +1218,12 @@ class App:
             self.paused = False
             self._preview_index = None  # resume from live, drop any history preview
             self.worker.resume()
-            self._status("Generating…")
+            self._status("Running")
             self._sync_enabled()
         else:
             self.paused = True
             self.worker.pause()
-            self._status("Paused — adjust prompts, steps, or size")
+            self._status("Paused")
             self._sync_enabled()
 
     def _apply_size(self, width: int, height: int) -> None:
@@ -1025,7 +1241,15 @@ class App:
         self._frame_surface = None
         self._frame_key = None
         self._fit_view()
-        self._status(f"Size set to {self.width}x{self.height} - press Play")
+        self._status("Size set")
+
+    def _set_sidebar_width(self, width: int) -> None:
+        """Set the sidebar width (clamped); the rebuild is coalesced to one per frame."""
+        max_w = max(SIDEBAR_W_MIN, min(SIDEBAR_W_MAX, self.win_w - MIN_LEFT_PANEL_W - DIVIDER_W))
+        new_w = max(SIDEBAR_W_MIN, min(max_w, int(width)))
+        if new_w != self.sidebar_w:
+            self.sidebar_w = new_w
+            self._sidebar_dirty = True
 
     def _resize_window(self, w: int, h: int) -> None:
         # Adopt the window's actual new size — do NOT call set_mode (that fights tiling WMs;
@@ -1034,6 +1258,10 @@ class App:
         if (w, h) == (self.win_w, self.win_h):
             return
         self.win_w, self.win_h = w, h
+        # Keep the sidebar within the new window (the left column must still fit).
+        self.sidebar_w = max(
+            SIDEBAR_W_MIN, min(self.sidebar_w, self.win_w - MIN_LEFT_PANEL_W - DIVIDER_W)
+        )
         surface = pygame.display.get_surface()
         if surface is not None:
             self.screen = surface
@@ -1055,17 +1283,16 @@ class App:
         self.steps_entry.set_text(str(value))
         if value == self.steps:
             return
-        changed = value
         self.steps = value
         # If a run is paused, changing steps abandons it (respacing is fixed per run).
         if self.worker is not None and self.worker.is_alive():
             self._stop_run()
-            self._status(f"Steps set to {changed} — press Play to start fresh")
+            self._status("Steps set")
 
     def _open_save_dialog(self) -> None:
         """Freeze the current frame and open a file dialog to choose where to write it."""
         if self._frame_surface is None:
-            self._status("Nothing to save yet")
+            self._status("No frame")
             return
         if self._file_dialog is not None and self._file_dialog.alive():
             return  # a dialog is already open
@@ -1093,7 +1320,7 @@ class App:
         path.parent.mkdir(parents=True, exist_ok=True)
         pygame.image.save(self._save_surface, str(path))
         self._save_surface = None
-        self._status(f"Saved {path}")
+        self._status("Saved")
         log.info("saved %s", path)
 
     # -- history / revert --
@@ -1178,13 +1405,19 @@ class App:
 
         if event.type == pygame.MOUSEMOTION:
             self._mouse_pos = event.pos
-            if self._panning:
+            if self._dragging_divider:
+                self._set_sidebar_width(self.win_w - event.pos[0] - DIVIDER_W // 2)
+            elif self._panning:
                 self._pan += pygame.Vector2(event.rel)
                 self._clamp_pan()
             elif self._painting:
                 self._paint_to(event.pos)
             return True
         if event.type == pygame.MOUSEBUTTONDOWN:
+            # The draggable divider sits between the left column and the sidebar (full height).
+            if event.button == 1 and abs(event.pos[0] - self._divider_x()) <= DIVIDER_W:
+                self._dragging_divider = True
+                return True
             on_canvas = self._image_region().collidepoint(event.pos)
             if event.button == 3 and on_canvas:  # right held = navigate mode (pan + scroll-zoom)
                 self._navigating = True
@@ -1204,6 +1437,7 @@ class App:
                 return True
         if event.type == pygame.MOUSEBUTTONUP:
             if event.button == 1:
+                self._dragging_divider = False
                 self._painting = False
                 self._last_gen = None
             elif event.button == 3:
@@ -1237,16 +1471,18 @@ class App:
                 self._status("Stopped")
             elif event.ui_element == self.save_button:
                 self._open_save_dialog()
-            elif event.ui_element in (self.tab_prompts, self.tab_advanced):
-                self._active_tab = "prompts" if event.ui_element == self.tab_prompts else "advanced"
-                self._sync_tabs()
+            elif event.ui_element in (self.tab_settings, self.tab_current):
+                self._sidebar_tab = (
+                    "settings" if event.ui_element == self.tab_settings else "current"
+                )
+                self._sync_sidebar_tabs()
             elif event.ui_element in self._preset_buttons:
                 self._apply_preset(self._preset_buttons[event.ui_element])
             elif event.ui_element == self.perlin_button:
                 self.session.config.perlin_init = not self.session.config.perlin_init
                 on = self.session.config.perlin_init
                 (self.perlin_button.select if on else self.perlin_button.unselect)()
-                self._status(f"Perlin init {'on' if on else 'off'} — applies on next Play")
+                self._status(f"Perlin {'on' if on else 'off'}")
             elif event.ui_element in self._clip_buttons:
                 self._toggle_clip_model(event.ui_element)
             elif event.ui_element == self.secondary_button:
@@ -1256,8 +1492,7 @@ class App:
                     if self._secondary_on
                     else self.secondary_button.unselect
                 )()
-            elif event.ui_element == self.reload_button:
-                self._start_reload()
+                self._update_reload_queue()
             elif event.ui_element == self.add_button:
                 self.prompts.append(PromptRow("", 1.0))
                 self._rebuild_prompt_rows()
@@ -1396,9 +1631,23 @@ class App:
     def _draw(self) -> None:
         win_w, win_h = self._window_size()
         img_h = self._image_area_h()
+        panel_w = self._panel_w()
         self.screen.fill(WINDOW_BG)
-        pygame.draw.rect(self.screen, IMAGE_BG, (0, 0, win_w, img_h))
-        pygame.draw.rect(self.screen, PANEL_BG, (0, img_h, win_w, win_h - img_h))
+        pygame.draw.rect(self.screen, IMAGE_BG, (0, 0, panel_w, img_h))
+        pygame.draw.rect(self.screen, PANEL_BG, (0, img_h, panel_w, win_h - img_h))
+        pygame.draw.rect(self.screen, PANEL_BG, self._sidebar_rect())  # full-height sidebar
+        # Draggable divider band between the left column and the sidebar.
+        div = pygame.Rect(panel_w, 0, DIVIDER_W, win_h)
+        hot = self._dragging_divider or abs(self._mouse_pos[0] - panel_w) <= DIVIDER_W
+        pygame.draw.rect(self.screen, DIVIDER, div)
+        grip_x = panel_w + DIVIDER_W // 2
+        pygame.draw.line(
+            self.screen,
+            (110, 120, 140) if hot else (70, 78, 92),
+            (grip_x, win_h // 2 - 14),
+            (grip_x, win_h // 2 + 14),
+            2,
+        )
         # Draw the canvas (and unbaked paint overlay) under the view transform, clipped to
         # the viewport so a zoomed/panned canvas never spills into the panel.
         self.screen.set_clip(self._image_region())
@@ -1418,7 +1667,7 @@ class App:
             self._blit_canvas(self._paint_layer.to_surface())
         pygame.draw.rect(self.screen, CANVAS_BORDER, crect, 1)  # canvas outline at any zoom
         self.screen.set_clip(None)
-        pygame.draw.line(self.screen, DIVIDER, (0, img_h), (win_w, img_h))
+        pygame.draw.line(self.screen, DIVIDER, (0, img_h), (panel_w, img_h))
 
     def _draw_tools(self) -> None:
         """Draw the colour palette, the brush-preview ring, and the canvas help HUD."""
@@ -1521,6 +1770,24 @@ class App:
                 w, h = self._pending_size
                 self._pending_size = None
                 self._resize_window(w, h)
+            # Fit the canvas to the available area on the first realized frame (after any
+            # startup window-manager resize has been applied above).
+            if not self._did_initial_fit:
+                self._did_initial_fit = True
+                self._fit_view()
+            # Rebuild once per frame after a sidebar-divider drag (also coalesced).
+            if self._sidebar_dirty:
+                self._sidebar_dirty = False
+                self._build_ui()
+                self._clamp_pan()
+            # Fire the debounced model auto-reload once its delay has elapsed.
+            if (
+                self._reload_queued_at is not None
+                and not self._reloading
+                and pygame.time.get_ticks() >= self._reload_queued_at
+            ):
+                self._reload_queued_at = None
+                self._start_reload()
             # When the run finishes (worker idles) or exits unexpectedly, drop to a paused
             # state so controls/history are usable and the image can still be reverted.
             wk = self.worker
@@ -1528,7 +1795,7 @@ class App:
                 self.paused = True
                 if wk.is_alive():
                     wk.pause()
-                self._status("Done — scrub History to revert, Save, or Play to start over")
+                self._status("Done")
                 self._sync_enabled()
             if wk is not None and wk.notice is not None:  # e.g. compile OOM -> eager fallback
                 self._status(wk.notice)
@@ -1537,6 +1804,7 @@ class App:
             self._auto_apply_on_blur()
             # Live "edited · Enter" badge while typing (cheap; only mutates on change).
             self._refresh_rows()
+            self._refresh_current()  # keep the "Current" sidebar tab in sync
             self._sync_paint()
             self._sync_history()
             self._update_frame_surface()

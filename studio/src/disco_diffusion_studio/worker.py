@@ -234,7 +234,7 @@ class GenerationWorker(threading.Thread):
         restarting from scratch loses no real progress.
         """
         log.warning("CUDA OOM under torch.compile; falling back to eager and restarting")
-        self.notice = "compile ran out of memory - switched to eager"
+        self.notice = "Eager fallback"
         self._compile_fallback_done = True
         try:
             if self._sampler is not None:
@@ -291,7 +291,7 @@ class GenerationWorker(threading.Thread):
                         # Already eager (or compile was off): genuinely out of VRAM.
                         # Stop gracefully with a clear message instead of crashing.
                         log.exception("out of GPU memory")
-                        self.notice = "out of GPU memory - try a smaller size or --no-compile"
+                        self.notice = "Out of VRAM"
                         self.finished = True
                         continue
                     # Compiled-warmup OOM: drop to eager and restart once. Defer the

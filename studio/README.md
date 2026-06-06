@@ -11,40 +11,42 @@ the image respond.
 
 ## What you can do
 
+The layout is an **image canvas** (top-left) over a **bottom panel** (transport, history,
+paint tools, prompts), with a full-height **right sidebar** of settings. Drag the divider
+between them to resize the sidebar; the canvas auto-fits the available space.
+
 - **Play / Pause / Stop** the diffusion loop (Space toggles play/pause); a step counter shows
-  progress.
-- **Prompts / Advanced tabs**: the panel's lower area switches between the prompt list and an
-  **Advanced** panel of guidance controls (same footprint — no taller window).
-- **Prompts**: add/remove rows, each with a live **weight slider (0–2)**. Text applies on
-  Enter *or* when you click away; an amber `edited · Enter` badge shows when a box hasn't been
-  applied yet. Each row shows the **normalised %** it actually contributes to guidance.
-- **Advanced — live guidance**: sliders for `clip_guidance_scale`, `tv_scale` (smoothing),
+  progress. The **History** scrubber sits directly underneath.
+- **Prompts** (bottom panel): add/remove rows, each with a live **weight slider (0–2)**. Text
+  applies on Enter *or* when you click away; an amber `edited · Enter` badge shows when a box
+  hasn't been applied yet. Each row shows the **normalised %** it contributes to guidance.
+- **Sidebar — Settings / Current tabs**: *Settings* holds every knob (below); *Current* is a
+  read-only readout of the settings the run is actually using — live knobs update as you drag
+  them, per-run values show what the active run was started with (or what the next Play will
+  use when stopped).
+- **Settings — output**: total **steps**, **width/height** (snapped to multiples of 64),
+  **Apply size**, and a landscape/portrait **flip**. The canvas (at the chosen size) is shown
+  before you generate, so you can see the aspect — and paint on it — before pressing Play.
+- **Settings — guidance (live)**: sliders for `clip_guidance_scale`, `tv_scale` (smoothing),
   `range_scale`, `sat_scale`, `clamp_max`, and `cutn_batches`. These are read **every step**,
   so dragging one retunes the run on the next step (no restart) — and seeds the next run when
   stopped. Higher CLIP guidance = stronger prompt adherence; TV/range/sat are the regularisers
   that keep detail from turning to mush.
-- **Advanced — cut schedules + presets**: raw schedule strings for `cut_overview` /
-  `cut_innercut` / `cut_ic_pow` / `cut_icgray_p` (e.g. `[12]*400+[4]*600`), plus one-click
-  **full-recipe presets** (`Default`, `2022 sauce`). A preset sets *everything* — the guidance
-  sliders, eta/Perlin, and all four schedules at once — and stages its CLIP model set +
-  secondary toggle (press **Reload** to actually load those). The schedules are snapshotted
-  when a run starts, so they **apply on the next Play**. Edits are validated (and must cover
-  the 1000-step timeline) before they take —
-  a malformed or too-short schedule is rejected and the previous value kept. `cut_ic_pow` is
-  the detail knob (higher = more fine texture); overview vs inner cuts trade global
-  composition for local detail across the run.
-- **Advanced — eta / Perlin init**: `eta` (DDIM stochasticity, 0 = deterministic) and a
-  **Perlin init** toggle that seeds a fresh run from Perlin noise instead of flat gaussian.
-  Both are per-run — they take effect on the next Play.
-- **Advanced — models**: toggle the **CLIP model set** (add ViT-L/14, RN50x4, …) and the
-  **secondary model**, then press **Reload**. Reloading rebuilds the session (loads weights,
-  ~a minute; longer if a model still needs downloading) on a **background thread**, so the UI
-  stays responsive — Play and Reload lock until it's ready. More/larger CLIP models = stronger,
-  higher-quality guidance at a real speed cost.
-- **Steps**: set the total step count (while paused/stopped).
-- **Size**: width/height (snapped to multiples of 64) and a landscape/portrait flip. The
-  canvas (at the chosen size) is shown before you generate, so you can see the aspect — and
-  paint on it — before pressing Play.
+- **Settings — per-run (presets, eta/Perlin, cut schedules)**: one-click **full-recipe
+  presets** (`Default`, `2022 sauce`) that set *everything* at once; `eta` (DDIM stochasticity,
+  0 = deterministic) and a **Perlin init** toggle (seed from Perlin noise instead of flat
+  gaussian); and raw schedule strings for `cut_overview` / `cut_innercut` / `cut_ic_pow` /
+  `cut_icgray_p` (e.g. `[12]*400+[4]*600`). These are snapshotted when a run starts, so they
+  **apply on the next Play**. Schedule edits are validated (and must cover the 1000-step
+  timeline) — a malformed or too-short schedule is rejected and the previous value kept.
+  `cut_ic_pow` is the detail knob (higher = more fine texture); overview vs inner cuts trade
+  global composition for local detail across the run.
+- **Settings — models**: toggle the **CLIP model set** (add ViT-L/14, RN50x4, …) and the
+  **secondary model**. Changing the set **auto-reloads** — the session rebuilds (loads weights,
+  ~a minute; longer if a model still needs downloading) on a **background thread** shortly
+  after you stop changing things, so rapid toggling doesn't reload repeatedly; reverting to the
+  loaded set cancels the queued reload. More/larger CLIP models = stronger guidance at a real
+  speed cost.
 - **Canvas navigation**: the window is a viewport onto the canvas. **Hold the right mouse
   button** to navigate — drag to pan, scroll to zoom toward the cursor; release to go back to
   drawing. **F** fits the canvas to the window, **0** is 100%. A help line in the canvas

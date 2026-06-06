@@ -17,15 +17,24 @@ LABEL_H = 24  # height of a standalone label line
 ROW_PITCH = 46  # vertical pitch of one prompt row
 
 # The prompt list is a fixed-height scrolling area (shows ~2 rows; more rows scroll), which
-# keeps the control panel compact. The panel height is derived from the rows it contains —
-# 4 control rows (transport / size / tools / history), 2 label rows (status / prompt header),
-# then the list — so the panel exactly fits its contents and the window isn't taller than it
-# needs.
+# keeps the bottom panel compact. The panel height is derived from the rows it contains —
+# 4 control rows (transport / history / tools / colours), 1 label row (prompt header), then
+# the list — so the panel exactly fits its contents and the window isn't taller than it needs.
+# (The status now shares the transport row; steps / size and the advanced controls live in the
+# right-hand sidebar.)
 PROMPT_LIST_H = 2 * ROW_PITCH + 12
-PANEL_H = PAD + 4 * (CTRL_H + PAD) + 2 * (LABEL_H + PAD) + PROMPT_LIST_H + PAD
+PANEL_H = PAD + 4 * (CTRL_H + PAD) + 1 * (LABEL_H + PAD) + PROMPT_LIST_H + PAD
+
+# Right-hand sidebar (size + advanced controls + the "Current" readout). User-resizable via a
+# draggable divider; the left column (image + bottom panel) keeps at least MIN_LEFT_PANEL_W.
+SIDEBAR_W_DEFAULT = 360
+SIDEBAR_W_MIN = 300
+SIDEBAR_W_MAX = 680
+DIVIDER_W = 6  # width of the draggable divider band between the left column and the sidebar
+MIN_LEFT_PANEL_W = 660  # the bottom panel's tool row needs this much
 
 # Window / image sizing.
-MIN_WINDOW_W = 940  # never let the window get narrower than the controls need
+MIN_WINDOW_W = MIN_LEFT_PANEL_W + DIVIDER_W + SIDEBAR_W_MIN  # left column + divider + sidebar
 MIN_IMAGE_H = 320  # minimum height of the image region (image is centered within it)
 DEFAULT_W, DEFAULT_H = 1280, 768
 MAX_SIDE = 1280  # cap each dimension (snapped to x64); the UNet accepts any multiple of 64
