@@ -28,13 +28,13 @@ import threading
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any
 
 import numpy as np
 import pygame
 import pygame_gui
 from disco_diffusion import DiscoSession, EncodedPrompt, RunConfig
 from disco_diffusion.config import AVAILABLE_CLIP_MODELS, parse_schedule
+from pydantic import BaseModel, ConfigDict, field_validator
 from pygame_gui.core import ObjectID
 from pygame_gui.windows import UIFileDialog
 
@@ -86,69 +86,143 @@ CANVAS_BORDER = (70, 78, 92)
 NOISE_MAX_INJECT = 0.2
 NOISE_OPACITY_GAMMA = 2.0
 
+
+class LiveScale(BaseModel):
+    """A live guidance knob surfaced as a slider on the Advanced tab.
+
+    It drives a ``RunConfig`` attribute that ``Sampler._cond_fn`` reads fresh every step, so
+    dragging the slider retunes the run on the next step — no restart needed.
+    """
+
+    model_config = ConfigDict(frozen=True, use_attribute_docstrings=True)
+
+    attr: str
+    """The ``RunConfig`` attribute this slider sets."""
+    label: str
+    """Slider label shown in the panel."""
+    lo: float
+    """Minimum slider value."""
+    hi: float
+    """Maximum slider value."""
+    is_int: bool
+    """Round the value to an int before applying."""
+    fmt: str
+    """Format string for the value readout."""
+
+
+class ScheduleField(BaseModel):
+    """A cut-schedule knob, edited as a raw schedule string (e.g. ``[12]*400+[4]*600``).
+
+    Schedules are snapshotted when a Sampler is built, so edits apply on the *next* Play.
+    """
+
+    model_config = ConfigDict(frozen=True, use_attribute_docstrings=True)
+
+    attr: str
+    """The ``RunConfig`` schedule attribute this box edits."""
+    label: str
+    """Field label shown in the panel."""
+
+
+class PresetConfig(BaseModel):
+    """The config-only half of a preset: guidance scales, eta/Perlin, and the cut schedules.
+
+    Field names match ``RunConfig`` so a preset applies via ``setattr`` over ``model_dump()``.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    clip_guidance_scale: int
+    tv_scale: float
+    range_scale: float
+    sat_scale: float
+    clamp_max: float
+    cutn_batches: int
+    eta: float
+    perlin_init: bool
+    cut_overview: str
+    cut_innercut: str
+    cut_ic_pow: str
+    cut_icgray_p: str
+
+    @field_validator("cut_overview", "cut_innercut", "cut_ic_pow", "cut_icgray_p")
+    @classmethod
+    def _validate_schedule(cls, value: str) -> str:
+        parse_schedule(value)  # raises on a malformed schedule string
+        return value
+
+
+class Preset(BaseModel):
+    """A one-click full recipe: config knobs (applied now) + a model set (staged for Reload)."""
+
+    model_config = ConfigDict(frozen=True)
+
+    config: PresetConfig
+    clip_models: list[str]
+    use_secondary_model: bool
+
+
 # Live guidance knobs surfaced as sliders on the Advanced tab. Each is read fresh every step
 # by Sampler._cond_fn (it reads session.config directly), so dragging one retunes the run on
-# the next step — no restart needed. (attr, label, min, max, is_int, value format).
-LIVE_SCALES: list[tuple[str, str, float, float, bool, str]] = [
-    ("clip_guidance_scale", "CLIP guidance", 0.0, 30000.0, True, "{:.0f}"),
-    ("tv_scale", "TV / smoothing", 0.0, 300000.0, False, "{:.0f}"),
-    ("range_scale", "Range", 0.0, 20000.0, False, "{:.0f}"),
-    ("sat_scale", "Saturation", 0.0, 100000.0, False, "{:.0f}"),
-    ("clamp_max", "Clamp max", 0.0, 0.3, False, "{:.3f}"),
-    ("cutn_batches", "Cutn batches", 1.0, 8.0, True, "{:.0f}"),
+# the next step — no restart needed.
+LIVE_SCALES: list[LiveScale] = [
+    LiveScale(
+        attr="clip_guidance_scale", label="CLIP guidance", lo=0, hi=30000, is_int=True, fmt="{:.0f}"
+    ),
+    LiveScale(attr="tv_scale", label="TV / smoothing", lo=0, hi=300000, is_int=False, fmt="{:.0f}"),
+    LiveScale(attr="range_scale", label="Range", lo=0, hi=20000, is_int=False, fmt="{:.0f}"),
+    LiveScale(attr="sat_scale", label="Saturation", lo=0, hi=100000, is_int=False, fmt="{:.0f}"),
+    LiveScale(attr="clamp_max", label="Clamp max", lo=0, hi=0.3, is_int=False, fmt="{:.3f}"),
+    LiveScale(attr="cutn_batches", label="Cutn batches", lo=1, hi=8, is_int=True, fmt="{:.0f}"),
 ]
 
-# Cut-schedule knobs surfaced as raw schedule strings (e.g. "[12]*400+[4]*600"). These are
-# snapshotted when a Sampler is built, so editing them applies on the *next* Play, not live.
-# (config attr, label).
-SCHEDULES: list[tuple[str, str]] = [
-    ("cut_overview", "Overview cuts"),
-    ("cut_innercut", "Inner cuts"),
-    ("cut_ic_pow", "IC power (detail)"),
-    ("cut_icgray_p", "IC grey prob"),
+# Cut-schedule knobs surfaced as raw schedule strings; edits apply on the next Play.
+SCHEDULES: list[ScheduleField] = [
+    ScheduleField(attr="cut_overview", label="Overview cuts"),
+    ScheduleField(attr="cut_innercut", label="Inner cuts"),
+    ScheduleField(attr="cut_ic_pow", label="IC power (detail)"),
+    ScheduleField(attr="cut_icgray_p", label="IC grey prob"),
 ]
 
-# One-click full-recipe presets. "config" holds every config-only knob (the sliders +
-# eta/perlin + the four schedules); "clip_models"/"use_secondary_model" stage the model set
-# (applied on Reload). "Default" is the port's faithful recipe; "2022 sauce" is the
+# One-click full-recipe presets. "Default" is the port's faithful recipe; "2022 sauce" is the
 # high-detail, heavily-regularised, multi-CLIP look from the archive (ic_pow 15, six models).
-PRESETS: dict[str, dict[str, Any]] = {
-    "Default": {
-        "config": {
-            "clip_guidance_scale": 5000,
-            "tv_scale": 0.0,
-            "range_scale": 150.0,
-            "sat_scale": 0.0,
-            "clamp_max": 0.05,
-            "cutn_batches": 4,
-            "eta": 0.8,
-            "perlin_init": False,
-            "cut_overview": "[12]*400+[4]*600",
-            "cut_innercut": "[4]*400+[12]*600",
-            "cut_ic_pow": "[1]*1000",
-            "cut_icgray_p": "[0.2]*400+[0]*600",
-        },
-        "clip_models": ["ViT-B/32", "ViT-B/16", "RN50"],
-        "use_secondary_model": True,
-    },
-    "2022 sauce": {
-        "config": {
-            "clip_guidance_scale": 15000,
-            "tv_scale": 250000.0,
-            "range_scale": 10000.0,
-            "sat_scale": 50000.0,
-            "clamp_max": 0.09,
-            "cutn_batches": 1,
-            "eta": 0.8,
-            "perlin_init": True,
-            "cut_overview": "[18]*200+[14]*200+[4]*400+[2]*200",
-            "cut_innercut": "[2]*200+[6]*200+[8]*400+[18]*200",
-            "cut_ic_pow": "[15]*1000",
-            "cut_icgray_p": "[0.2]*200+[0.1]*200+[0.1]*200+[0.1]*200+[0.1]*200",
-        },
-        "clip_models": ["ViT-B/32", "ViT-B/16", "ViT-L/14", "RN101", "RN50", "RN50x4"],
-        "use_secondary_model": False,
-    },
+PRESETS: dict[str, Preset] = {
+    "Default": Preset(
+        config=PresetConfig(
+            clip_guidance_scale=5000,
+            tv_scale=0.0,
+            range_scale=150.0,
+            sat_scale=0.0,
+            clamp_max=0.05,
+            cutn_batches=4,
+            eta=0.8,
+            perlin_init=False,
+            cut_overview="[12]*400+[4]*600",
+            cut_innercut="[4]*400+[12]*600",
+            cut_ic_pow="[1]*1000",
+            cut_icgray_p="[0.2]*400+[0]*600",
+        ),
+        clip_models=["ViT-B/32", "ViT-B/16", "RN50"],
+        use_secondary_model=True,
+    ),
+    "2022 sauce": Preset(
+        config=PresetConfig(
+            clip_guidance_scale=15000,
+            tv_scale=250000.0,
+            range_scale=10000.0,
+            sat_scale=50000.0,
+            clamp_max=0.09,
+            cutn_batches=1,
+            eta=0.8,
+            perlin_init=True,
+            cut_overview="[18]*200+[14]*200+[4]*400+[2]*200",
+            cut_innercut="[2]*200+[6]*200+[8]*400+[18]*200",
+            cut_ic_pow="[15]*1000",
+            cut_icgray_p="[0.2]*200+[0.1]*200+[0.1]*200+[0.1]*200+[0.1]*200",
+        ),
+        clip_models=["ViT-B/32", "ViT-B/16", "ViT-L/14", "RN101", "RN50", "RN50x4"],
+        use_secondary_model=False,
+    ),
 }
 
 
@@ -585,20 +659,20 @@ class App:
         cfg = self.session.config
 
         y = 2
-        for attr, label_text, lo, hi, is_int, fmt in LIVE_SCALES:
+        for sc in LIVE_SCALES:
             r = Row(0, y, inner_w, CTRL_H)
-            ui.UILabel(r.left(124), label_text, self.manager, container=container)
+            ui.UILabel(r.left(124), sc.label, self.manager, container=container)
             vlabel = ui.UILabel(r.right(84), "", self.manager, container=container)
-            cur = float(getattr(cfg, attr))
+            cur = float(getattr(cfg, sc.attr))
             slider = ui.UIHorizontalSlider(
                 r.fill(),
-                start_value=min(max(cur, lo), hi),
-                value_range=(lo, hi),
+                start_value=min(max(cur, sc.lo), sc.hi),
+                value_range=(sc.lo, sc.hi),
                 manager=self.manager,
                 container=container,
             )
-            vlabel.set_text(fmt.format(cur))
-            self._scale_sliders[slider] = (attr, is_int, vlabel, fmt)
+            vlabel.set_text(sc.fmt.format(cur))
+            self._scale_sliders[slider] = (sc.attr, sc.is_int, vlabel, sc.fmt)
             y += pitch
 
         # Per-run section (snapshotted at run start): eta + perlin, then schedule presets/boxes.
@@ -636,12 +710,12 @@ class App:
             button = ui.UIButton(r.left(110), name, self.manager, container=container)
             self._preset_buttons[button] = name
         y += pitch
-        for attr, label_text in SCHEDULES:
+        for sch in SCHEDULES:
             r = Row(0, y, inner_w, CTRL_H)
-            ui.UILabel(r.left(124), label_text, self.manager, container=container)
+            ui.UILabel(r.left(124), sch.label, self.manager, container=container)
             entry = ui.UITextEntryLine(r.fill(), self.manager, container=container)
-            entry.set_text(str(getattr(cfg, attr)))
-            self._schedule_entries[entry] = attr
+            entry.set_text(str(getattr(cfg, sch.attr)))
+            self._schedule_entries[entry] = sch.attr
             y += pitch
 
         # Models section (needs a reload): CLIP toggles, secondary toggle, Reload button.
@@ -744,12 +818,12 @@ class App:
         if preset is None:
             return
         cfg = self.session.config
-        for attr, value in preset["config"].items():
+        for attr, value in preset.config.model_dump().items():
             setattr(cfg, attr, value)
         self._refresh_advanced_widgets()
         # Stage the model set (CLIP + secondary) — these only take effect on Reload.
-        self._clip_selected = set(preset["clip_models"])
-        self._secondary_on = preset["use_secondary_model"]
+        self._clip_selected = set(preset.clip_models)
+        self._secondary_on = preset.use_secondary_model
         for button, mname in self._clip_buttons.items():
             (button.select if mname in self._clip_selected else button.unselect)()
         (self.secondary_button.select if self._secondary_on else self.secondary_button.unselect)()
