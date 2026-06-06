@@ -1530,6 +1530,9 @@ class App:
                     wk.pause()
                 self._status("Done — scrub History to revert, Save, or Play to start over")
                 self._sync_enabled()
+            if wk is not None and wk.notice is not None:  # e.g. compile OOM -> eager fallback
+                self._status(wk.notice)
+                wk.notice = None
             self._poll_reload()  # swap in a reloaded session once its background thread finishes
             self._auto_apply_on_blur()
             # Live "edited · Enter" badge while typing (cheap; only mutates on change).
@@ -1571,8 +1574,12 @@ def main() -> None:
     ap.add_argument(
         "--compile",
         action="store_true",
-        help="torch.compile the UNet/CLIP (~2x faster once warm, but recompiles ~90s on "
-        "each new image size).",
+        help="torch.compile the UNet/CLIP for faster steps (off by default). Worth it on a "
+        "GPU with free VRAM headroom or for smaller/lighter runs (~1.4x); the first run at "
+        "each size warms up (~60s, cached on disk). Robust: compile-time errors and OOM fall "
+        "back to eager rather than crashing. Off by default because the heavy presets at "
+        "large sizes need ~21GB to compile, which can exceed a shared GPU's free memory - and "
+        "eager already runs the 2022 preset at 1280x768 in ~1.5min.",
     )
     ap.add_argument("--cpu", action="store_true", help="Force CPU (very slow).")
     # Defaults are repo-root-relative, matching the library, so weights/outputs are shared

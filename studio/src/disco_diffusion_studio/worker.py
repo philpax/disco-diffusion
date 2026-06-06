@@ -7,6 +7,7 @@ history, and toggles the pause / stop / pending flags.
 
 from __future__ import annotations
 
+import gc
 import logging
 import threading
 import time
@@ -14,6 +15,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
+import torch
 from disco_diffusion import DiscoSession, EncodedPrompt
 
 log = logging.getLogger("disco_diffusion_studio.worker")
@@ -86,6 +88,8 @@ class GenerationWorker(threading.Thread):
         self._started_history = False
         self.finished = False
         self.paint_applied_count = 0  # bumps each time a paint batch is injected
+        self._compile_fallback_done = False  # one-shot: only fall back from compile once
+        self.notice: str | None = None  # transient message for the UI to surface
         self.total = session.diffusion_for(steps).num_timesteps  # skip_steps=0 below
 
     # -- control (called from UI thread) --
@@ -208,8 +212,7 @@ class GenerationWorker(threading.Thread):
             self._frame = Frame(entry.preview, entry.index, entry.total, self.paint_applied_count)
         log.info("reverted to '%s' (step %d/%d)", entry.label, entry.index, entry.total)
 
-    # -- run loop --
-    def run(self) -> None:
+    def _start_sampler(self) -> None:
         # skip_steps=0 so any total-step count >= 1 is valid (no init image to skip toward).
         self._sampler = self._session.sampler(
             width=self._width,
@@ -220,6 +223,44 @@ class GenerationWorker(threading.Thread):
             perlin=self._perlin,
         )
         self.total = self._sampler.total
+        if self._last_items:  # restart path: re-apply the conditioning we already had
+            self._sampler.set_conditioning(self._last_items)
+
+    def _fallback_to_eager(self) -> None:
+        """A compiled-warmup CUDA OOM: drop compile and restart this run eagerly.
+
+        The compiled UNet's warmup memory spike can exceed VRAM at large sizes on a
+        shared GPU; eager fits. The OOM happens on the first (warmup) step, so
+        restarting from scratch loses no real progress.
+        """
+        log.warning("CUDA OOM under torch.compile; falling back to eager and restarting")
+        self.notice = "compile ran out of memory - switched to eager"
+        self._compile_fallback_done = True
+        try:
+            if self._sampler is not None:
+                self._sampler.close()
+        except Exception:  # noqa: BLE001 - best-effort cleanup before we rebuild
+            pass
+        self._sampler = None
+        self._session.disable_compile()
+        # The failed compile's tensors are only freed once the OOM exception (and its
+        # traceback, which references them) has been cleared by the caller — which is
+        # why this runs *after* the except block, not inside it. Collect them, drop the
+        # compiled-graph state, and return the freed blocks so the eager run has room.
+        # NB: this reclaims PyTorch's own allocations, but torch.compile can leave a few
+        # GB of CUDA-module/allocator residue that only a fresh process fully frees, so
+        # the eager retry can still OOM on a memory-contended GPU — handled gracefully.
+        gc.collect()
+        torch._dynamo.reset()
+        torch.cuda.empty_cache()
+        self._started_history = False
+        with self._lock:
+            self.history.clear()
+        self._start_sampler()
+
+    # -- run loop --
+    def run(self) -> None:
+        self._start_sampler()
         log.info("worker started: %dx%d, %d steps", self._width, self._height, self.total)
 
         try:
@@ -238,11 +279,28 @@ class GenerationWorker(threading.Thread):
 
                 self._apply_pending()  # re-mix conditioning
                 self._apply_pending_paint()  # inject painted pixels
+                oom_fallback = False
                 try:
                     step = next(self._sampler)
                 except StopIteration:
                     self.finished = True  # idle (don't exit) so reverts can still resume it
                     log.info("worker finished")
+                    continue
+                except torch.cuda.OutOfMemoryError:
+                    if self._compile_fallback_done or not self._session.compiled:
+                        # Already eager (or compile was off): genuinely out of VRAM.
+                        # Stop gracefully with a clear message instead of crashing.
+                        log.exception("out of GPU memory")
+                        self.notice = "out of GPU memory - try a smaller size or --no-compile"
+                        self.finished = True
+                        continue
+                    # Compiled-warmup OOM: drop to eager and restart once. Defer the
+                    # actual fallback until the except block exits — while it's active the
+                    # exception's traceback pins the failed forward's tensors, so the
+                    # memory can't be reclaimed until we're out of the handler.
+                    oom_fallback = True
+                if oom_fallback:
+                    self._fallback_to_eager()
                     continue
                 if not self._started_history:  # baseline checkpoint after the first step
                     self._started_history = True

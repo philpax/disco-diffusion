@@ -88,6 +88,15 @@ uv run disco-studio
 Options: `disco-studio --help` (`--steps`, `--width`, `--height`, `--compile`, `--cpu`,
 `--models-dir`, `--out`). Paths default to the repo-root `models/` and `images_out/`.
 
+`torch.compile` is **off by default**. It's worth enabling (`--compile`) on a GPU with free
+VRAM headroom or for smaller/lighter runs (~1.4× faster steps, with a one-time ~60s warmup per
+size, cached on disk). It's **robust** — compile-time errors and OOM fall back to eager rather
+than crashing — but it's off by default because the heavy multi-CLIP presets at large sizes
+need ~21 GB *to compile* (a transient warmup spike; steady state fits in ~15 GB), which can
+exceed the free memory on a shared desktop GPU. Eager already runs the `2022 sauce` preset at
+1280×768 in ~1.5 min on a 5090 (thanks to the single-forward guidance path), so compile isn't
+needed there.
+
 ## Layout
 
 ```

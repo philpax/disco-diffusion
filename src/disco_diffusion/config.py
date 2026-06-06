@@ -132,6 +132,14 @@ class RunConfig(BaseModel):
     # warm; the first run pays a one-time compile cost that is then cached on disk
     # (so subsequent runs are fast). Disable for a faster cold start / debugging.
     compile: bool = True
+    # Inductor mode for torch.compile. "default" is robust and low-memory; the first
+    # run warms in ~60s. "max-autotune-no-cudagraphs" benchmarks more kernels for a
+    # small extra win on light recipes/small sizes, but at large sizes its conv kernels
+    # exceed the GPU shared-memory limit (so they fall back anyway) and its autotune
+    # workspace is memory-hungry — giving no steady-state gain there for a ~2.3x longer
+    # warmup. Compile errors always fall back to eager (suppress_errors), so a mode that
+    # can't compile a given shape degrades gracefully rather than crashing.
+    compile_mode: str = "default"
 
     # "fast" (lossy) speed levers. Each trades a small, measured fidelity departure for
     # speed and is OFF by default (the default stays faithful, within the run-to-run noise

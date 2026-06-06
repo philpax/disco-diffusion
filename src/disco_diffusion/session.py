@@ -155,22 +155,60 @@ class DiscoSession:
         # VGG backbone download when it isn't needed.
         self.lpips_model = load_lpips(self.device) if config.init_image is not None else None
 
+        # Eager references kept so a caller can fall back if compile OOMs (see
+        # disable_compile): the compiled UNet's warmup spike can exceed VRAM at large
+        # sizes on a shared GPU even though its steady state fits.
+        self._compiled = False
+        self._eager_model: Any = self.model
+        self._eager_encode: list[Any] = []
+
         if config.compile and self.device.type == "cuda":
             # Compile the UNet and the CLIP image encoders. The first run pays a
             # one-time warmup (cached on disk by _configure_perf); later runs are fast.
             #
-            # The UNet forward is convolution-bound (~50% of its runtime is fp16
-            # tensor-core GEMMs), so we autotune kernel selection with
-            # "max-autotune-no-cudagraphs": it benchmarks Triton/CUTLASS conv+matmul
-            # templates and picks the fastest, taking the UNet from ~128 ms to ~109 ms
-            # (~14%) on a 1280x768 forward. The choice is lossless (still fp16 tensor
-            # cores, within the existing noise floor); only the first-run compile is
-            # slower (~90 s vs ~6 s), and that is cached on disk. CUDA graphs are skipped
-            # because the forward is GPU-bound, not launch-bound (they gave no speedup).
-            print("torch.compile enabled (first run autotunes kernels; later runs reuse cache)")
-            self.model = torch.compile(self.model, mode="max-autotune-no-cudagraphs")  # type: ignore[assignment]
+            # Make compile best-effort: if inductor can't compile a given graph/shape
+            # (e.g. a recipe whose cut schedule recompiles the CLIP encoder for an
+            # awkward cutout-batch shape, which trips an inductor tiling assertion at
+            # large sizes), fall back to eager for that graph instead of crashing the
+            # run. The compiled graphs still get the speedup; only the unsupported ones
+            # run eager.
+            torch._dynamo.config.suppress_errors = True
+            # "default" is the robust, low-memory mode (warms in ~60s). max-autotune
+            # benchmarks more kernels for a small extra win on light recipes, but at
+            # large sizes it gives no steady-state gain (conv kernels exceed the GPU
+            # shared-memory limit and fall back) for a much longer, memory-hungry
+            # warmup; opt into it via config.compile_mode when it pays off.
+            print("torch.compile enabled (first run warms kernels; later runs reuse cache)")
+            self._eager_encode = [cm.encode_image for cm in self.clip_models]
+            mode = config.compile_mode
+            compiled = (
+                torch.compile(self.model)
+                if mode == "default"
+                else torch.compile(self.model, mode=mode)
+            )
+            self.model = compiled  # type: ignore[assignment]
             for clip_model in self.clip_models:
                 clip_model.encode_image = torch.compile(clip_model.encode_image)
+            self._compiled = True
+
+    @property
+    def compiled(self) -> bool:
+        """Whether the UNet/CLIP are currently torch.compile-wrapped."""
+        return self._compiled
+
+    def disable_compile(self) -> None:
+        """Revert to the eager UNet/CLIP encoders.
+
+        For recovering from a compile-warmup CUDA OOM: the caller drops any sampler
+        holding the compiled graphs, calls this, empties the cache, and rebuilds a
+        sampler — which then reads these eager modules. A no-op if not compiled.
+        """
+        if not self._compiled:
+            return
+        self.model = self._eager_model
+        for clip_model, encode in zip(self.clip_models, self._eager_encode, strict=True):
+            clip_model.encode_image = encode
+        self._compiled = False
 
     # -- encoding ---------------------------------------------------------
     def encode(self, prompt: str) -> EncodedPrompt:
