@@ -7,10 +7,35 @@ Defaults faithfully reproduce the canonical "lighthouse" image.
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, Field, field_validator
+
+
+@dataclass(frozen=True)
+class Tunable:
+    """Frontend hint attached (via ``Annotated``) to the interactively-tunable ``RunConfig``
+    fields, so a UI can derive its controls straight from the schema instead of duplicating a
+    list of attribute names (read it back from ``RunConfig.model_fields[name].metadata``).
+
+    ``group`` says *when a change takes effect*, which is a property of how the sampler reads
+    the field, not of any particular UI:
+      * ``"live"`` — read every step, so a change retunes the running step immediately;
+      * ``"schedule"`` — a per-1000-step cut schedule, snapshotted when a run starts;
+      * ``"per_run"`` — any other setting snapshotted when a run starts.
+    Numeric ``"live"`` knobs also carry a suggested slider range + display format.
+    """
+
+    label: str
+    group: Literal["live", "schedule", "per_run"]
+    lo: float | None = None
+    hi: float | None = None
+    is_int: bool = False
+    fmt: str = "{:.0f}"
+
 
 # CLIP models available from the vendored OpenAI CLIP.
 AVAILABLE_CLIP_MODELS = (
@@ -97,11 +122,13 @@ class RunConfig(BaseModel):
     steps: int = 250
     width: int = 1280
     height: int = 768
-    clip_guidance_scale: int = 5000
-    tv_scale: float = 0.0
-    range_scale: float = 150.0
-    sat_scale: float = 0.0
-    cutn_batches: int = 4
+    clip_guidance_scale: Annotated[int, Tunable("CLIP guidance", "live", 0, 30000, is_int=True)] = (
+        5000
+    )
+    tv_scale: Annotated[float, Tunable("TV / smoothing", "live", 0, 300000)] = 0.0
+    range_scale: Annotated[float, Tunable("Range", "live", 0, 20000)] = 150.0
+    sat_scale: Annotated[float, Tunable("Saturation", "live", 0, 100000)] = 0.0
+    cutn_batches: Annotated[int, Tunable("Cutn batches", "live", 1, 8, is_int=True)] = 4
     skip_augs: bool = False
 
     # Init image
@@ -110,20 +137,20 @@ class RunConfig(BaseModel):
     skip_steps: int = 10
 
     # Cutout schedules (per 1000 internal steps)
-    cut_overview: str = "[12]*400+[4]*600"
-    cut_innercut: str = "[4]*400+[12]*600"
-    cut_ic_pow: str = "[1]*1000"
-    cut_icgray_p: str = "[0.2]*400+[0]*600"
+    cut_overview: Annotated[str, Tunable("Overview cuts", "schedule")] = "[12]*400+[4]*600"
+    cut_innercut: Annotated[str, Tunable("Inner cuts", "schedule")] = "[4]*400+[12]*600"
+    cut_ic_pow: Annotated[str, Tunable("IC power", "schedule")] = "[1]*1000"
+    cut_icgray_p: Annotated[str, Tunable("IC grey prob", "schedule")] = "[0.2]*400+[0]*600"
 
     # Advanced
-    eta: float = 0.8
+    eta: Annotated[float, Tunable("eta", "per_run", 0, 1, fmt="{:.2f}")] = 0.8
     clamp_grad: bool = True
-    clamp_max: float = 0.05
+    clamp_max: Annotated[float, Tunable("Clamp max", "live", 0, 0.3, fmt="{:.3f}")] = 0.05
     randomize_class: bool = True
     clip_denoised: bool = False
     fuzzy_prompt: bool = False
     rand_mag: float = 0.05
-    perlin_init: bool = False
+    perlin_init: Annotated[bool, Tunable("Perlin init", "per_run")] = False
     perlin_mode: PerlinMode = PerlinMode.mixed
 
     # Runtime
