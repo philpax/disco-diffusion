@@ -1085,6 +1085,10 @@ class App:
         finally:
             self._applying_preset = False
         self._preset_selection = name
+        # A preset retunes the live guidance, so record a revert point (discrete change — no
+        # debounce); supersede any pending guidance-drag checkpoint.
+        self._guidance_checkpoint_at = None
+        self._request_checkpoint(f"preset {name}")
         self._status(f"Loaded {name}")
 
     def _open_save_preset_dialog(self) -> None:
