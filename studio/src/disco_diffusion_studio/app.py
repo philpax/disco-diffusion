@@ -91,8 +91,8 @@ APP_TITLE = "Disco Diffusion Studio"  # window caption + loading-screen heading
 MIN_ZOOM, MAX_ZOOM = 0.1, 16.0  # view zoom bounds
 # Help HUD text per interaction mode (hold right mouse = navigate, release = draw).
 DRAW_HELP = (
-    "left-drag: paint · scroll: size · shift+scroll: opacity · hold right: pan/zoom"
-    " · F: fit · space: play/pause"
+    "left-drag: paint · scroll/[]: size · shift+scroll: opacity · 1-9: colour"
+    " · hold right: pan/zoom · F: fit · space: play · ctrl+S/Z: save/undo"
 )
 NAV_HELP = "right-drag: pan · scroll: zoom · release right: draw · F: fit · space: play/pause"
 CANVAS_EMPTY_BG = (18, 20, 26)  # placeholder canvas fill shown before the first frame
@@ -404,6 +404,10 @@ class App:
         # = showing that checkpoint's image (non-destructive) until Revert commits it.
         self._history: list[HistoryEntry] = []
         self._hist_len = 0
+        # Ctrl+Z walks back through the checkpoints: the index it last reverted to (None = at the
+        # live frame, so the first Ctrl+Z targets the latest checkpoint). Reset whenever a new
+        # checkpoint appears (a fresh edit) so a new undo chain starts.
+        self._undo_cursor: int | None = None
         self._preview_index: int | None = None
         self._preview_prompts: list[PromptRow] | None = None  # prompts shown while previewing
         self._preview_surface: pygame.Surface | None = None
@@ -1413,6 +1417,7 @@ class App:
         self._history = []
         self._hist_len = 0
         self._preview_index = None
+        self._undo_cursor = None
         self.paused = False
         self.worker.start()
         self._status("Running")
@@ -1438,6 +1443,7 @@ class App:
         elif self.paused:
             self.paused = False
             self._preview_index = None  # resume from live, drop any history preview
+            self._undo_cursor = None  # resuming ends the undo chain
             self.worker.resume()
             self._status("Running")
             self._sync_enabled()
@@ -1684,6 +1690,65 @@ class App:
         self._set_history_label()
         (self.play_button.disable if self._preview_index is not None else self.play_button.enable)()
 
+    def _do_revert(self) -> None:
+        """Branch the run from the previewed checkpoint, restoring its prompts + guidance/eta."""
+        if self._preview_index is None or self.worker is None:
+            return
+        entry = self._history[self._preview_index]
+        # Adopt the checkpoint's prompts as the live set, then branch from it.
+        self.prompts = [PromptRow(t, w) for t, w in entry.prompts]
+        # Restore the guidance + eta captured at the checkpoint (undo the changes made since),
+        # syncing the sliders; cancel any pending guidance checkpoint.
+        for attr, cfg_value in entry.config.items():
+            setattr(self.session.config, attr, cfg_value)
+        self._guidance_checkpoint_at = None
+        self._refresh_advanced_widgets()
+        self.worker.seek(self._preview_index)
+        self._preview_index = None
+        self._preview_prompts = None
+        # Branching drops any in-flight strokes (the worker clears its queue on seek), so reset
+        # the overlay tracking to stay aligned with the worker's apply count.
+        self._pending_overlays = []
+        self._paint_submitted = self.worker.paint_applied_count
+        # Park the thumb on the checkpoint's actual step now — the worker processes the seek
+        # asynchronously, so _live_index() would still read the stale (forward) live frame here.
+        self.history_slider.set_current_value(float(entry.index))
+        self._rebuild_prompt_rows()  # now-live (reverted) prompts
+        self._push_prompts()  # apply them to the resumed run
+        self._sync_enabled()  # re-enable prompt editing
+        self._refresh_preview_state()
+
+    # -- keyboard shortcuts --
+    def _keyboard_revert(self) -> None:
+        """Ctrl+Z: step back through the checkpoints, reverting to each in turn (undo).
+
+        A scrubbed preview commits that checkpoint; otherwise the first press targets the latest
+        checkpoint and each further press one earlier (tracked by _undo_cursor, since a revert to
+        the last checkpoint doesn't truncate history so it can't be read back off the list).
+        """
+        if self.worker is None or self.running or not self._history:
+            return
+        if self._preview_index is not None:
+            target = self._preview_index
+        elif self._undo_cursor is not None:
+            target = max(0, self._undo_cursor - 1)
+        else:
+            target = len(self._history) - 1
+        self._undo_cursor = target
+        self._preview_index = target
+        self._do_revert()
+
+    def _nudge_brush_size(self, factor: float) -> None:
+        """[ / ]: scale the brush size (matching the scroll-wheel bounds) and sync the slider."""
+        self.brush_size = max(4.0, min(160.0, self.brush_size * factor))
+        self.size_slider.set_current_value(self.brush_size)
+
+    def _select_palette_index(self, index: int) -> None:
+        """Digit keys: pick the nth swatch (palette + recents) as the brush colour, if it exists."""
+        colours = self._swatch_colours()
+        if 0 <= index < len(colours):
+            self.brush_color = colours[index]
+
     def _history_total(self) -> int:
         """The run's display-step total (the history slider's right edge)."""
         if self._history:
@@ -1726,7 +1791,10 @@ class App:
         """Pull the worker's history each frame; rebuild the slider when it changes length."""
         self._history = self.worker.get_history() if self.worker is not None else []
         if len(self._history) != self._hist_len:
+            grew = len(self._history) > self._hist_len  # a new checkpoint = a fresh edit
             self._hist_len = len(self._history)
+            if grew:
+                self._undo_cursor = None  # start a new undo chain (our reverts only shrink)
             if self._preview_index is not None and self._preview_index >= self._hist_len:
                 self._preview_index = None
             self._rebuild_history_slider()
@@ -1837,12 +1905,23 @@ class App:
                 self.size_slider.set_current_value(self.brush_size)
             return True
         if event.type == pygame.KEYDOWN and not self._typing() and not self._modal_open():
-            if event.key == pygame.K_SPACE:
+            if event.mod & pygame.KMOD_CTRL:  # ctrl combos: Save / Revert
+                if event.key == pygame.K_s:
+                    self._open_save_dialog()
+                elif event.key == pygame.K_z:
+                    self._keyboard_revert()
+            elif event.key == pygame.K_SPACE:
                 self._toggle_play()
             elif event.key == pygame.K_f:
                 self._fit_view()
             elif event.key == pygame.K_0:
                 self._zoom_at(self._image_region().center, 1.0 / self._zoom)
+            elif event.key == pygame.K_LEFTBRACKET:
+                self._nudge_brush_size(1.0 / 1.1)
+            elif event.key == pygame.K_RIGHTBRACKET:
+                self._nudge_brush_size(1.1)
+            elif pygame.K_1 <= event.key <= pygame.K_9:  # digit -> nth palette/recents swatch
+                self._select_palette_index(event.key - pygame.K_1)
 
         if event.type == pygame_gui.UI_BUTTON_PRESSED:
             if event.ui_element == self.play_button:
@@ -1919,28 +1998,7 @@ class App:
             elif event.ui_element == self.clear_paint_button:
                 self._paint_layer.clear()
             elif event.ui_element == self.revert_button:
-                if self._preview_index is not None and self.worker is not None:
-                    entry = self._history[self._preview_index]
-                    # Adopt the checkpoint's prompts as the live set, then branch from it.
-                    self.prompts = [PromptRow(t, w) for t, w in entry.prompts]
-                    # Restore the live guidance captured at the checkpoint (undo the changes made
-                    # since), syncing the sliders; cancel any pending guidance checkpoint.
-                    for attr, cfg_value in entry.config.items():
-                        setattr(self.session.config, attr, cfg_value)
-                    self._guidance_checkpoint_at = None
-                    self._refresh_advanced_widgets()
-                    self.worker.seek(self._preview_index)
-                    self._preview_index = None
-                    self._preview_prompts = None
-                    # Branching drops any in-flight strokes (the worker clears its queue on seek),
-                    # so reset the overlay tracking to stay aligned with the worker's apply count.
-                    self._pending_overlays = []
-                    self._paint_submitted = self.worker.paint_applied_count
-                    self.history_slider.set_current_value(float(self._live_index()))
-                    self._rebuild_prompt_rows()  # now-live (reverted) prompts
-                    self._push_prompts()  # apply them to the resumed run
-                    self._sync_enabled()  # re-enable prompt editing
-                    self._refresh_preview_state()
+                self._do_revert()
             elif event.ui_element == self.cancel_button:
                 self._preview_index = None
                 self.history_slider.set_current_value(float(self._live_index()))

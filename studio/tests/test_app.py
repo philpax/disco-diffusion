@@ -128,3 +128,73 @@ def test_loading_screen_returns_false_on_quit(app):
     pygame.event.post(pygame.event.Event(pygame.QUIT))
     state = A._LoadingState(status="diffusion model")
     assert A._loading_screen(app.screen, state) is False
+
+
+def _key(key, mod=0):
+    return pygame.event.Event(pygame.KEYDOWN, key=key, mod=mod)
+
+
+def test_ctrl_s_opens_save_dialog(app):
+    app._frame_surface = pygame.Surface((app.width, app.height))
+    app._handle_event(_key(pygame.K_s, pygame.KMOD_CTRL))
+    assert app._file_dialog is not None and app._file_dialog.alive()
+
+
+def test_bracket_keys_change_brush_size(app):
+    app.brush_size = 48.0
+    app._handle_event(_key(pygame.K_RIGHTBRACKET))
+    assert app.brush_size > 48.0
+    app.brush_size = 48.0
+    app._handle_event(_key(pygame.K_LEFTBRACKET))
+    assert app.brush_size < 48.0
+
+
+def test_digit_selects_palette_colour(app):
+    app._handle_event(_key(pygame.K_3))
+    assert app.brush_color == app._swatch_colours()[2]
+
+
+def test_ctrl_z_reverts_to_latest_checkpoint(app):
+    img = np.zeros((4, 4, 3), np.uint8)
+    app._history = [
+        HistoryEntry(
+            latent=None, step=0, index=5, total=100, preview=img, label="start",
+            prompts=[("p", 1.0)], config={"clip_guidance_scale": 5000},
+        )
+    ]
+    app._hist_len = 1
+    seeked = []
+    app.worker = SimpleNamespace(
+        is_alive=lambda: True, finished=True, seek=seeked.append, set_prompts=lambda p: None,
+        paint_applied_count=0, latest_frame=lambda: None,
+    )
+    app.paused = True  # not running -> revert is allowed
+    app.session.config.clip_guidance_scale = 20000
+    app._handle_event(_key(pygame.K_z, pygame.KMOD_CTRL))
+    assert seeked == [0]  # reverted to the latest checkpoint (undo last edit)
+    assert app.session.config.clip_guidance_scale == 5000
+
+
+def test_ctrl_z_walks_back_through_history(app):
+    img = np.zeros((4, 4, 3), np.uint8)
+    app._history = [
+        HistoryEntry(latent=None, step=0, index=2, total=100, preview=img, label="start",
+                     prompts=[("p", 1.0)], config={}),
+        HistoryEntry(latent=None, step=0, index=20, total=100, preview=img, label="prompt",
+                     prompts=[("p", 1.0)], config={}),
+    ]
+    app._hist_len = 2
+    seeked = []
+
+    def seek(i):
+        seeked.append(i)
+        del app._history[i + 1:]  # mimic the worker's branch-truncation on seek
+
+    app.worker = SimpleNamespace(
+        is_alive=lambda: True, finished=True, seek=seek, set_prompts=lambda p: None,
+        paint_applied_count=0, latest_frame=lambda: None,
+    )
+    app.paused = True
+    for _ in range(3):
+        app._handle_event(_key(pygame.K_z, pygame.KMOD_CTRL))
+    assert seeked == [1, 0, 0]  # latest -> earlier -> clamped at the first checkpoint
