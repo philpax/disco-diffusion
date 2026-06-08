@@ -28,12 +28,19 @@ packages = ["src/disco_diffusion_studio"]
 dev = [
     "ruff>=0.6",
     "mypy>=1.10",
+    "pytest>=8.0",
 ]
 
 # This project is a member of the disco-diffusion uv workspace (its parent repo); the
 # library is the workspace root, and the PyTorch CUDA index/sources are inherited from it.
 [tool.uv.sources]
 disco-diffusion = { workspace = true }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Setting the native min window size uses pygame.Window.from_display_module (deprecated in
+# pygame-ce); harmless here and unrelated to the tests, so keep the output clean.
+filterwarnings = ["ignore:Please use Window.get_surface:DeprecationWarning"]
 
 [tool.ruff]
 line-length = 100
