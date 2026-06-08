@@ -34,10 +34,11 @@ import pygame
 import pygame_gui
 from disco_diffusion import DiscoSession, EncodedPrompt, RunConfig
 from disco_diffusion.config import AVAILABLE_CLIP_MODELS, Tunable, parse_schedule
+from PIL import Image
 from pydantic import BaseModel, ConfigDict
 from pygame_gui.core import ObjectID
 from pygame_gui.elements import UIDropDownMenu
-from pygame_gui.windows import UIColourPickerDialog, UIFileDialog
+from pygame_gui.windows import UIColourPickerDialog, UIConfirmationDialog, UIFileDialog
 
 from .layout import (
     CTRL_H,
@@ -352,6 +353,19 @@ class App:
         self._run_snapshot: dict[str, str] = {}
         self._current_labels: dict[str, pygame_gui.elements.UILabel] = {}
 
+        # img2img init image (per-run, applies on next Play): seed the run from an image instead
+        # of noise. _init_denoise (0-100%) maps to the skip_steps the run starts at — 100% = full
+        # re-diffusion (ignores the init's structure), 0% = keep the init (one step). Set by
+        # Open…/drag-drop (a file) or "Use current" (the on-screen frame); _init_surface is the
+        # canvas preview shown before Play.
+        self._init_image: Image.Image | None = None
+        self._init_label = "none"
+        self._init_denoise = 60
+        self._init_surface: pygame.Surface | None = None
+        self._init_dialog: UIFileDialog | None = None
+        # "Reset canvas" confirmation (discards the rendered frame so the init preview shows).
+        self._confirm_dialog: UIConfirmationDialog | None = None
+
         # Colours: the palette + recently-picked colours come from studio/config.toml. The RGB
         # picker prepends to the recents (capped, persisted), and swatches = palette + recents.
         self._colour_cfg: ColourConfig = load_colours()
@@ -508,7 +522,7 @@ class App:
         )
 
     def _modal_open(self) -> bool:
-        """True while a dialog window (RGB picker / save preset / save image) is open.
+        """True while a dialog window (RGB picker / save preset / open or save image) is open.
 
         Those are ``UIWindow``s pygame_gui draws over the canvas, but our raw mouse/keyboard
         canvas handling runs regardless — so while one is up we suppress painting, panning,
@@ -516,7 +530,13 @@ class App:
         """
         return any(
             w is not None and w.alive()
-            for w in (self._colour_picker, self._save_preset_window, self._file_dialog)
+            for w in (
+                self._colour_picker,
+                self._save_preset_window,
+                self._file_dialog,
+                self._init_dialog,
+                self._confirm_dialog,
+            )
         )
 
     def _swatch_colours(self) -> list[tuple[int, int, int]]:
@@ -567,12 +587,14 @@ class App:
         panel_w = self._panel_w()
         stack = Stack(MARGIN, self._image_area_h() + PAD, panel_w - 2 * MARGIN)
 
-        # Row 1: transport — Play / Stop | step (left-aligned) … status (right-aligned) | Save.
+        # Row 1: transport — Play / Stop / Reset | step (left) … status (right) | Save.
         r = stack.row(CTRL_H)
-        self.play_button = ui.UIButton(r.left(110), "Play", self.manager, object_id="#play_button")
-        self.stop_button = ui.UIButton(r.left(90), "Stop", self.manager, object_id="#stop_button")
-        self.save_button = ui.UIButton(r.right(90), "Save", self.manager, object_id="#save_button")
-        self.status_label = ui.UILabel(r.right(170), "", self.manager, object_id="#status_label")
+        self.play_button = ui.UIButton(r.left(100), "Play", self.manager, object_id="#play_button")
+        self.stop_button = ui.UIButton(r.left(80), "Stop", self.manager, object_id="#stop_button")
+        # Reset discards the rendered frame (after a confirm) so the init / empty canvas shows.
+        self.reset_button = ui.UIButton(r.left(70), "Reset", self.manager)
+        self.save_button = ui.UIButton(r.right(80), "Save", self.manager, object_id="#save_button")
+        self.status_label = ui.UILabel(r.right(150), "", self.manager, object_id="#status_label")
         self.step_label = ui.UILabel(r.fill(), "step 0 / 0", self.manager, object_id="#step_label")
 
         # Row 2: history scrubber — directly under transport. Drag to preview a checkpoint.
@@ -804,6 +826,38 @@ class App:
             r.left((inner_w - PAD) // 2), "Apply size", self.manager, container=container
         )
         self.swap_button = ui.UIButton(r.fill(), "Flip W/H", self.manager, container=container)
+        y += pitch
+
+        # Init image (per-run, img2img): seed the run from an image instead of noise. Open… picks
+        # a file (you can also drag-drop one onto the window); "Use current" takes the on-screen
+        # frame; Denoise sets how much the run re-diffuses it (applies on next Play).
+        y = section(y + 6, "Init image — applies on next Play")
+        self._init_status_label = ui.UILabel(
+            Row(0, y, inner_w, CTRL_H).fill(), f"Init: {self._init_label}", self.manager,
+            container=container,
+        )
+        y += pitch
+        r = Row(0, y, inner_w, CTRL_H)
+        third = (inner_w - 2 * PAD) // 3
+        self.open_init_button = ui.UIButton(
+            r.left(third), "Open…", self.manager, container=container
+        )
+        self.use_current_init_button = ui.UIButton(
+            r.left(third), "Use current", self.manager, container=container
+        )
+        self.clear_init_button = ui.UIButton(r.fill(), "Clear", self.manager, container=container)
+        y += pitch
+        r = Row(0, y, inner_w, CTRL_H)
+        ui.UILabel(r.left(80), "Denoise", self.manager, container=container)
+        self._init_denoise_label = ui.UILabel(r.right(48), "", self.manager, container=container)
+        self._init_denoise_slider = ui.UIHorizontalSlider(
+            r.fill(),
+            start_value=float(self._init_denoise),
+            value_range=(0.0, 100.0),
+            manager=self.manager,
+            container=container,
+        )
+        self._init_denoise_label.set_text(f"{self._init_denoise}%")
         y += pitch
 
         # Preset (above Guidance): a dropdown of saved recipes + Save. Selecting one applies the
@@ -1341,6 +1395,8 @@ class App:
             cache_lock=self._cache_lock,
             perlin=self.session.config.perlin_init,
             guidance_attrs=[sc.attr for sc in LIVE_SCALES],
+            init_image=self._init_image,
+            skip_steps=self._init_skip_steps(),
         )
         self.worker.set_prompts(self._prompt_snapshot())
         # A fresh worker starts with paint_applied_count == 0; reset the overlay tracking to match
@@ -1402,6 +1458,7 @@ class App:
         self._paint_layer = PaintLayer(self.width, self.height)
         self._pending_overlays = []
         self._paint_submitted = 0
+        self._rebuild_init_surface()  # the init preview is generation-resolution too
         # The canvas changed shape: drop the stale frame and refit the view.
         self._frame_surface = None
         self._frame_key = None
@@ -1489,6 +1546,104 @@ class App:
         self._save_surface = None
         self._status("Saved")
         log.info("saved %s", path)
+
+    # -- init image (img2img) --
+    def _init_skip_steps(self) -> int:
+        """skip_steps the next run starts at for the current init + denoise (0 when no init).
+
+        Denoise 100% -> skip 0 (full re-diffusion); 0% -> skip steps-1 (keep the init, one step).
+        """
+        if self._init_image is None:
+            return 0
+        skip = round((1 - self._init_denoise / 100) * self.steps)
+        return max(0, min(self.steps - 1, skip))
+
+    def _rebuild_init_surface(self) -> None:
+        """Build the canvas-resolution preview of the init image (shown before Play)."""
+        if self._init_image is None:
+            self._init_surface = None
+            return
+        pil = self._init_image.convert("RGB").resize(
+            (self.width, self.height), Image.Resampling.LANCZOS
+        )
+        self._init_surface = pygame.surfarray.make_surface(np.asarray(pil).swapaxes(0, 1))
+
+    def _set_init_image(self, image: Image.Image, label: str) -> None:
+        self._init_image = image
+        self._init_label = label
+        self._rebuild_init_surface()
+        status = getattr(self, "_init_status_label", None)
+        if status is not None:
+            status.set_text(f"Init: {label}")
+        self._status(f"Init set ({label})")
+
+    def _load_init_file(self, path_str: str) -> None:
+        try:
+            image = Image.open(path_str).convert("RGB")
+        except Exception as exc:  # noqa: BLE001 - surface the failure instead of crashing
+            log.exception("failed to load init image %s", path_str)
+            self._status(f"Bad image: {exc}")
+            return
+        self._set_init_image(image, Path(path_str).name)
+
+    def _use_current_as_init(self) -> None:
+        """Seed the next run from whatever is currently on the canvas (live frame or preview)."""
+        surface = self._displayed_surface()
+        if surface is None:
+            self._status("No frame")
+            return
+        arr = pygame.surfarray.array3d(surface).swapaxes(0, 1).astype("uint8")  # (H, W, 3)
+        self._set_init_image(Image.fromarray(arr), "current result")
+
+    def _clear_init(self) -> None:
+        self._init_image = None
+        self._init_label = "none"
+        self._init_surface = None
+        status = getattr(self, "_init_status_label", None)
+        if status is not None:
+            status.set_text("Init: none")
+        self._status("Init cleared")
+
+    def _open_init_dialog(self) -> None:
+        """Open a file dialog to pick an image to seed the run from."""
+        if self._init_dialog is not None and self._init_dialog.alive():
+            return
+        win_w, win_h = self._window_size()
+        rect = pygame.Rect(0, 0, 560, 440)
+        rect.center = (win_w // 2, win_h // 2)
+        self.out_dir.mkdir(parents=True, exist_ok=True)
+        self._init_dialog = UIFileDialog(
+            rect,
+            self.manager,
+            window_title="Open init image",
+            initial_file_path=f"{self.out_dir}/",
+            allow_existing_files_only=True,
+        )
+
+    def _open_reset_confirm(self) -> None:
+        """Confirm before discarding the rendered frame (so the init / empty canvas shows again)."""
+        if self._frame_surface is None and self.worker is None:
+            self._status("Nothing to clear")
+            return
+        if self._confirm_dialog is not None and self._confirm_dialog.alive():
+            return
+        win_w, win_h = self._window_size()
+        rect = pygame.Rect(0, 0, 360, 200)
+        rect.center = (win_w // 2, win_h // 2)
+        desc = "Discard the current image and stop the run? The init image (if set) is shown again."
+        self._confirm_dialog = UIConfirmationDialog(
+            rect, desc, self.manager, window_title="Reset canvas", action_short_name="Reset"
+        )
+
+    def _reset_canvas(self) -> None:
+        """Stop the run and drop the rendered frame, revealing the init preview / empty canvas."""
+        self._stop_run()  # also clears history / preview index
+        self._frame_surface = None
+        self._frame_key = None
+        self._preview_surface = None
+        self._preview_key = None
+        self.step_label.set_text("step 0 / 0")
+        self._status("Canvas cleared")
 
     # -- history / revert --
     def _request_checkpoint(self, label: str) -> None:
@@ -1693,6 +1848,8 @@ class App:
             elif event.ui_element == self.stop_button:
                 self._stop_run()
                 self._status("Stopped")
+            elif event.ui_element == self.reset_button:
+                self._open_reset_confirm()
             elif event.ui_element == self.save_button:
                 self._open_save_dialog()
             elif event.ui_element in (self.tab_settings, self.tab_current):
@@ -1704,6 +1861,12 @@ class App:
                 self._open_save_preset_dialog()
             elif event.ui_element == self.pick_color_button:
                 self._open_colour_picker()
+            elif event.ui_element == self.open_init_button:
+                self._open_init_dialog()
+            elif event.ui_element == self.use_current_init_button:
+                self._use_current_as_init()
+            elif event.ui_element == self.clear_init_button:
+                self._clear_init()
             elif event.ui_element is self._save_preset_ok:
                 self._save_current_preset()
             elif event.ui_element is self._save_preset_cancel:
@@ -1802,6 +1965,10 @@ class App:
                 self.session.config.eta = float(event.value)
                 self._eta_label.set_text(f"{event.value:.2f}")
                 self._mark_custom()
+            elif event.ui_element == self._init_denoise_slider:
+                # img2img strength — converted to skip_steps at the next Play.
+                self._init_denoise = int(round(event.value))
+                self._init_denoise_label.set_text(f"{self._init_denoise}%")
             elif event.ui_element in self._scale_sliders:
                 attr, is_int, vlabel, fmt = self._scale_sliders[event.ui_element]
                 value: float | int = int(round(event.value)) if is_int else float(event.value)
@@ -1842,19 +2009,34 @@ class App:
             elif event.ui_element in self._schedule_entries:
                 self._commit_schedule_entry(event.ui_element)
 
+        elif event.type == pygame_gui.UI_CONFIRMATION_DIALOG_CONFIRMED:
+            if event.ui_element is self._confirm_dialog:
+                self._reset_canvas()
+                self._confirm_dialog = None
+
+        elif event.type == pygame.DROPFILE:  # drag-drop an image onto the window -> init image
+            self._load_init_file(event.file)
+
         elif event.type == pygame_gui.UI_FILE_DIALOG_PATH_PICKED:
             if event.ui_element is self._file_dialog:
                 self._write_save(event.text)
                 self._file_dialog = None
+            elif event.ui_element is self._init_dialog:
+                self._load_init_file(event.text)
+                self._init_dialog = None
 
         elif event.type == pygame_gui.UI_WINDOW_CLOSE:
             if event.ui_element is self._file_dialog:  # cancelled
                 self._file_dialog = None
                 self._save_surface = None
+            elif event.ui_element is self._init_dialog:
+                self._init_dialog = None
             elif event.ui_element is self._save_preset_window:
                 self._close_save_preset_dialog()
             elif event.ui_element is self._colour_picker:
                 self._colour_picker = None
+            elif event.ui_element is self._confirm_dialog:  # cancelled
+                self._confirm_dialog = None
 
         return True
 
@@ -1927,6 +2109,17 @@ class App:
         surface = self._displayed_surface()
         if surface is not None:
             self._blit_canvas(surface)
+        elif self._init_surface is not None:
+            # No frame yet but an init image is set: preview it (dimmed) so it's clear the run
+            # will seed from it.
+            self._blit_canvas(self._init_surface)
+            scrim = pygame.Surface(crect.size, pygame.SRCALPHA)
+            scrim.fill((10, 12, 16, 120))
+            self.screen.blit(scrim, crect.topleft)
+            label = self._hud_font.render(
+                f"init: {self._init_label} — press Play to evolve", True, (224, 228, 236)
+            )
+            self.screen.blit(label, label.get_rect(center=crect.center))
         else:
             # No frame yet: show the canvas bounds so the size/aspect is clear before Play.
             pygame.draw.rect(self.screen, CANVAS_EMPTY_BG, crect)

@@ -17,6 +17,7 @@ from typing import Any
 import numpy as np
 import torch
 from disco_diffusion import DiscoSession, EncodedPrompt
+from PIL import Image
 
 log = logging.getLogger("disco_diffusion_studio.worker")
 
@@ -61,6 +62,8 @@ class GenerationWorker(threading.Thread):
         cache_lock: threading.Lock,
         perlin: bool = False,
         guidance_attrs: list[str] | None = None,
+        init_image: Image.Image | None = None,
+        skip_steps: int = 0,
     ) -> None:
         super().__init__(daemon=True)
         self._session = session
@@ -70,6 +73,10 @@ class GenerationWorker(threading.Thread):
         self._encode_cache = encode_cache
         self._cache_lock = cache_lock
         self._perlin = perlin  # seed the fresh run from Perlin noise instead of flat gaussian
+        # img2img: seed the fresh run from this image, noised to skip_steps in (resized to the
+        # generation size by the library). A revert still resumes from a saved latent, not this.
+        self._init_image = init_image
+        self._init_skip_steps = skip_steps
         # Live-guidance config attrs to snapshot into each checkpoint (so a revert restores them).
         self._guidance_attrs = list(guidance_attrs or [])
 
@@ -228,14 +235,16 @@ class GenerationWorker(threading.Thread):
         log.info("reverted to '%s' (step %d/%d)", entry.label, entry.index, entry.total)
 
     def _start_sampler(self) -> None:
-        # skip_steps=0 so any total-step count >= 1 is valid (no init image to skip toward).
+        # With no init image, skip_steps=0 so any total-step count >= 1 is valid (nothing to skip
+        # toward); with an init image we skip toward it (the library resizes it to the gen size).
         self._sampler = self._session.sampler(
             width=self._width,
             height=self._height,
             steps=self._steps,
             seed=None,
-            skip_steps=0,
+            skip_steps=self._init_skip_steps,
             perlin=self._perlin,
+            init_image=self._init_image,
         )
         self.total = self._sampler.total
         if self._last_items:  # restart path: re-apply the conditioning we already had
