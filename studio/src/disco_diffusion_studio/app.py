@@ -511,6 +511,18 @@ class App:
             isinstance(e, pygame_gui.elements.UITextEntryLine) for e in focus
         )
 
+    def _modal_open(self) -> bool:
+        """True while a dialog window (RGB picker / save preset / save image) is open.
+
+        Those are ``UIWindow``s pygame_gui draws over the canvas, but our raw mouse/keyboard
+        canvas handling runs regardless — so while one is up we suppress painting, panning,
+        zooming, swatch clicks, shortcuts, and the brush cursor to keep it from leaking through.
+        """
+        return any(
+            w is not None and w.alive()
+            for w in (self._colour_picker, self._save_preset_window, self._file_dialog)
+        )
+
     def _build_palette(self, rect: pygame.Rect) -> None:
         """Lay out the current-colour preview + swatch rects within ``rect`` (drawn custom)."""
         self._swatch_rects = []
@@ -1444,6 +1456,19 @@ class App:
             self._pending_size = (event.w, event.h)
             return True
 
+        # While a dialog window is open, let pygame_gui own the mouse/keyboard (it processed the
+        # event already, before us) and skip our canvas interactions so they don't leak through.
+        _MOUSE = (
+            pygame.MOUSEMOTION,
+            pygame.MOUSEBUTTONDOWN,
+            pygame.MOUSEBUTTONUP,
+            pygame.MOUSEWHEEL,
+        )
+        if event.type in _MOUSE and self._modal_open():
+            if event.type == pygame.MOUSEMOTION:
+                self._mouse_pos = event.pos  # keep the cursor position current for hover/HUD
+            return True
+
         if event.type == pygame.MOUSEMOTION:
             self._mouse_pos = event.pos
             if self._dragging_divider:
@@ -1498,7 +1523,7 @@ class App:
                 self.brush_size = max(4.0, min(160.0, self.brush_size * (1.1**event.y)))
                 self.size_slider.set_current_value(self.brush_size)
             return True
-        if event.type == pygame.KEYDOWN and not self._typing():
+        if event.type == pygame.KEYDOWN and not self._typing() and not self._modal_open():
             if event.key == pygame.K_SPACE:
                 self._toggle_play()
             elif event.key == pygame.K_f:
@@ -1741,10 +1766,12 @@ class App:
             if color == self.brush_color:
                 pygame.draw.rect(self.screen, (255, 255, 255), sr, width=2, border_radius=4)
         region = self._image_region()
-        # Brush ring (scaled by zoom) — only in draw mode (not navigating, not previewing).
+        # Brush ring (scaled by zoom) — only in draw mode (not navigating, not previewing, and
+        # not while a dialog window is up).
         if (
             not self._navigating
             and self._preview_index is None
+            and not self._modal_open()
             and region.collidepoint(self._mouse_pos)
         ):
             ring = max(2, int(self.brush_size * self._zoom))
