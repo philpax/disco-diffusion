@@ -15,21 +15,8 @@ import pygame
 # Brush kinds (in display order). Selected by name.
 BRUSHES = ["Soft", "Hard", "Spray"]
 
-# A compact, friendly palette (RGB 0-255).
-PALETTE: list[tuple[int, int, int]] = [
-    (0, 0, 0),
-    (255, 255, 255),
-    (127, 127, 127),
-    (214, 69, 65),
-    (232, 131, 58),
-    (241, 196, 15),
-    (46, 204, 113),
-    (52, 152, 219),
-    (108, 124, 255),
-    (155, 89, 182),
-    (236, 112, 180),
-    (245, 222, 179),
-]
+# The colour palette now lives in studio/config.toml (loaded via presets.load_colours), so it can
+# be edited and extended with recently-picked colours rather than hard-coded here.
 
 
 class PaintLayer:

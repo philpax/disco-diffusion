@@ -523,16 +523,26 @@ class App:
             for w in (self._colour_picker, self._save_preset_window, self._file_dialog)
         )
 
+    def _swatch_colours(self) -> list[tuple[int, int, int]]:
+        """The palette colours followed by any recently-picked ones not already in it."""
+        out = list(self._palette)
+        for c in self._recent:
+            if c not in out:
+                out.append(c)
+        return out
+
     def _build_palette(self, rect: pygame.Rect) -> None:
         """Lay out the current-colour preview + swatch rects within ``rect`` (drawn custom)."""
+        self._palette_rect = rect
         self._swatch_rects = []
         self._color_preview_rect = pygame.Rect(rect.x, rect.y, CTRL_H, CTRL_H)
         x = rect.x + CTRL_H + 10
-        n = len(PALETTE)
+        colours = self._swatch_colours()
+        n = max(len(colours), 1)
         gap = 4
-        sw = max(10, min(CTRL_H, (rect.right - x - (n - 1) * gap) // n))
+        sw = max(8, min(CTRL_H, (rect.right - x - (n - 1) * gap) // n))
         y = rect.y + (CTRL_H - sw) // 2
-        for i, color in enumerate(PALETTE):
+        for i, color in enumerate(colours):
             self._swatch_rects.append((pygame.Rect(x + i * (sw + gap), y, sw, sw), color))
 
     @property
@@ -611,8 +621,14 @@ class App:
             r.fill(), self.brush_size, (4.0, 160.0), self.manager
         )
 
-        # Row 4: colour palette — current-colour preview + swatches (custom-drawn) on its own row.
-        self._build_palette(stack.row(CTRL_H).fill())
+        # Row 4: colour palette — current-colour preview + swatches (custom-drawn), and an
+        # "RGB…" button that opens the arbitrary-colour picker. The preview/swatches occupy the
+        # space left of the button.
+        r = stack.row(CTRL_H)
+        self.pick_color_button = ui.UIButton(
+            r.right(70), "RGB…", self.manager, object_id="#add_button"
+        )
+        self._build_palette(r.fill())
 
         # Row 5: prompts header — Add + hint (hint fills the remaining width)
         r = stack.row(LABEL_H)
@@ -1789,6 +1805,35 @@ class App:
         pos = (10, region.bottom - chip.get_height() - 10)
         self.screen.blit(chip, pos)
         self.screen.blit(text, (pos[0] + pad, pos[1] + pad))
+
+    # -- colours --
+    def _open_colour_picker(self) -> None:
+        """Open the arbitrary-RGB picker, seeded with the current brush colour."""
+        if self._colour_picker is not None and self._colour_picker.alive():
+            return
+        win_w, win_h = self._window_size()
+        rect = pygame.Rect(0, 0, 420, 400)
+        rect.center = (win_w // 2, win_h // 2)
+        self._colour_picker = UIColourPickerDialog(
+            rect,
+            self.manager,
+            initial_colour=pygame.Color(*self.brush_color),
+            window_title="Pick a colour",
+        )
+
+    def _apply_picked_colour(self, rgb: tuple[int, int, int]) -> None:
+        """Adopt a picked colour as the brush colour and remember it (capped, persisted)."""
+        self.brush_color = rgb
+        # Remember it most-recent-first, de-duplicated and capped. Palette colours are already
+        # shown as fixed swatches, so they don't earn a recents slot.
+        if rgb not in self._palette:
+            self._recent = [rgb, *(c for c in self._recent if c != rgb)][:MAX_RECENT]
+            self._colour_cfg = ColourConfig(palette=self._palette, recent=self._recent)
+            try:
+                save_colours(self._colour_cfg)
+            except Exception:  # noqa: BLE001 - persistence is best-effort; don't crash the UI
+                log.exception("saving colour config failed")
+        self._build_palette(self._palette_rect)  # relayout swatches to include the new recent
 
     # -- painting --
     def _on_swatch(self, pos: tuple[int, int]) -> bool:
