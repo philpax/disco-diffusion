@@ -1928,6 +1928,73 @@ class App:
         self.screen.blit(chip, pos)
         self.screen.blit(text, (pos[0] + pad, pos[1] + pad))
 
+    def _history_tick_x(self, value: float, track: pygame.Rect, button_w: int) -> int:
+        """Screen x where the slider thumb centre sits for a step ``value`` (0..total)."""
+        total = float(max(self._history_total(), 1))
+        span = max(1, track.width - button_w)
+        frac = min(max(value / total, 0.0), 1.0)
+        return int(track.left + button_w / 2 + frac * span)
+
+    @staticmethod
+    def _history_tick_colour(label: str) -> tuple[int, int, int]:
+        """Colour a checkpoint tick by kind, so the history reads at a glance."""
+        if label.startswith("paint"):
+            return (118, 200, 140)  # green — painted strokes
+        if label.startswith("guidance"):
+            return PENDING_COLOR  # amber — guidance retunes
+        if label.startswith("preset"):
+            return (176, 136, 240)  # violet — preset loads
+        if "prompt" in label:
+            return READOUT_COLOR  # blue — prompt edits (edit / add / remove)
+        return MUTED_COLOR  # grey — the run's baseline ("start")
+
+    @staticmethod
+    def _brighten(c: tuple[int, int, int], t: float = 0.55) -> tuple[int, int, int]:
+        """Lerp a colour toward white (for the active / hovered tick), keeping its hue."""
+        return tuple(int(v + (255 - v) * t) for v in c)  # type: ignore[return-value]
+
+    def _draw_history_ticks(self) -> None:
+        """Mark each checkpoint's position on the (step-space) history slider.
+
+        Drawn after the UI so the ticks sit on top of the track; hovering the slider shows the
+        nearest checkpoint's label so the otherwise-invisible snap points are discoverable.
+        """
+        if not self._history or not self.history_slider.is_enabled:
+            return
+        track = self.history_slider.rect
+        button = getattr(self.history_slider, "sliding_button", None)
+        button_w = button.rect.width if button is not None else 26
+        base_y = track.bottom - 3
+        for i, cp in enumerate(self._history):
+            x = self._history_tick_x(float(cp.index), track, button_w)
+            active = self._preview_index == i
+            kind = self._history_tick_colour(cp.label)
+            colour = self._brighten(kind) if active else kind
+            height = 9 if active else 5
+            width = 2 if active else 1
+            pygame.draw.line(self.screen, colour, (x, base_y - height), (x, base_y), width)
+        # Hover: surface the nearest checkpoint's label above the slider (and accent its tick).
+        if track.collidepoint(self._mouse_pos) and not self._modal_open():
+            total = float(max(self._history_total(), 1))
+            span = max(1, track.width - button_w)
+            mval = (self._mouse_pos[0] - track.left - button_w / 2) / span * total
+            cp = min(self._history, key=lambda c: abs(c.index - mval))
+            x = self._history_tick_x(float(cp.index), track, button_w)
+            accent = self._brighten(self._history_tick_colour(cp.label))
+            pygame.draw.line(self.screen, accent, (x, base_y - 9), (x, base_y), 2)
+            label = f"{cp.label}  {cp.index}/{cp.total}"
+            text = self._hud_font.render(label, True, (228, 232, 240))
+            pad = 5
+            chip = pygame.Surface(
+                (text.get_width() + 2 * pad, text.get_height() + 2 * pad), pygame.SRCALPHA
+            )
+            chip.fill((18, 20, 28, 235))
+            cx = x - chip.get_width() // 2
+            cx = max(track.left, min(cx, track.right - chip.get_width()))
+            cy = track.top - chip.get_height() - 3
+            self.screen.blit(chip, (cx, cy))
+            self.screen.blit(text, (cx + pad, cy + pad))
+
     # -- colours --
     def _open_colour_picker(self) -> None:
         """Open the arbitrary-RGB picker, seeded with the current brush colour."""
@@ -2088,6 +2155,7 @@ class App:
             self._draw()
             self.manager.draw_ui(self.screen)
             self._draw_tools()
+            self._draw_history_ticks()
             pygame.display.flip()
         self._stop_run()
 
