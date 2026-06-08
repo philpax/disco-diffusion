@@ -86,6 +86,7 @@ from .worker import GenerationWorker, HistoryEntry
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger("disco_diffusion_studio")
 
+APP_TITLE = "Disco Diffusion Studio"  # window caption + loading-screen heading
 MIN_ZOOM, MAX_ZOOM = 0.1, 16.0  # view zoom bounds
 # Help HUD text per interaction mode (hold right mouse = navigate, release = draw).
 DRAW_HELP = (
@@ -192,6 +193,28 @@ CURRENT_PERRUN: list[tuple[str, str]] = [
 CUSTOM_PRESET = "Custom"
 
 
+def compute_window_size(width: int, height: int, sidebar_w: int, panel_h: int) -> tuple[int, int]:
+    """The initial window size: the canvas fitted into the image area, plus the chrome.
+
+    Seeded once from the desktop size (the window is user-resizable thereafter). Shared by the
+    startup loading screen (``main``) and ``App.__post_init__`` so both open at the same size.
+    """
+    chrome_w = sidebar_w + DIVIDER_W  # width taken by the sidebar + its divider
+    try:
+        sizes = pygame.display.get_desktop_sizes()
+        desk_w, desk_h = sizes[0] if sizes and sizes[0][0] > 0 else (1920, 1080)
+    except (pygame.error, IndexError):  # headless / older pygame
+        desk_w, desk_h = 1920, 1080
+    avail_w = max(320, int(desk_w * 0.9) - chrome_w)
+    avail_h = max(240, int(desk_h * 0.9) - panel_h)
+    # Fit the canvas into the available image area, never upscaling past 1:1.
+    scale = min(avail_w / width, avail_h / height, 1.0)
+    img_w, img_h = int(width * scale), int(height * scale)
+    # The left column is at least MIN_LEFT_PANEL_W wide; the sidebar always gets its full width on
+    # top of that, so the chrome never squeezes either below its minimum.
+    return max(MIN_LEFT_PANEL_W, img_w) + chrome_w, max(MIN_IMAGE_H, img_h) + panel_h
+
+
 # --- app ---------------------------------------------------------------------
 
 
@@ -241,23 +264,20 @@ class App:
         # Bottom-panel height — seeded to its natural default, then user-owned (draggable via a
         # horizontal divider, clamped to [PANEL_MIN, win_h - MIN_IMAGE_H]).
         self.panel_h = PANEL_H
-        chrome_w = self.sidebar_w + DIVIDER_W  # width taken by the sidebar + its divider
-        try:
-            sizes = pygame.display.get_desktop_sizes()
-            desk_w, desk_h = sizes[0] if sizes and sizes[0][0] > 0 else (1920, 1080)
-        except (pygame.error, IndexError):  # headless / older pygame
-            desk_w, desk_h = 1920, 1080
-        avail_w = max(320, int(desk_w * 0.9) - chrome_w)
-        avail_h = max(240, int(desk_h * 0.9) - self.panel_h)
-        # Fit the canvas into the available image area, never upscaling past 1:1.
-        scale = min(avail_w / self.width, avail_h / self.height, 1.0)
-        img_w, img_h = int(self.width * scale), int(self.height * scale)
-        # The left column is at least MIN_LEFT_PANEL_W wide; the sidebar always gets its full
-        # width on top of that, so the chrome never squeezes either below its minimum.
-        self.win_w = max(MIN_LEFT_PANEL_W, img_w) + chrome_w
-        self.win_h = max(MIN_IMAGE_H, img_h) + self.panel_h
-        self.screen = pygame.display.set_mode((self.win_w, self.win_h), pygame.RESIZABLE)
-        pygame.display.set_caption("Disco Diffusion - interactive")
+        # If a window already exists — the startup loading screen creates it at this exact size
+        # (see main()) — adopt it as-is, so we don't re-issue a SetWindowSize that a tiling WM
+        # would fight, and so there's no visible resize after the models finish loading. Only
+        # create the window here when constructed standalone (no loading screen, e.g. tests).
+        existing = pygame.display.get_surface()
+        if existing is not None:
+            self.screen = existing
+            self.win_w, self.win_h = existing.get_size()
+        else:
+            self.win_w, self.win_h = compute_window_size(
+                self.width, self.height, self.sidebar_w, self.panel_h
+            )
+            self.screen = pygame.display.set_mode((self.win_w, self.win_h), pygame.RESIZABLE)
+        pygame.display.set_caption(APP_TITLE)
         # Enforce the minimum size natively (SDL) instead of by re-calling set_mode on
         # resize. Re-calling set_mode issues a SetWindowSize that a tiling WM treats as the
         # app demanding geometry, snapping a floated window back under tiling. With a native
@@ -2223,6 +2243,57 @@ def int_or(text: str, fallback: int) -> int:
         return fallback
 
 
+@dataclass
+class _LoadingState:
+    """Shared between the loading thread and the loading screen."""
+
+    status: str = "starting"  # the component currently loading
+    session: DiscoSession | None = None
+    error: Exception | None = None
+    done: bool = False
+
+
+def _loading_screen(screen: pygame.Surface, state: _LoadingState) -> bool:
+    """Render a loading screen until the model load finishes; ``False`` if the user closes it."""
+    title_font = pygame.font.SysFont(None, 40)
+    status_font = pygame.font.SysFont(None, 24)
+    hint_font = pygame.font.SysFont(None, 18)
+    clock = pygame.time.Clock()
+    while True:
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                return False
+        w, h = screen.get_size()
+        cx, cy = w // 2, h // 2
+        screen.fill(WINDOW_BG)
+        title = title_font.render(APP_TITLE, True, (231, 233, 240))
+        screen.blit(title, title.get_rect(center=(cx, cy - 38)))
+        if state.error is not None:
+            msg = status_font.render(f"Failed to load: {state.error}", True, (239, 107, 129))
+            screen.blit(msg, msg.get_rect(center=(cx, cy + 8)))
+            hint = hint_font.render("close the window to exit", True, (122, 130, 144))
+            screen.blit(hint, hint.get_rect(center=(cx, cy + 42)))
+        else:
+            dots = "." * (1 + (pygame.time.get_ticks() // 400) % 3)
+            msg = status_font.render(f"loading {state.status}{dots}", True, (150, 196, 255))
+            screen.blit(msg, msg.get_rect(center=(cx, cy + 8)))
+            # An indeterminate progress sweep so it's clearly alive during the long load.
+            bar = pygame.Rect(0, 0, min(420, w - 80), 4)
+            bar.center = (cx, cy + 46)
+            pygame.draw.rect(screen, (38, 44, 56), bar, border_radius=2)
+            frac = (pygame.time.get_ticks() % 1400) / 1400.0
+            seg_w = bar.width // 4
+            sx = max(bar.left, bar.left + int((bar.width + seg_w) * frac) - seg_w)
+            seg_w = min(seg_w, bar.right - sx)
+            if seg_w > 0:
+                rect = (sx, bar.top, seg_w, bar.height)
+                pygame.draw.rect(screen, (109, 124, 255), rect, border_radius=2)
+        pygame.display.flip()
+        clock.tick(30)
+        if state.done and state.error is None:
+            return True
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--steps", type=int, default=100, help="Initial total step count.")
@@ -2265,10 +2336,53 @@ def main() -> None:
         height=snap_side(args.height),
         steps=args.steps,
     )
+
+    # Choose the device up front on the main thread: it may prompt on stdin for CPU fallback,
+    # which must not happen on the background loading thread (the prompt would be invisible behind
+    # the window). The loading thread is then handed the chosen device and never re-prompts.
+    from disco_diffusion.session import select_device
+
+    device = select_device(config.cpu)
+
+    # Open the window at its final size now, with a loading screen, so it never resizes after the
+    # models finish loading — App adopts this same window (see __post_init__).
+    win_w, win_h = compute_window_size(
+        snap_side(args.width), snap_side(args.height), SIDEBAR_W_DEFAULT, PANEL_H
+    )
+    screen = pygame.display.set_mode((win_w, win_h), pygame.RESIZABLE)
+    pygame.display.set_caption(APP_TITLE)
+    try:
+        pygame.Window.from_display_module().minimum_size = (MIN_WINDOW_W, MIN_IMAGE_H + PANEL_MIN)
+    except (AttributeError, pygame.error):  # older pygame / headless: best-effort only
+        pass
+
+    # Load the models on a background thread (the device/CPU work) while the loading screen
+    # pumps events and shows what's loading. (DiscoSession off the main thread is already how
+    # the in-app model reload works.)
+    state = _LoadingState()
+
+    def load() -> None:
+        try:
+            state.session = DiscoSession(
+                config, device=device, progress=lambda label: setattr(state, "status", label)
+            )
+        except Exception as exc:  # noqa: BLE001 - surfaced on the loading screen, re-raised below
+            log.exception("model load failed")
+            state.error = exc
+        finally:
+            state.done = True
+
     log.info("loading models (this can take a minute)…")
-    session = DiscoSession(config)
+    threading.Thread(target=load, daemon=True).start()
+    if not _loading_screen(screen, state):  # window closed before the load succeeded
+        pygame.quit()
+        if state.error is not None:  # it failed (the screen showed the error); surface it
+            raise state.error
+        return  # the user aborted while still loading
     log.info("models loaded")
 
+    session = state.session
+    assert session is not None
     app = App(
         session=session,
         out_dir=args.out,
