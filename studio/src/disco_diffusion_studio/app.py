@@ -1642,13 +1642,16 @@ class App:
         frame = self.worker.latest_frame()
         if frame is None:
             return
+        # Refresh the step label every frame (cheap — pygame_gui no-ops if unchanged). A UI
+        # rebuild (resize / divider drag) recreates the label as "step 0 / 0", so updating it
+        # only when the *surface* changes would leave it stale at "0 / 0" once generation stops.
+        self.step_label.set_text(f"step {frame.index} / {frame.total}")
         key = (id(frame.image), frame.index)
         if key == self._frame_key:
             return
         self._frame_key = key
         # pygame.surfarray expects (W, H, 3), so swap the first two axes.
         self._frame_surface = pygame.surfarray.make_surface(frame.image.swapaxes(0, 1))
-        self.step_label.set_text(f"step {frame.index} / {frame.total}")
 
     def _auto_apply_on_blur(self) -> None:
         """Apply a text box when keyboard focus leaves it (no Enter needed).
