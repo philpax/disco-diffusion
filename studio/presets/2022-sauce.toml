@@ -1,0 +1,20 @@
+name = "2022 sauce"
+
+# The high-detail, heavily-regularised, multi-CLIP look from the archive (ic_pow 15, six models).
+[config]
+clip_guidance_scale = 15000
+tv_scale = 250000.0
+range_scale = 10000.0
+sat_scale = 50000.0
+clamp_max = 0.09
+cutn_batches = 1
+eta = 0.8
+perlin_init = true
+cut_overview = "[18]*200+[14]*200+[4]*400+[2]*200"
+cut_innercut = "[2]*200+[6]*200+[8]*400+[18]*200"
+cut_ic_pow = "[15]*1000"
+cut_icgray_p = "[0.2]*200+[0.1]*200+[0.1]*200+[0.1]*200+[0.1]*200"
+
+[models]
+clip_models = ["ViT-B/32", "ViT-B/16", "ViT-L/14", "RN101", "RN50", "RN50x4"]
+use_secondary_model = false
