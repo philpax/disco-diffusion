@@ -615,7 +615,8 @@ class App:
         )
 
         # Fixed-height scrolling prompt list (extra rows scroll), filling the rest of the panel.
-        list_rect = pygame.Rect(MARGIN, stack.y, panel_w - 2 * MARGIN, PROMPT_LIST_H)
+        # Pulled up under the header (less the usual row pad) to tighten the gap to the first row.
+        list_rect = pygame.Rect(MARGIN, stack.y - 8, panel_w - 2 * MARGIN, PROMPT_LIST_H)
         self.prompt_panel = ui.UIScrollingContainer(list_rect, self.manager)
         # Lay rows out narrower than the viewport so the vertical scrollbar never forces a
         # horizontal one (a horizontal bar appears only when content is wider than the view).
