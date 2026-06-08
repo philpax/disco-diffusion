@@ -44,6 +44,7 @@ class HistoryEntry:
     preview: np.ndarray  # (H, W, 3) uint8 — the image at this checkpoint
     label: str
     prompts: list[tuple[str, float]] = field(default_factory=list)  # (text, weight) at capture
+    config: dict[str, float] = field(default_factory=dict)  # live guidance values at capture
 
 
 class GenerationWorker(threading.Thread):
@@ -59,6 +60,7 @@ class GenerationWorker(threading.Thread):
         encode_cache: dict[str, EncodedPrompt],
         cache_lock: threading.Lock,
         perlin: bool = False,
+        guidance_attrs: list[str] | None = None,
     ) -> None:
         super().__init__(daemon=True)
         self._session = session
@@ -68,6 +70,8 @@ class GenerationWorker(threading.Thread):
         self._encode_cache = encode_cache
         self._cache_lock = cache_lock
         self._perlin = perlin  # seed the fresh run from Perlin noise instead of flat gaussian
+        # Live-guidance config attrs to snapshot into each checkpoint (so a revert restores them).
+        self._guidance_attrs = list(guidance_attrs or [])
 
         self._resume = threading.Event()
         self._resume.set()  # start running (not paused)
@@ -178,6 +182,7 @@ class GenerationWorker(threading.Thread):
         if state is None or pil is None:
             return
         latent, step = state
+        cfg = self._session.config
         entry = HistoryEntry(
             latent=latent,
             step=step,
@@ -186,6 +191,7 @@ class GenerationWorker(threading.Thread):
             preview=np.asarray(pil),
             label=label,
             prompts=list(self._last_prompts),
+            config={a: getattr(cfg, a) for a in self._guidance_attrs},
         )
         with self._lock:
             self.history.append(entry)

@@ -104,6 +104,10 @@ NOISE_OPACITY_GAMMA = 2.0
 # Debounce for the model auto-reload: changing the CLIP set / secondary toggle queues a reload
 # that fires this long after the *last* change, so rapid toggling doesn't reload repeatedly.
 RELOAD_DEBOUNCE_MS = 1200
+# Debounce for the guidance-change history checkpoint: a guidance slider streams events while
+# dragged, so we checkpoint once the value has been quiescent for this long (one settled change
+# = one revertible entry), rather than once per pixel of the drag.
+GUIDANCE_CHECKPOINT_MS = 500
 
 
 class LiveScale(BaseModel):
@@ -310,6 +314,9 @@ class App:
         self._reload_thread: threading.Thread | None = None
         self._reload_result: dict[str, object] | None = None
         self._reload_queued_at: int | None = None  # pygame ticks at which to fire the auto-reload
+        # pygame ticks at which to drop a guidance-change checkpoint (set when a guidance slider
+        # moves, pushed back on each further move, fired once the value settles). None = idle.
+        self._guidance_checkpoint_at: int | None = None
         # The preset matching the loaded session (or "Custom"); the dropdown's selected entry.
         self._preset_selection = self._detect_preset()
 
@@ -1291,6 +1298,7 @@ class App:
             encode_cache=self._encode_cache,
             cache_lock=self._cache_lock,
             perlin=self.session.config.perlin_init,
+            guidance_attrs=[sc.attr for sc in LIVE_SCALES],
         )
         self.worker.set_prompts(self._prompt_snapshot())
         # A fresh worker starts with paint_applied_count == 0; reset the overlay tracking to match
@@ -1692,10 +1700,15 @@ class App:
                 self._paint_layer.clear()
             elif event.ui_element == self.revert_button:
                 if self._preview_index is not None and self.worker is not None:
+                    entry = self._history[self._preview_index]
                     # Adopt the checkpoint's prompts as the live set, then branch from it.
-                    self.prompts = [
-                        PromptRow(t, w) for t, w in self._history[self._preview_index].prompts
-                    ]
+                    self.prompts = [PromptRow(t, w) for t, w in entry.prompts]
+                    # Restore the live guidance captured at the checkpoint (undo the changes made
+                    # since), syncing the sliders; cancel any pending guidance checkpoint.
+                    for attr, cfg_value in entry.config.items():
+                        setattr(self.session.config, attr, cfg_value)
+                    self._guidance_checkpoint_at = None
+                    self._refresh_advanced_widgets()
                     self.worker.seek(self._preview_index)
                     self._preview_index = None
                     self._preview_prompts = None
@@ -1742,6 +1755,8 @@ class App:
                 setattr(self.session.config, attr, value)
                 vlabel.set_text(fmt.format(value))
                 self._mark_custom()
+                # Drop a revert point once the drag settles (debounced in run()).
+                self._guidance_checkpoint_at = pygame.time.get_ticks() + GUIDANCE_CHECKPOINT_MS
             else:
                 slider_idx = self._weight_sliders.get(event.ui_element)
                 if slider_idx is not None and 0 <= slider_idx < len(self.prompts):
@@ -2038,6 +2053,13 @@ class App:
             ):
                 self._reload_queued_at = None
                 self._start_reload()
+            # Drop a "guidance" checkpoint once a guidance slider has settled (no-op if no run).
+            if (
+                self._guidance_checkpoint_at is not None
+                and pygame.time.get_ticks() >= self._guidance_checkpoint_at
+            ):
+                self._guidance_checkpoint_at = None
+                self._request_checkpoint("guidance")
             # When the run finishes (worker idles) or exits unexpectedly, drop to a paused
             # state so controls/history are usable and the image can still be reverted.
             wk = self.worker
