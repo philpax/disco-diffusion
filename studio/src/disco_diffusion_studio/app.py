@@ -1188,8 +1188,13 @@ class App:
             perlin=self.session.config.perlin_init,
         )
         self.worker.set_prompts(self._prompt_snapshot())
+        # A fresh worker starts with paint_applied_count == 0; reset the overlay tracking to match
+        # and drop stale overlays from the previous run. Any stroke painted before Play (still on
+        # the active layer) is flushed as the new run's first paint batch rather than discarded.
+        self._pending_overlays = []
+        self._paint_submitted = 0
         if not self._paint_layer.empty():
-            self._paint_layer.dirty = True  # re-send any standing strokes to the new run
+            self._flush_stroke()
         # Freeze the per-run settings this run uses, for the "Current" tab to show while it runs.
         self._run_snapshot = self._perrun_values()
         self._history = []
@@ -1237,9 +1242,11 @@ class App:
         self.height = snap_side(height)
         self.width_entry.set_text(str(self.width))
         self.height_entry.set_text(str(self.height))
-        # The paint layer is generation-resolution, so rebuild it for the new size.
+        # The paint layer is generation-resolution, so rebuild it for the new size; the stale
+        # overlays (old resolution) are dropped too.
         self._paint_layer = PaintLayer(self.width, self.height)
-        self._paint_awaiting_bake = False
+        self._pending_overlays = []
+        self._paint_submitted = 0
         # The canvas changed shape: drop the stale frame and refit the view.
         self._frame_surface = None
         self._frame_key = None
@@ -1472,7 +1479,9 @@ class App:
         if event.type == pygame.MOUSEBUTTONUP:
             if event.button == 1:
                 self._dragging_divider = False
-                self._painting = False
+                if self._painting:  # a completed stroke becomes one paint batch / checkpoint
+                    self._painting = False
+                    self._flush_stroke()
                 self._last_gen = None
             elif event.button == 3:
                 self._navigating = False
@@ -1711,9 +1720,13 @@ class App:
                 f"{self.width} × {self.height} — press Play", True, (140, 147, 160)
             )
             self.screen.blit(label, label.get_rect(center=crect.center))
-        # Paint overlay only on the live view (hidden while previewing history).
-        if self._preview_index is None and not self._paint_layer.empty():
-            self._blit_canvas(self._paint_layer.to_surface())
+        # Paint overlays only on the live view (hidden while previewing history): the in-progress
+        # stroke plus any flushed strokes not yet baked into a published frame.
+        if self._preview_index is None:
+            for overlay, _ in self._pending_overlays:
+                self._blit_canvas(overlay)
+            if not self._paint_layer.empty():
+                self._blit_canvas(self._paint_layer.to_surface())
         pygame.draw.rect(self.screen, CANVAS_BORDER, crect, 1)  # canvas outline at any zoom
         self.screen.set_clip(None)
         pygame.draw.line(self.screen, DIVIDER, (0, img_h), (panel_w, img_h))
@@ -1781,28 +1794,41 @@ class App:
             )
         self._last_gen = gen
 
-    def _sync_paint(self) -> None:
-        """Hand new strokes to the worker, and clear the overlay once a step has baked them."""
+    def _flush_stroke(self) -> None:
+        """Hand the just-finished stroke to the worker as one batch (its own checkpoint).
+
+        The stroke stays on screen as a pending overlay until a baked frame incorporates it
+        (the injecting step takes seconds), then clears. Each stroke gets its own paint batch,
+        so painting with different settings yields separate history entries rather than merging.
+        """
         layer = self._paint_layer
-        if layer.dirty and self.worker is not None and self.worker.is_alive():
-            layer.dirty = False
-            rgb, alpha, tint = layer.snapshot()
-            # Gamma-shape the *injected* mask for noise-mode pixels (tint/alpha = how much of
-            # the pixel is noise-mode), keeping the on-screen overlay at the raw opacity.
-            frac_noise = np.divide(tint, alpha, out=np.zeros_like(tint), where=alpha > 1e-6)
-            shaped = NOISE_MAX_INJECT * alpha**NOISE_OPACITY_GAMMA
-            alpha = alpha * (1.0 - frac_noise) + shaped * frac_noise
-            self.worker.set_paint(rgb, alpha, tint)
-            self._paint_awaiting_bake = True
-            self._paint_baseline = self.worker.paint_applied_count
-        # Clear the overlay only when a *published frame* that incorporated the paint arrives —
-        # not merely when the worker started applying it. The injecting step takes seconds, so
-        # clearing on apply would make the stroke vanish before the baked image catches up.
-        if self._paint_awaiting_bake and not self._painting and self.worker is not None:
-            frame = self.worker.latest_frame()
-            if frame is not None and frame.paint_applied > self._paint_baseline:
-                layer.clear()
-                self._paint_awaiting_bake = False
+        if layer.empty():
+            return
+        if self.worker is None or not self.worker.is_alive():
+            return  # no run yet: keep the stroke on the active overlay; _start_run flushes it
+        rgb, alpha, tint = layer.snapshot()
+        # Gamma-shape the *injected* mask for noise-mode pixels (tint/alpha = how much of the
+        # pixel is noise-mode), keeping the on-screen overlay at the raw opacity.
+        frac_noise = np.divide(tint, alpha, out=np.zeros_like(tint), where=alpha > 1e-6)
+        shaped = NOISE_MAX_INJECT * alpha**NOISE_OPACITY_GAMMA
+        alpha = alpha * (1.0 - frac_noise) + shaped * frac_noise
+        label = f"paint {self.brush_type.lower()} {int(self.brush_size)}px"
+        # _paint_submitted mirrors the worker's apply count: max(..)+1 keeps it monotonic even
+        # if a frame's count has overtaken our last target (e.g. after a revert reset it).
+        self._paint_submitted = max(self._paint_submitted, self.worker.paint_applied_count) + 1
+        self.worker.set_paint(rgb, alpha, tint, label)
+        self._pending_overlays.append((layer.to_surface().copy(), self._paint_submitted))
+        layer.clear()  # next stroke starts fresh; the overlay copy keeps this one visible
+
+    def _sync_paint(self) -> None:
+        """Drop pending stroke overlays once a baked frame has incorporated them."""
+        if self.worker is None or not self._pending_overlays:
+            return
+        frame = self.worker.latest_frame()
+        if frame is not None:
+            self._pending_overlays = [
+                item for item in self._pending_overlays if item[1] > frame.paint_applied
+            ]
 
     # -- main loop --
     def run(self) -> None:

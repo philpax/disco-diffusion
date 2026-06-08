@@ -77,7 +77,10 @@ class GenerationWorker(threading.Thread):
 
         self._lock = threading.Lock()
         self._pending: list[tuple[str, float]] | None = None  # prompts awaiting (re)encode
-        self._pending_paint: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None
+        # A FIFO of paint batches (rgb, alpha, tint, label). Each is injected on its own step
+        # with its own checkpoint, so successive strokes stay separate edits in the history
+        # rather than coalescing into one.
+        self._pending_paints: list[tuple[np.ndarray, np.ndarray, np.ndarray, str]] = []
         self._pending_seek: int | None = None  # history index to revert to
         self._checkpoint_label: str | None = None  # request a checkpoint before the next step
         self._frame: Frame | None = None
@@ -111,13 +114,16 @@ class GenerationWorker(threading.Thread):
         with self._lock:
             return self._frame
 
-    def set_paint(self, rgb: np.ndarray, alpha: np.ndarray, tint: np.ndarray) -> None:
+    def set_paint(
+        self, rgb: np.ndarray, alpha: np.ndarray, tint: np.ndarray, label: str = "paint"
+    ) -> None:
+        """Queue a paint batch (one completed stroke); injected on its own step."""
         with self._lock:
-            self._pending_paint = (rgb, alpha, tint)
+            self._pending_paints.append((rgb, alpha, tint, label))
 
     def has_pending_paint(self) -> bool:
         with self._lock:
-            return self._pending_paint is not None
+            return bool(self._pending_paints)
 
     def checkpoint(self, label: str) -> None:
         """Request an edit checkpoint (captured before the next step)."""
@@ -160,10 +166,9 @@ class GenerationWorker(threading.Thread):
         if not self._sampler.has_output:
             return
         with self._lock:
-            paint = self._pending_paint
-            self._pending_paint = None
-        if paint is None:
-            return
+            if not self._pending_paints:
+                return
+            paint = self._pending_paints.pop(0)  # one stroke per step (FIFO)
         self._sampler.paint(paint[0], paint[1], paint[2])  # injects into the sample, in place
         self.paint_applied_count += 1
 
@@ -192,6 +197,10 @@ class GenerationWorker(threading.Thread):
         with self._lock:
             index = self._pending_seek
             self._pending_seek = None
+            # Only an actual revert abandons queued strokes — this runs every loop iteration, so
+            # clearing unconditionally here would wipe paint before it was ever injected.
+            if index is not None:
+                self._pending_paints.clear()
         if index is None or not (0 <= index < len(self.history)):
             return
         entry = self.history[index]
@@ -270,12 +279,14 @@ class GenerationWorker(threading.Thread):
                     time.sleep(0.03)  # idle (done/paused) but stay responsive to seek/stop
                     continue
                 # Checkpoint the pre-edit state before applying paint or a flagged prompt edit.
+                # Each queued stroke carries its own label, so successive paints checkpoint (and
+                # bake) one at a time rather than merging into a single edit.
                 with self._lock:
                     label = self._checkpoint_label
                     self._checkpoint_label = None
-                    has_paint = self._pending_paint is not None
-                if label is not None or has_paint:
-                    self._add_checkpoint(label or "paint")
+                    paint_label = self._pending_paints[0][3] if self._pending_paints else None
+                if label is not None or paint_label is not None:
+                    self._add_checkpoint(label or paint_label or "paint")
 
                 self._apply_pending()  # re-mix conditioning
                 self._apply_pending_paint()  # inject painted pixels
