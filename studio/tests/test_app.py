@@ -10,7 +10,7 @@ import pygame
 import pygame_gui
 
 from disco_diffusion_studio import app as A
-from disco_diffusion_studio.worker import HistoryEntry
+from disco_diffusion_studio.worker import HistoryEntry, PromptSpec
 
 
 def test_app_constructs_and_renders(app):
@@ -66,7 +66,8 @@ def test_revert_restores_guidance_and_eta(app):
     app._history = [
         HistoryEntry(
             latent=None, step=0, index=5, total=100, preview=img, label="start",
-            prompts=[("a prompt", 1.0)], config={"clip_guidance_scale": 5000, "eta": 0.8},
+            prompts=[PromptSpec(text="a prompt", weight=1.0, muted=False)],
+            config={"clip_guidance_scale": 5000, "eta": 0.8},
         )
     ]
     app._hist_len = 1
@@ -102,6 +103,21 @@ def test_picked_colour_is_remembered(app):
     after_custom = len(app._recent)
     app._apply_picked_colour(app._palette[0])
     assert len(app._recent) == after_custom
+
+
+def test_mute_button_toggles_and_excludes_from_snapshot(app):
+    app.prompts = [A.PromptRow("a", 1.0), A.PromptRow("b", 1.0)]
+    app._rebuild_prompt_rows()
+    mute_btn = next(b for b, i in app._mute_buttons.items() if i == 1)
+    app._handle_event(pygame.event.Event(pygame_gui.UI_BUTTON_PRESSED, ui_element=mute_btn))
+    assert app.prompts[1].muted is True
+    # the snapshot carries the muted flag (so the worker excludes it but checkpoints keep it)
+    assert app._prompt_snapshot() == [
+        PromptSpec(text="a", weight=1.0, muted=False),
+        PromptSpec(text="b", weight=1.0, muted=True),
+    ]
+    app._handle_event(pygame.event.Event(pygame_gui.UI_BUTTON_PRESSED, ui_element=mute_btn))
+    assert app.prompts[1].muted is False
 
 
 def test_panel_height_clamps(app):
@@ -159,7 +175,8 @@ def test_ctrl_z_reverts_to_latest_checkpoint(app):
     app._history = [
         HistoryEntry(
             latent=None, step=0, index=5, total=100, preview=img, label="start",
-            prompts=[("p", 1.0)], config={"clip_guidance_scale": 5000},
+            prompts=[PromptSpec(text="p", weight=1.0, muted=False)],
+            config={"clip_guidance_scale": 5000},
         )
     ]
     app._hist_len = 1
@@ -179,9 +196,9 @@ def test_ctrl_z_walks_back_through_history(app):
     img = np.zeros((4, 4, 3), np.uint8)
     app._history = [
         HistoryEntry(latent=None, step=0, index=2, total=100, preview=img, label="start",
-                     prompts=[("p", 1.0)], config={}),
+                     prompts=[PromptSpec(text="p", weight=1.0, muted=False)], config={}),
         HistoryEntry(latent=None, step=0, index=20, total=100, preview=img, label="prompt",
-                     prompts=[("p", 1.0)], config={}),
+                     prompts=[PromptSpec(text="p", weight=1.0, muted=False)], config={}),
     ]
     app._hist_len = 2
     seeked = []

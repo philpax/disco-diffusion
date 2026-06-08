@@ -12,7 +12,7 @@ import logging
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, NamedTuple
 
 import numpy as np
 import torch
@@ -22,6 +22,19 @@ from PIL import Image
 log = logging.getLogger("disco_diffusion_studio.worker")
 
 MAX_HISTORY = 60  # cap on edit-history checkpoints (each holds a CPU latent)
+
+
+class PromptSpec(NamedTuple):
+    """One prompt as handed to the worker / stored in a checkpoint.
+
+    A ``NamedTuple`` (not a dataclass) so it stays tuple-compatible — it unpacks as
+    ``text, weight, muted`` and compares equal to a plain 3-tuple — while giving the wire
+    format between the UI and the worker a name and typed fields.
+    """
+
+    text: str
+    weight: float
+    muted: bool
 
 
 @dataclass
@@ -44,7 +57,7 @@ class HistoryEntry:
     total: int
     preview: np.ndarray  # (H, W, 3) uint8 — the image at this checkpoint
     label: str
-    prompts: list[tuple[str, float]] = field(default_factory=list)  # (text, weight) at capture
+    prompts: list[PromptSpec] = field(default_factory=list)  # (text, weight, muted) at capture
     config: dict[str, float] = field(default_factory=dict)  # live guidance values at capture
 
 
@@ -88,7 +101,7 @@ class GenerationWorker(threading.Thread):
         self._stop_event = threading.Event()
 
         self._lock = threading.Lock()
-        self._pending: list[tuple[str, float]] | None = None  # prompts awaiting (re)encode
+        self._pending: list[PromptSpec] | None = None  # prompts awaiting (re)encode
         # A FIFO of paint batches (rgb, alpha, tint, label). Each is injected on its own step
         # with its own checkpoint, so successive strokes stay separate edits in the history
         # rather than coalescing into one.
@@ -98,7 +111,7 @@ class GenerationWorker(threading.Thread):
         self._frame: Frame | None = None
         self._sampler: Any = None
         self._last_items: list[tuple[EncodedPrompt, float]] = []  # conditioning to re-apply
-        self._last_prompts: list[tuple[str, float]] = []  # (text, weight) shown in the UI
+        self._last_prompts: list[PromptSpec] = []  # (text, weight, muted) shown in the UI
         self.history: list[HistoryEntry] = []
         self._started_history = False
         self.finished = False
@@ -108,7 +121,7 @@ class GenerationWorker(threading.Thread):
         self.total = session.diffusion_for(steps).num_timesteps  # skip_steps=0 below
 
     # -- control (called from UI thread) --
-    def set_prompts(self, prompts: list[tuple[str, float]]) -> None:
+    def set_prompts(self, prompts: list[PromptSpec]) -> None:
         with self._lock:
             self._pending = list(prompts)
 
@@ -169,7 +182,11 @@ class GenerationWorker(threading.Thread):
         if pending is None:
             return
         self._last_prompts = list(pending)
-        self._last_items = [(self._encode(t), w) for t, w in pending if t.strip()]
+        # Muted (or empty) prompts are kept in _last_prompts (so a checkpoint/revert preserves
+        # them) but excluded from the conditioning the sampler actually guides on.
+        self._last_items = [
+            (self._encode(t), w) for t, w, muted in pending if t.strip() and not muted
+        ]
         self._sampler.set_conditioning(self._last_items)
 
     def _apply_pending_paint(self) -> None:

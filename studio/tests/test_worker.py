@@ -14,7 +14,7 @@ from types import SimpleNamespace
 import numpy as np
 from PIL import Image
 
-from disco_diffusion_studio.worker import GenerationWorker
+from disco_diffusion_studio.worker import GenerationWorker, PromptSpec
 
 
 class _StepResult:
@@ -120,3 +120,32 @@ def test_checkpoints_snapshot_guidance_and_eta():
     assert start.config["eta"] == 0.8
     assert guidance.config["clip_guidance_scale"] == 12345
     assert guidance.config["eta"] == 0.3  # eta is captured, so Revert can restore it
+
+
+def test_muted_and_empty_prompts_excluded_from_conditioning():
+    recorded = []
+
+    class RecSampler(StubSampler):
+        def set_conditioning(self, items):
+            recorded.append(items)
+
+    session = SimpleNamespace(
+        config=SimpleNamespace(),
+        diffusion_for=lambda steps: SimpleNamespace(num_timesteps=20),
+        sampler=lambda **kw: RecSampler(),
+        encode=lambda text: f"emb:{text}",
+    )
+    worker = GenerationWorker(
+        session, width=64, height=64, steps=20, encode_cache={}, cache_lock=threading.Lock()
+    )
+    specs = [
+        PromptSpec(text="a", weight=1.0, muted=False),
+        PromptSpec(text="b", weight=0.5, muted=True),
+        PromptSpec(text="", weight=1.0, muted=False),
+    ]
+    worker._start_sampler()
+    worker.set_prompts(specs)
+    worker._apply_pending()
+    assert recorded[-1] == [("emb:a", 1.0)]  # only the active, non-muted, non-empty prompt
+    # but all prompts are kept on _last_prompts, so a checkpoint/revert preserves the muted one
+    assert worker._last_prompts == specs

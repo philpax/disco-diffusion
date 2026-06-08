@@ -82,7 +82,7 @@ from .theme import (
     THEME,
     WINDOW_BG,
 )
-from .worker import GenerationWorker, HistoryEntry
+from .worker import GenerationWorker, HistoryEntry, PromptSpec
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger("disco_diffusion_studio")
@@ -223,6 +223,7 @@ def compute_window_size(width: int, height: int, sidebar_w: int, panel_h: int) -
 class PromptRow:
     text: str = ""
     weight: float = 1.0
+    muted: bool = False  # excluded from the conditioning mix, but kept (text + weight preserved)
 
 
 @dataclass
@@ -293,6 +294,7 @@ class App:
         # element-reference tables, rebuilt by _build_ui
         self._row_elements: list[pygame_gui.core.UIElement] = []
         self._remove_buttons: dict[pygame_gui.elements.UIButton, int] = {}
+        self._mute_buttons: dict[pygame_gui.elements.UIButton, int] = {}
         self._prompt_entries: dict[pygame_gui.elements.UITextEntryLine, int] = {}
         self._weight_sliders: dict[pygame_gui.elements.UIHorizontalSlider, int] = {}
         # The prompt entry that last held keyboard focus, so we can auto-apply its text
@@ -578,6 +580,7 @@ class App:
     def _build_ui(self) -> None:
         self.manager.clear_and_reset()
         self._remove_buttons.clear()
+        self._mute_buttons.clear()
         self._prompt_entries.clear()
         self._weight_sliders.clear()
         self._row_elements.clear()
@@ -659,7 +662,7 @@ class App:
         )
         self.hint_label = ui.UILabel(
             r.fill(),
-            "weight 0-2 applies instantly · text applies on Enter or click-away · % = mix used",
+            "weight 0-2 applies instantly · Enter/click-away applies text · M mutes · % = mix",
             self.manager,
             object_id="#hint_label",
         )
@@ -708,6 +711,7 @@ class App:
             el.kill()
         self._row_elements.clear()
         self._remove_buttons.clear()
+        self._mute_buttons.clear()
         self._prompt_entries.clear()
         self._weight_sliders.clear()
 
@@ -717,9 +721,14 @@ class App:
         v_pad = (ROW_PITCH - CTRL_H) // 2  # vertically centre widgets in their row pitch
         prompts = self._displayed_prompts()
         for i, prompt in enumerate(prompts):
-            # Pack: [text fills] [slider] [weight readout] [X]. Right-side widgets are taken
-            # first so the text entry flexes into whatever width is left.
+            # Pack: [mute] [text fills] [slider] [weight readout] [X]. Right-side widgets are
+            # taken first so the text entry flexes into whatever width is left.
             r = Row(0, i * ROW_PITCH + v_pad, inner_w, CTRL_H)
+            mute = ui.UIButton(
+                r.left(30), "M", self.manager, container=container, object_id="#brush_button"
+            )
+            if prompt.muted:
+                mute.select()
             remove = ui.UIButton(
                 r.right(30),
                 "×",
@@ -737,8 +746,9 @@ class App:
             )
             entry = ui.UITextEntryLine(r.fill(), self.manager, container=container)
             entry.set_text(prompt.text)
-            self._row_elements += [remove, entry, slider, wlabel]
+            self._row_elements += [mute, remove, entry, slider, wlabel]
             self._remove_buttons[remove] = i
+            self._mute_buttons[mute] = i
             self._prompt_entries[entry] = i
             self._weight_sliders[slider] = i
             prompt._wlabel = wlabel  # type: ignore[attr-defined]  # stash for live updates
@@ -757,7 +767,7 @@ class App:
         changes, so this is cheap to call every frame.
         """
         prompts = self._displayed_prompts()
-        active = [(i, r.weight) for i, r in enumerate(prompts) if r.text.strip()]
+        active = [(i, r.weight) for i, r in enumerate(prompts) if r.text.strip() and not r.muted]
         total = sum(w for _, w in active)
         shares = {i: w / total for i, w in active} if total > 1e-3 else {}
         for i, row in enumerate(prompts):
@@ -767,6 +777,8 @@ class App:
                 continue
             if entry.get_text() != row.text:
                 text, colour = "edited · Enter", PENDING_COLOR
+            elif row.muted:
+                text, colour = f"{row.weight:.2f}  muted", MUTED_COLOR
             elif not row.text.strip():
                 text, colour = f"{row.weight:.2f}  empty", MUTED_COLOR
             elif not shares:
@@ -1331,7 +1343,7 @@ class App:
         # Prompt rows are read-only while previewing a checkpoint (they show its prompts).
         prompts_on = self._preview_index is None
         prompt_widgets = [self.add_button, *self._prompt_entries, *self._weight_sliders]
-        for pw in (*prompt_widgets, *self._remove_buttons):
+        for pw in (*prompt_widgets, *self._remove_buttons, *self._mute_buttons):
             (pw.enable if prompts_on else pw.disable)()
         self.play_button.set_text("Pause" if self.running else "Play")
         # Can't resume mid-preview or mid-reload — Revert/Cancel, or wait for the reload.
@@ -1364,8 +1376,8 @@ class App:
         self.status_label.set_text(text)
 
     # -- prompt snapshot --
-    def _prompt_snapshot(self) -> list[tuple[str, float]]:
-        return [(r.text, r.weight) for r in self.prompts]
+    def _prompt_snapshot(self) -> list[PromptSpec]:
+        return [PromptSpec(r.text, r.weight, r.muted) for r in self.prompts]
 
     def _push_prompts(self) -> None:
         if self.worker is not None and self.worker.is_alive():
@@ -1670,17 +1682,19 @@ class App:
 
     def _sync_preview_prompts(self) -> None:
         """Show the previewed checkpoint's prompts in the rows (live set when not previewing)."""
-        want: list[tuple[str, float]] | None = None
+        want: list[PromptSpec] | None = None
         if self._preview_index is not None and self._preview_index < len(self._history):
             want = self._history[self._preview_index].prompts
         cur = (
-            [(p.text, p.weight) for p in self._preview_prompts]
+            [PromptSpec(p.text, p.weight, p.muted) for p in self._preview_prompts]
             if self._preview_prompts is not None
             else None
         )
         if (list(want) if want is not None else None) == cur:
             return  # already showing the right prompts
-        self._preview_prompts = [PromptRow(t, w) for t, w in want] if want is not None else None
+        self._preview_prompts = (
+            [PromptRow(t, w, m) for t, w, m in want] if want is not None else None
+        )
         self._rebuild_prompt_rows()
         self._sync_enabled()
 
@@ -1696,7 +1710,7 @@ class App:
             return
         entry = self._history[self._preview_index]
         # Adopt the checkpoint's prompts as the live set, then branch from it.
-        self.prompts = [PromptRow(t, w) for t, w in entry.prompts]
+        self.prompts = [PromptRow(t, w, m) for t, w, m in entry.prompts]
         # Restore the guidance + eta captured at the checkpoint (undo the changes made since),
         # syncing the sliders; cancel any pending guidance checkpoint.
         for attr, cfg_value in entry.config.items():
@@ -1988,6 +2002,15 @@ class App:
                     self._rebuild_prompt_rows()
                     self._push_prompts()
                     self._request_checkpoint("remove prompt")
+            elif event.ui_element in self._mute_buttons:
+                idx = self._mute_buttons[event.ui_element]
+                if 0 <= idx < len(self.prompts):
+                    prompt = self.prompts[idx]
+                    prompt.muted = not prompt.muted
+                    (event.ui_element.select if prompt.muted else event.ui_element.unselect)()
+                    self._refresh_rows()
+                    self._push_prompts()  # re-mix conditioning (muted excluded)
+                    self._request_checkpoint("mute prompt" if prompt.muted else "unmute prompt")
             elif event.ui_element in self._brush_buttons:
                 self.brush_type = self._brush_buttons[event.ui_element]
                 for button, name in self._brush_buttons.items():
