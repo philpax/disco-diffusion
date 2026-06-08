@@ -61,6 +61,28 @@ def test_history_snap_picks_nearest_checkpoint(app):
     assert app._history_snap(95.0) is None  # rightmost == live
 
 
+def test_revert_restores_guidance_and_eta(app):
+    img = np.zeros((4, 4, 3), np.uint8)
+    app._history = [
+        HistoryEntry(
+            latent=None, step=0, index=5, total=100, preview=img, label="start",
+            prompts=[("a prompt", 1.0)], config={"clip_guidance_scale": 5000, "eta": 0.8},
+        )
+    ]
+    app._hist_len = 1
+    app._preview_index = 0
+    app.worker = SimpleNamespace(
+        is_alive=lambda: True, seek=lambda i: None, set_prompts=lambda p: None,
+        paint_applied_count=0, latest_frame=lambda: None, finished=False,
+    )
+    app.session.config.clip_guidance_scale = 20000  # diverge from the checkpoint
+    app.session.config.eta = 0.2
+    revert = pygame.event.Event(pygame_gui.UI_BUTTON_PRESSED, ui_element=app.revert_button)
+    app._handle_event(revert)
+    assert app.session.config.clip_guidance_scale == 5000
+    assert app.session.config.eta == 0.8  # eta restored, not just the live guidance scales
+
+
 def test_modal_blocks_canvas_painting(app):
     app._open_colour_picker()
     assert app._modal_open()

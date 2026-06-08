@@ -1394,7 +1394,9 @@ class App:
             encode_cache=self._encode_cache,
             cache_lock=self._cache_lock,
             perlin=self.session.config.perlin_init,
-            guidance_attrs=[sc.attr for sc in LIVE_SCALES],
+            # Snapshot the live guidance scales + eta per checkpoint so Revert restores them
+            # (eta is read when the resumed sampler is built, so a restored value takes effect).
+            revert_attrs=[sc.attr for sc in LIVE_SCALES] + ["eta"],
             init_image=self._init_image,
             skip_steps=self._init_skip_steps(),
         )

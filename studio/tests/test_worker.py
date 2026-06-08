@@ -62,7 +62,7 @@ class StubSampler:
         pass
 
 
-def _make_worker(cfg=None, guidance_attrs=None) -> GenerationWorker:
+def _make_worker(cfg=None, revert_attrs=None) -> GenerationWorker:
     cfg = cfg or SimpleNamespace(clip_guidance_scale=5000, tv_scale=0.0)
     session = SimpleNamespace(
         config=cfg,
@@ -76,7 +76,7 @@ def _make_worker(cfg=None, guidance_attrs=None) -> GenerationWorker:
         steps=20,
         encode_cache={},
         cache_lock=threading.Lock(),
-        guidance_attrs=guidance_attrs or [],
+        revert_attrs=revert_attrs or [],
     )
 
 
@@ -102,12 +102,13 @@ def test_each_stroke_is_its_own_checkpoint():
     assert sum(label.startswith("paint") for label in labels) == 3
 
 
-def test_checkpoints_snapshot_guidance():
-    cfg = SimpleNamespace(clip_guidance_scale=5000, tv_scale=0.0)
-    worker = _make_worker(cfg, guidance_attrs=["clip_guidance_scale", "tv_scale"])
+def test_checkpoints_snapshot_guidance_and_eta():
+    cfg = SimpleNamespace(clip_guidance_scale=5000, tv_scale=0.0, eta=0.8)
+    worker = _make_worker(cfg, revert_attrs=["clip_guidance_scale", "eta"])
     worker.start()
     time.sleep(0.05)
     cfg.clip_guidance_scale = 12345  # "change guidance"
+    cfg.eta = 0.3
     worker.checkpoint("guidance")
     time.sleep(0.1)
     worker.stop()
@@ -116,4 +117,6 @@ def test_checkpoints_snapshot_guidance():
     start = next(e for e in history if e.label == "start")
     guidance = next(e for e in history if e.label == "guidance")
     assert start.config["clip_guidance_scale"] == 5000
+    assert start.config["eta"] == 0.8
     assert guidance.config["clip_guidance_scale"] == 12345
+    assert guidance.config["eta"] == 0.3  # eta is captured, so Revert can restore it
