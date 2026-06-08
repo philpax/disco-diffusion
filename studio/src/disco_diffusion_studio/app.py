@@ -34,9 +34,10 @@ import pygame
 import pygame_gui
 from disco_diffusion import DiscoSession, EncodedPrompt, RunConfig
 from disco_diffusion.config import AVAILABLE_CLIP_MODELS, Tunable, parse_schedule
-from pydantic import BaseModel, ConfigDict, field_validator
+from pydantic import BaseModel, ConfigDict
 from pygame_gui.core import ObjectID
-from pygame_gui.windows import UIFileDialog
+from pygame_gui.elements import UIDropDownMenu
+from pygame_gui.windows import UIColourPickerDialog, UIFileDialog
 
 from .layout import (
     CTRL_H,
@@ -59,7 +60,17 @@ from .layout import (
     Stack,
     snap_side,
 )
-from .paint import BRUSHES, PALETTE, PaintLayer
+from .paint import BRUSHES, PaintLayer
+from .presets import (
+    MAX_RECENT,
+    ColourConfig,
+    Preset,
+    PresetConfig,
+    load_colours,
+    load_presets,
+    save_colours,
+    save_preset,
+)
 from .theme import (
     DIVIDER,
     IMAGE_BG,
@@ -132,49 +143,7 @@ class ScheduleField(BaseModel):
     """Field label shown in the panel."""
 
 
-class PresetConfig(BaseModel):
-    """The config-only half of a preset: guidance scales, eta/Perlin, and the cut schedules.
-
-    Field names match ``RunConfig`` so a preset applies via ``setattr`` over ``model_dump()``.
-    """
-
-    model_config = ConfigDict(frozen=True)
-
-    clip_guidance_scale: int
-    tv_scale: float
-    range_scale: float
-    sat_scale: float
-    clamp_max: float
-    cutn_batches: int
-    eta: float
-    perlin_init: bool
-    cut_overview: str
-    cut_innercut: str
-    cut_ic_pow: str
-    cut_icgray_p: str
-
-    @field_validator("cut_overview", "cut_innercut", "cut_ic_pow", "cut_icgray_p")
-    @classmethod
-    def _validate_schedule(cls, value: str) -> str:
-        parse_schedule(value)  # raises on a malformed schedule string
-        return value
-
-
-# A preset applies via setattr over model_dump(), so every PresetConfig field must name a real
-# RunConfig field — check at import so a typo fails fast instead of at apply time.
-_UNKNOWN_PRESET_FIELDS = set(PresetConfig.model_fields) - set(RunConfig.model_fields)
-if _UNKNOWN_PRESET_FIELDS:
-    raise RuntimeError(f"PresetConfig fields not on RunConfig: {sorted(_UNKNOWN_PRESET_FIELDS)}")
-
-
-class Preset(BaseModel):
-    """A one-click full recipe: config knobs (applied now) + a model set (staged for Reload)."""
-
-    model_config = ConfigDict(frozen=True)
-
-    config: PresetConfig
-    clip_models: list[str]
-    use_secondary_model: bool
+# Preset / PresetConfig and their loading/saving live in .presets (TOML on disk).
 
 
 # The control tables below are *derived from* the ``Tunable`` metadata on the RunConfig fields
@@ -215,46 +184,8 @@ CURRENT_PERRUN: list[tuple[str, str]] = [
     ("use_secondary_model", "Secondary"),
 ]
 
-# One-click full-recipe presets. "Default" is the port's faithful recipe; "2022 sauce" is the
-# high-detail, heavily-regularised, multi-CLIP look from the archive (ic_pow 15, six models).
-PRESETS: dict[str, Preset] = {
-    "Default": Preset(
-        config=PresetConfig(
-            clip_guidance_scale=5000,
-            tv_scale=0.0,
-            range_scale=150.0,
-            sat_scale=0.0,
-            clamp_max=0.05,
-            cutn_batches=4,
-            eta=0.8,
-            perlin_init=False,
-            cut_overview="[12]*400+[4]*600",
-            cut_innercut="[4]*400+[12]*600",
-            cut_ic_pow="[1]*1000",
-            cut_icgray_p="[0.2]*400+[0]*600",
-        ),
-        clip_models=["ViT-B/32", "ViT-B/16", "RN50"],
-        use_secondary_model=True,
-    ),
-    "2022 sauce": Preset(
-        config=PresetConfig(
-            clip_guidance_scale=15000,
-            tv_scale=250000.0,
-            range_scale=10000.0,
-            sat_scale=50000.0,
-            clamp_max=0.09,
-            cutn_batches=1,
-            eta=0.8,
-            perlin_init=True,
-            cut_overview="[18]*200+[14]*200+[4]*400+[2]*200",
-            cut_innercut="[2]*200+[6]*200+[8]*400+[18]*200",
-            cut_ic_pow="[15]*1000",
-            cut_icgray_p="[0.2]*200+[0.1]*200+[0.1]*200+[0.1]*200+[0.1]*200",
-        ),
-        clip_models=["ViT-B/32", "ViT-B/16", "ViT-L/14", "RN101", "RN50", "RN50x4"],
-        use_secondary_model=False,
-    ),
-}
+# The dropdown entry shown when the live settings don't match any saved preset.
+CUSTOM_PRESET = "Custom"
 
 
 # --- app ---------------------------------------------------------------------
@@ -355,7 +286,17 @@ class App:
         ] = {}
         # Cut-schedule text boxes -> config attr (validated, applied on next Play).
         self._schedule_entries: dict[pygame_gui.elements.UITextEntryLine, str] = {}
-        self._preset_buttons: dict[pygame_gui.elements.UIButton, str] = {}
+        # Presets are loaded from studio/presets/*.toml and surfaced as a dropdown that flips to
+        # "Custom" once any preset-controlled knob is edited. _applying_preset suppresses that
+        # flip while a preset is being applied (so its own widget updates don't read as edits).
+        self._presets: dict[str, Preset] = load_presets()
+        self._applying_preset = False
+        self.preset_dropdown: UIDropDownMenu | None = None
+        self._preset_dd_rect = pygame.Rect(0, 0, 10, 10)
+        self._save_preset_window: pygame_gui.elements.UIWindow | None = None
+        self._save_preset_entry: pygame_gui.elements.UITextEntryLine | None = None
+        self._save_preset_ok: pygame_gui.elements.UIButton | None = None
+        self._save_preset_cancel: pygame_gui.elements.UIButton | None = None
         # The schedule box that last held focus, so its text is committed on blur (like steps).
         self._focused_schedule: pygame_gui.elements.UITextEntryLine | None = None
 
@@ -369,25 +310,38 @@ class App:
         self._reload_thread: threading.Thread | None = None
         self._reload_result: dict[str, object] | None = None
         self._reload_queued_at: int | None = None  # pygame ticks at which to fire the auto-reload
+        # The preset matching the loaded session (or "Custom"); the dropdown's selected entry.
+        self._preset_selection = self._detect_preset()
 
         # "Current" sidebar tab: snapshot of the per-run settings the active run was started
         # with (live knobs are read straight from session.config), plus the label cache.
         self._run_snapshot: dict[str, str] = {}
         self._current_labels: dict[str, pygame_gui.elements.UILabel] = {}
 
-        # Painting state. The paint layer is generation-resolution and persists across runs
-        # (re-created only on a size change); strokes are injected into the latent by the
-        # worker and the overlay clears once a step has baked them.
-        self.brush_color: tuple[int, int, int] = PALETTE[3]
+        # Colours: the palette + recently-picked colours come from studio/config.toml. The RGB
+        # picker prepends to the recents (capped, persisted), and swatches = palette + recents.
+        self._colour_cfg: ColourConfig = load_colours()
+        self._palette: list[tuple[int, int, int]] = list(self._colour_cfg.palette)
+        self._recent: list[tuple[int, int, int]] = list(self._colour_cfg.recent)
+        self._colour_picker: UIColourPickerDialog | None = None
+
+        # Painting state. The active paint layer holds the in-progress stroke; on mouse-up it's
+        # flushed to the worker as one batch (its own checkpoint) and moved into _pending_overlays
+        # — surfaces shown on the canvas until a baked frame incorporates that stroke. Each flush
+        # bumps _paint_submitted; an overlay clears once frame.paint_applied reaches its target.
+        self.brush_color: tuple[int, int, int] = (
+            self._palette[3] if len(self._palette) > 3 else self._palette[0]
+        )
         self._paint_layer = PaintLayer(self.width, self.height)
+        self._pending_overlays: list[tuple[pygame.Surface, int]] = []
+        self._paint_submitted = 0
         self._mouse_pos: tuple[int, int] = (0, 0)
         self._painting = False
         self._last_gen: tuple[float, float] | None = None
-        self._paint_awaiting_bake = False
-        self._paint_baseline = 0
         self._brush_buttons: dict[pygame_gui.elements.UIButton, str] = {}
         self._swatch_rects: list[tuple[pygame.Rect, tuple[int, int, int]]] = []
         self._color_preview_rect = pygame.Rect(0, 0, 0, 0)
+        self._palette_rect = pygame.Rect(0, 0, 0, 0)  # area the palette swatches lay out within
         self._list_inner_w = 0  # row width inside the prompt list (set in _build_ui)
 
         # View transform: the canvas is decoupled from the window, which is just a viewport
@@ -758,15 +712,15 @@ class App:
     def _build_settings_rows(self) -> None:
         """Build the sidebar Settings tab: output size, then the advanced controls.
 
-        Layout order: output (steps / size, per-run) · guidance sliders (retune live) · per-run
-        cut schedules + eta/perlin · model set. Sliders write straight to ``session.config``
-        (read live by the worker each step); schedule boxes are validated and applied next Play;
-        toggling a model queues a (debounced) auto-reload.
+        Layout order: output (steps / size) · preset (dropdown + Save) · guidance sliders (retune
+        live) · per-run cut schedules + eta/perlin · model set. Sliders write straight to
+        ``session.config`` (read live by the worker each step); schedule boxes are validated and
+        applied next Play; toggling a model queues a (debounced) auto-reload.
         """
         self._scale_sliders = {}
         self._schedule_entries = {}
-        self._preset_buttons = {}
         self._clip_buttons = {}
+        self.preset_dropdown = None  # cleared by clear_and_reset; respawned below
         ui = pygame_gui.elements
         container = self.settings_panel
         inner_w = self._sb_inner_w
@@ -807,6 +761,18 @@ class App:
         self.swap_button = ui.UIButton(r.fill(), "Flip W/H", self.manager, container=container)
         y += pitch
 
+        # Preset (above Guidance): a dropdown of saved recipes + Save. Selecting one applies the
+        # whole recipe (guidance + per-run + schedules + model set); editing any of those flips
+        # the dropdown to "Custom". Save writes the current settings to a new presets/*.toml.
+        y = section(y + 6, "Preset")
+        r = Row(0, y, inner_w, CTRL_H)
+        self.save_preset_button = ui.UIButton(
+            r.right(72), "Save…", self.manager, container=container, object_id="#add_button"
+        )
+        self._preset_dd_rect = r.fill()
+        self._spawn_preset_dropdown()
+        y += pitch
+
         # Guidance (live): each slider retunes the running step immediately.
         y = section(y + 6, "Guidance — retunes live")
         for sc in LIVE_SCALES:
@@ -825,15 +791,8 @@ class App:
             self._scale_sliders[slider] = (sc.attr, sc.is_int, vlabel, sc.fmt)
             y += pitch
 
-        # Per-run: presets, eta + perlin, raw cut schedules.
+        # Per-run: eta + perlin, raw cut schedules.
         y = section(y + 6, "Per-run — apply on next Play")
-        r = Row(0, y, inner_w, CTRL_H)
-        ui.UILabel(r.left(50), "Preset", self.manager, container=container)
-        pw = (inner_w - 50 - PAD - (len(PRESETS) - 1) * PAD) // max(len(PRESETS), 1)
-        for name in PRESETS:
-            button = ui.UIButton(r.left(pw), name, self.manager, container=container)
-            self._preset_buttons[button] = name
-        y += pitch
         r = Row(0, y, inner_w, CTRL_H)
         ui.UILabel(r.left(40), "eta", self.manager, container=container)
         self.perlin_button = ui.UIButton(
@@ -1026,6 +985,7 @@ class App:
             return
         setattr(self.session.config, attr, text)
         self._status("Schedule set")
+        self._mark_custom()
 
     def _refresh_advanced_widgets(self) -> None:
         """Re-sync every Advanced widget from the current config (after a preset load)."""
@@ -1040,23 +1000,139 @@ class App:
         for entry, attr in self._schedule_entries.items():
             entry.set_text(str(getattr(cfg, attr)))
 
+    def _current_preset(self) -> Preset:
+        """Capture the live settings (guidance + per-run + schedules + models) as a Preset."""
+        cfg = self.session.config
+        config = PresetConfig(
+            clip_guidance_scale=int(cfg.clip_guidance_scale),
+            tv_scale=float(cfg.tv_scale),
+            range_scale=float(cfg.range_scale),
+            sat_scale=float(cfg.sat_scale),
+            clamp_max=float(cfg.clamp_max),
+            cutn_batches=int(cfg.cutn_batches),
+            eta=float(cfg.eta),
+            perlin_init=bool(cfg.perlin_init),
+            cut_overview=str(cfg.cut_overview),
+            cut_innercut=str(cfg.cut_innercut),
+            cut_ic_pow=str(cfg.cut_ic_pow),
+            cut_icgray_p=str(cfg.cut_icgray_p),
+        )
+        models = [m for m in AVAILABLE_CLIP_MODELS if m in self._clip_selected]
+        return Preset(config=config, clip_models=models, use_secondary_model=self._secondary_on)
+
+    def _detect_preset(self) -> str:
+        """The saved preset whose recipe matches the live settings, else "Custom"."""
+        current = self._current_preset()
+        for name, preset in self._presets.items():
+            if (
+                preset.config.model_dump() == current.config.model_dump()
+                and set(preset.clip_models) == set(current.clip_models)
+                and preset.use_secondary_model == current.use_secondary_model
+            ):
+                return name
+        return CUSTOM_PRESET
+
+    def _spawn_preset_dropdown(self) -> None:
+        """(Re)create the preset dropdown in the settings panel at the stored rect/selection."""
+        if self.preset_dropdown is not None:
+            self.preset_dropdown.kill()
+        options: list[str | tuple[str, str]] = [*self._presets.keys(), CUSTOM_PRESET]
+        selected = self._preset_selection if self._preset_selection in options else CUSTOM_PRESET
+        self._preset_selection = selected
+        self.preset_dropdown = UIDropDownMenu(
+            options, selected, self._preset_dd_rect, self.manager, container=self.settings_panel
+        )
+
+    def _set_preset_selection(self, name: str) -> None:
+        """Set the dropdown's selected entry (rebuilding it, since it has no set-selected API)."""
+        if self._preset_selection == name and self.preset_dropdown is not None:
+            return
+        self._preset_selection = name
+        self._spawn_preset_dropdown()
+
+    def _mark_custom(self) -> None:
+        """Flip the preset dropdown to "Custom" after the user edits a preset-controlled knob."""
+        if self._applying_preset:
+            return
+        self._set_preset_selection(CUSTOM_PRESET)
+
     def _apply_preset(self, name: str) -> None:
         """Load a full-recipe preset: config knobs apply now; a model change auto-reloads."""
-        preset = PRESETS.get(name)
+        preset = self._presets.get(name)
         if preset is None:
             return
-        cfg = self.session.config
-        for attr, value in preset.config.model_dump().items():
-            setattr(cfg, attr, value)
-        self._refresh_advanced_widgets()
-        # Stage the model set (CLIP + secondary); a change queues the debounced auto-reload.
-        self._clip_selected = set(preset.clip_models)
-        self._secondary_on = preset.use_secondary_model
-        for button, mname in self._clip_buttons.items():
-            (button.select if mname in self._clip_selected else button.unselect)()
-        (self.secondary_button.select if self._secondary_on else self.secondary_button.unselect)()
-        self._status("Loaded")
-        self._update_reload_queue()
+        self._applying_preset = True  # suppress the edit-driven flip back to "Custom"
+        try:
+            cfg = self.session.config
+            for attr, value in preset.config.model_dump().items():
+                setattr(cfg, attr, value)
+            self._refresh_advanced_widgets()
+            # Stage the model set (CLIP + secondary); a change queues the debounced auto-reload.
+            self._clip_selected = set(preset.clip_models)
+            self._secondary_on = preset.use_secondary_model
+            for button, mname in self._clip_buttons.items():
+                (button.select if mname in self._clip_selected else button.unselect)()
+            sec = self.secondary_button
+            (sec.select if self._secondary_on else sec.unselect)()
+            self._update_reload_queue()
+        finally:
+            self._applying_preset = False
+        self._preset_selection = name
+        self._status(f"Loaded {name}")
+
+    def _open_save_preset_dialog(self) -> None:
+        """Open a small modal asking for a filename to save the current settings as a preset."""
+        if self._save_preset_window is not None and self._save_preset_window.alive():
+            return
+        win_w, win_h = self._window_size()
+        rect = pygame.Rect(0, 0, 420, 168)
+        rect.center = (win_w // 2, win_h // 2)
+        ui = pygame_gui.elements
+        self._save_preset_window = ui.UIWindow(
+            rect, self.manager, window_display_title="Save preset"
+        )
+        cont = self._save_preset_window
+        inner_w = rect.width - 32
+        ui.UILabel(pygame.Rect(6, 4, inner_w, LABEL_H), "Filename", self.manager, container=cont)
+        self._save_preset_entry = ui.UITextEntryLine(
+            pygame.Rect(6, 32, inner_w, CTRL_H), self.manager, container=cont
+        )
+        self._save_preset_entry.set_text("my-preset")
+        self._save_preset_entry.focus()
+        self._save_preset_ok = ui.UIButton(
+            pygame.Rect(inner_w - 150, 78, 72, CTRL_H),
+            "Save",
+            self.manager,
+            container=cont,
+            object_id="#add_button",
+        )
+        self._save_preset_cancel = ui.UIButton(
+            pygame.Rect(inner_w - 70, 78, 72, CTRL_H), "Cancel", self.manager, container=cont
+        )
+
+    def _close_save_preset_dialog(self) -> None:
+        if self._save_preset_window is not None:
+            self._save_preset_window.kill()
+        self._save_preset_window = None
+        self._save_preset_entry = None
+        self._save_preset_ok = None
+        self._save_preset_cancel = None
+
+    def _save_current_preset(self) -> None:
+        """Write the current settings to presets/<filename>.toml and select the new preset."""
+        if self._save_preset_entry is None:
+            return
+        filename = self._save_preset_entry.get_text().strip() or "preset"
+        try:
+            name, _path = save_preset(filename, self._current_preset())
+        except Exception as exc:  # noqa: BLE001 - surface the failure instead of crashing
+            log.exception("saving preset failed")
+            self._status(f"Save failed: {exc}")
+            return
+        self._presets = load_presets()
+        self._close_save_preset_dialog()
+        self._set_preset_selection(name)
+        self._status(f"Saved {name}")
 
     def _toggle_clip_model(self, button: pygame_gui.elements.UIButton) -> None:
         """Stage a CLIP model in/out of the pending selection (queues the auto-reload)."""
@@ -1068,6 +1144,7 @@ class App:
             self._clip_selected.add(name)
             button.select()
         self._update_reload_queue()
+        self._mark_custom()
 
     def _start_reload(self) -> None:
         """Rebuild the session with the staged CLIP set / secondary toggle on a worker thread.
@@ -1560,13 +1637,20 @@ class App:
                     "settings" if event.ui_element == self.tab_settings else "current"
                 )
                 self._sync_sidebar_tabs()
-            elif event.ui_element in self._preset_buttons:
-                self._apply_preset(self._preset_buttons[event.ui_element])
+            elif event.ui_element == self.save_preset_button:
+                self._open_save_preset_dialog()
+            elif event.ui_element == self.pick_color_button:
+                self._open_colour_picker()
+            elif event.ui_element is self._save_preset_ok:
+                self._save_current_preset()
+            elif event.ui_element is self._save_preset_cancel:
+                self._close_save_preset_dialog()
             elif event.ui_element == self.perlin_button:
                 self.session.config.perlin_init = not self.session.config.perlin_init
                 on = self.session.config.perlin_init
                 (self.perlin_button.select if on else self.perlin_button.unselect)()
                 self._status(f"Perlin {'on' if on else 'off'}")
+                self._mark_custom()
             elif event.ui_element in self._clip_buttons:
                 self._toggle_clip_model(event.ui_element)
             elif event.ui_element == self.secondary_button:
@@ -1577,6 +1661,7 @@ class App:
                     else self.secondary_button.unselect
                 )()
                 self._update_reload_queue()
+                self._mark_custom()
             elif event.ui_element == self.add_button:
                 self.prompts.append(PromptRow("", 1.0))
                 self._rebuild_prompt_rows()
@@ -1656,6 +1741,7 @@ class App:
                 # this retunes guidance on the next step (and seeds the next run when stopped).
                 setattr(self.session.config, attr, value)
                 vlabel.set_text(fmt.format(value))
+                self._mark_custom()
             else:
                 slider_idx = self._weight_sliders.get(event.ui_element)
                 if slider_idx is not None and 0 <= slider_idx < len(self.prompts):
@@ -1663,11 +1749,24 @@ class App:
                     self._refresh_rows()
                     self._push_prompts()
 
+        elif event.type == pygame_gui.UI_DROP_DOWN_MENU_CHANGED:
+            if event.ui_element == self.preset_dropdown:
+                self._preset_selection = event.text
+                if event.text != CUSTOM_PRESET:
+                    self._apply_preset(event.text)
+
+        elif event.type == pygame_gui.UI_COLOUR_PICKER_COLOUR_PICKED:
+            if event.ui_element is self._colour_picker:
+                col = event.colour
+                self._apply_picked_colour((col.r, col.g, col.b))
+
         elif event.type == pygame_gui.UI_TEXT_ENTRY_FINISHED:
             if event.ui_element == self.steps_entry:
                 self._commit_steps()
             elif event.ui_element in (self.width_entry, self.height_entry):
                 pass  # applied via the Apply button
+            elif event.ui_element is self._save_preset_entry:
+                self._save_current_preset()  # Enter in the filename box saves
             elif event.ui_element in self._prompt_entries:
                 self._commit_prompt_entry(event.ui_element)
             elif event.ui_element in self._schedule_entries:
@@ -1682,6 +1781,10 @@ class App:
             if event.ui_element is self._file_dialog:  # cancelled
                 self._file_dialog = None
                 self._save_surface = None
+            elif event.ui_element is self._save_preset_window:
+                self._close_save_preset_dialog()
+            elif event.ui_element is self._colour_picker:
+                self._colour_picker = None
 
         return True
 
