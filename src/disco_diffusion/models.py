@@ -7,6 +7,7 @@ Ported from the original Disco Diffusion notebook.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
 import torch
@@ -174,12 +175,18 @@ def load_secondary_model(config: RunConfig, device: torch.device) -> SecondaryDi
     return model
 
 
-def load_clip_models(config: RunConfig, device: torch.device) -> list[Any]:
+def load_clip_models(
+    config: RunConfig,
+    device: torch.device,
+    progress: Callable[[str], None] | None = None,
+) -> list[Any]:
     # Typed as Any: CLIP models expose encode_text/encode_image/visual which are not
     # part of the nn.Module interface.
     download_root = str(config.models_dir / "clip")
     models: list[Any] = []
     for name in config.clip_models:
+        if progress is not None:
+            progress(name)
         model = clip.load(name, jit=False, download_root=download_root)[0]
         models.append(model.eval().requires_grad_(False).to(device))
     return models

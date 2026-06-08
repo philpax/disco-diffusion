@@ -31,6 +31,7 @@ import io
 import os
 import random
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -136,23 +137,41 @@ class DiscoSession:
     (:class:`disco_diffusion.generate.Generator` wraps a session).
     """
 
-    def __init__(self, config: RunConfig, device: torch.device | None = None) -> None:
+    def __init__(
+        self,
+        config: RunConfig,
+        device: torch.device | None = None,
+        progress: Callable[[str], None] | None = None,
+    ) -> None:
         ensure_certifi_ssl()
         self.config = config
         self.device = device or select_device(config.cpu)
         print(f"Using device: {self.device}")
 
+        # Optional progress hook: called with a short label as each component is loaded, so a
+        # frontend (e.g. the studio's loading screen) can show what's happening. No-op by default.
+        def note(label: str) -> None:
+            if progress is not None:
+                progress(label)
+
         if config.compile and self.device.type == "cuda":
             _configure_perf(config.models_dir)
 
         self.model_config = build_model_config(config)
+        note("diffusion model")
         self.model, self.diffusion = load_diffusion_model(config, self.model_config, self.device)
+        if config.use_secondary_model:
+            note("secondary model")
         self.secondary_model = (
             load_secondary_model(config, self.device) if config.use_secondary_model else None
         )
-        self.clip_models = load_clip_models(config, self.device)
+        self.clip_models = load_clip_models(
+            config, self.device, progress=lambda n: note(f"CLIP {n}")
+        )
         # LPIPS is only used for the init-image loss; load it lazily to avoid the
         # VGG backbone download when it isn't needed.
+        if config.init_image is not None:
+            note("LPIPS (init-image loss)")
         self.lpips_model = load_lpips(self.device) if config.init_image is not None else None
 
         # Eager references kept so a caller can fall back if compile OOMs (see
@@ -179,6 +198,7 @@ class DiscoSession:
             # shared-memory limit and fall back) for a much longer, memory-hungry
             # warmup; opt into it via config.compile_mode when it pays off.
             print("torch.compile enabled (first run warms kernels; later runs reuse cache)")
+            note("compiling models (first run only)")
             self._eager_encode = [cm.encode_image for cm in self.clip_models]
             mode = config.compile_mode
             compiled = (
