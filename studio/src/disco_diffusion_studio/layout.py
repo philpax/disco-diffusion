@@ -16,14 +16,15 @@ CTRL_H = 32  # height of a control (button / text box)
 LABEL_H = 24  # height of a standalone label line
 ROW_PITCH = 46  # vertical pitch of one prompt row
 
-# The prompt list is a fixed-height scrolling area (shows ~2 rows; more rows scroll), which
-# keeps the bottom panel compact. The panel height is derived from the rows it contains —
-# 4 control rows (transport / history / tools / colours), 1 label row (prompt header), then
-# the list — so the panel exactly fits its contents and the window isn't taller than it needs.
-# (The status now shares the transport row; steps / size and the advanced controls live in the
-# right-hand sidebar.)
+# The prompt list is a scrolling area filling the panel below the fixed rows (4 control rows +
+# 1 prompt-header label). PANEL_H is the default height (showing ~2 prompt rows); the panel is
+# user-resizable via a horizontal divider, down to PANEL_MIN (the fixed rows + one prompt row)
+# and up to whatever leaves MIN_IMAGE_H for the image. (The status shares the transport row;
+# steps / size and the advanced controls live in the right-hand sidebar.)
 PROMPT_LIST_H = 2 * ROW_PITCH + 12
-PANEL_H = PAD + 4 * (CTRL_H + PAD) + 1 * (LABEL_H + PAD) + PROMPT_LIST_H + PAD
+_PANEL_FIXED = PAD + 4 * (CTRL_H + PAD) + 1 * (LABEL_H + PAD) + PAD  # rows above the prompt list
+PANEL_H = _PANEL_FIXED + PROMPT_LIST_H
+PANEL_MIN = _PANEL_FIXED + ROW_PITCH  # fixed rows + room for a single prompt row
 
 # Right-hand sidebar (size + advanced controls + the "Current" readout). User-resizable via a
 # draggable divider; the left column (image + bottom panel) keeps at least MIN_LEFT_PANEL_W.

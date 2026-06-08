@@ -51,7 +51,7 @@ from .layout import (
     MIN_WINDOW_W,
     PAD,
     PANEL_H,
-    PROMPT_LIST_H,
+    PANEL_MIN,
     ROW_PITCH,
     SIDEBAR_W_DEFAULT,
     SIDEBAR_W_MAX,
@@ -238,6 +238,9 @@ class App:
         # letterboxing, and so the whole thing fits on the desktop. (On a tiling WM the size is
         # overridden anyway; the image is letterboxed into the region, so a flip never resizes.)
         self.sidebar_w = SIDEBAR_W_DEFAULT
+        # Bottom-panel height — seeded to its natural default, then user-owned (draggable via a
+        # horizontal divider, clamped to [PANEL_MIN, win_h - MIN_IMAGE_H]).
+        self.panel_h = PANEL_H
         chrome_w = self.sidebar_w + DIVIDER_W  # width taken by the sidebar + its divider
         try:
             sizes = pygame.display.get_desktop_sizes()
@@ -245,14 +248,14 @@ class App:
         except (pygame.error, IndexError):  # headless / older pygame
             desk_w, desk_h = 1920, 1080
         avail_w = max(320, int(desk_w * 0.9) - chrome_w)
-        avail_h = max(240, int(desk_h * 0.9) - PANEL_H)
+        avail_h = max(240, int(desk_h * 0.9) - self.panel_h)
         # Fit the canvas into the available image area, never upscaling past 1:1.
         scale = min(avail_w / self.width, avail_h / self.height, 1.0)
         img_w, img_h = int(self.width * scale), int(self.height * scale)
         # The left column is at least MIN_LEFT_PANEL_W wide; the sidebar always gets its full
         # width on top of that, so the chrome never squeezes either below its minimum.
         self.win_w = max(MIN_LEFT_PANEL_W, img_w) + chrome_w
-        self.win_h = max(MIN_IMAGE_H, img_h) + PANEL_H
+        self.win_h = max(MIN_IMAGE_H, img_h) + self.panel_h
         self.screen = pygame.display.set_mode((self.win_w, self.win_h), pygame.RESIZABLE)
         pygame.display.set_caption("Disco Diffusion - interactive")
         # Enforce the minimum size natively (SDL) instead of by re-calling set_mode on
@@ -261,7 +264,7 @@ class App:
         # minimum we just adopt whatever size the window becomes and never fight the WM.
         try:
             window = pygame.Window.from_display_module()
-            window.minimum_size = (MIN_WINDOW_W, MIN_IMAGE_H + PANEL_H)
+            window.minimum_size = (MIN_WINDOW_W, MIN_IMAGE_H + PANEL_MIN)
         except (AttributeError, pygame.error):  # older pygame / headless: best-effort only
             pass
         self.manager = pygame_gui.UIManager((self.win_w, self.win_h))
@@ -283,6 +286,10 @@ class App:
         self._sidebar_tab = "settings"  # "settings" | "current"
         self._dragging_divider = False
         self._sidebar_dirty = False
+        # Horizontal divider between the image area and the bottom panel (drag to resize the
+        # panel). Like the sidebar divider, the rebuild is coalesced to one per frame.
+        self._dragging_panel = False
+        self._panel_dirty = False
         # Live guidance-scale sliders -> (config attr, is_int, value label, value format).
         self._scale_sliders: dict[
             pygame_gui.elements.UIHorizontalSlider,
@@ -390,10 +397,18 @@ class App:
         return pygame.Rect(x, 0, max(0, self.win_w - x), self.win_h)
 
     def _bottom_panel_rect(self) -> pygame.Rect:
-        return pygame.Rect(0, self._image_area_h(), self._panel_w(), PANEL_H)
+        return pygame.Rect(0, self._image_area_h(), self._panel_w(), self.panel_h)
 
     def _image_area_h(self) -> int:
-        return max(0, self.win_h - PANEL_H)
+        return max(0, self.win_h - self.panel_h)
+
+    def _set_panel_height(self, height: int) -> None:
+        """Set the bottom-panel height (clamped); the rebuild is coalesced to one per frame."""
+        max_h = max(PANEL_MIN, self.win_h - MIN_IMAGE_H)
+        new_h = max(PANEL_MIN, min(max_h, int(height)))
+        if new_h != self.panel_h:
+            self.panel_h = new_h
+            self._panel_dirty = True
 
     def _window_size(self) -> tuple[int, int]:
         return (self.win_w, self.win_h)
@@ -603,9 +618,12 @@ class App:
             object_id="#hint_label",
         )
 
-        # Fixed-height scrolling prompt list (extra rows scroll), filling the rest of the panel.
-        # Pulled up under the header (less the usual row pad) to tighten the gap to the first row.
-        list_rect = pygame.Rect(MARGIN, stack.y - 8, panel_w - 2 * MARGIN, PROMPT_LIST_H)
+        # Scrolling prompt list (extra rows scroll), flexing to fill the rest of the panel down
+        # to its bottom edge — so dragging the panel taller shows more rows. Pulled up under the
+        # header (less the usual row pad) to tighten the gap to the first row.
+        list_top = stack.y - 8
+        list_h = max(ROW_PITCH, self.win_h - MARGIN - list_top)
+        list_rect = pygame.Rect(MARGIN, list_top, panel_w - 2 * MARGIN, list_h)
         self.prompt_panel = ui.UIScrollingContainer(list_rect, self.manager)
         # Lay rows out narrower than the viewport so the vertical scrollbar never forces a
         # horizontal one (a horizontal bar appears only when content is wider than the view).
@@ -1389,6 +1407,8 @@ class App:
         self.sidebar_w = max(
             SIDEBAR_W_MIN, min(self.sidebar_w, self.win_w - MIN_LEFT_PANEL_W - DIVIDER_W)
         )
+        # Keep the bottom panel within the new height (the image keeps at least MIN_IMAGE_H).
+        self.panel_h = max(PANEL_MIN, min(self.panel_h, self.win_h - MIN_IMAGE_H))
         surface = pygame.display.get_surface()
         if surface is not None:
             self.screen = surface
@@ -1578,6 +1598,8 @@ class App:
             self._mouse_pos = event.pos
             if self._dragging_divider:
                 self._set_sidebar_width(self.win_w - event.pos[0] - DIVIDER_W // 2)
+            elif self._dragging_panel:
+                self._set_panel_height(self.win_h - event.pos[1] - DIVIDER_W // 2)
             elif self._panning:
                 self._pan += pygame.Vector2(event.rel)
                 self._clamp_pan()
@@ -1588,6 +1610,14 @@ class App:
             # The draggable divider sits between the left column and the sidebar (full height).
             if event.button == 1 and abs(event.pos[0] - self._divider_x()) <= DIVIDER_W:
                 self._dragging_divider = True
+                return True
+            # Horizontal divider between the image area and the bottom panel (left column only).
+            if (
+                event.button == 1
+                and event.pos[0] < self._panel_w()
+                and abs(event.pos[1] - self._image_area_h()) <= DIVIDER_W
+            ):
+                self._dragging_panel = True
                 return True
             on_canvas = self._image_region().collidepoint(event.pos)
             if event.button == 3 and on_canvas:  # right held = navigate mode (pan + scroll-zoom)
@@ -1609,6 +1639,7 @@ class App:
         if event.type == pygame.MOUSEBUTTONUP:
             if event.button == 1:
                 self._dragging_divider = False
+                self._dragging_panel = False
                 if self._painting:  # a completed stroke becomes one paint batch / checkpoint
                     self._painting = False
                     self._flush_stroke()
@@ -1892,7 +1923,20 @@ class App:
                 self._blit_canvas(self._paint_layer.to_surface())
         pygame.draw.rect(self.screen, CANVAS_BORDER, crect, 1)  # canvas outline at any zoom
         self.screen.set_clip(None)
+        # Draggable horizontal divider between the image area and the bottom panel, with a grip
+        # that lights up on hover/drag (mirrors the sidebar divider).
         pygame.draw.line(self.screen, DIVIDER, (0, img_h), (panel_w, img_h))
+        hot_h = self._dragging_panel or (
+            self._mouse_pos[0] < panel_w and abs(self._mouse_pos[1] - img_h) <= DIVIDER_W
+        )
+        grip_cx = panel_w // 2
+        pygame.draw.line(
+            self.screen,
+            (110, 120, 140) if hot_h else (70, 78, 92),
+            (grip_cx - 14, img_h),
+            (grip_cx + 14, img_h),
+            2,
+        )
 
     def _draw_tools(self) -> None:
         """Draw the colour palette, the brush-preview ring, and the canvas help HUD."""
@@ -2111,9 +2155,10 @@ class App:
             if not self._did_initial_fit:
                 self._did_initial_fit = True
                 self._fit_view()
-            # Rebuild once per frame after a sidebar-divider drag (also coalesced).
-            if self._sidebar_dirty:
+            # Rebuild once per frame after a sidebar- or panel-divider drag (both coalesced).
+            if self._sidebar_dirty or self._panel_dirty:
                 self._sidebar_dirty = False
+                self._panel_dirty = False
                 self._build_ui()
                 self._clamp_pan()
             # Fire the debounced model auto-reload once its delay has elapsed.
