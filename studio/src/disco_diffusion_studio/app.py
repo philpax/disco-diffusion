@@ -564,11 +564,12 @@ class App:
         self.revert_button = ui.UIButton(r.right(70), "Revert", self.manager)
         self.history_label = ui.UILabel(r.right(120), "live", self.manager)
         self._history_slider_rect = r.fill()
-        n = len(self._history)
+        # The slider spans the 0..N step timeline (not the checkpoint count), so a checkpoint's
+        # thumb position matches its actual progress; drags snap to the nearest checkpoint.
         self.history_slider = ui.UIHorizontalSlider(
             self._history_slider_rect,
-            start_value=float(self._preview_index if self._preview_index is not None else n),
-            value_range=(0.0, float(max(n, 1))),
+            start_value=self._history_slider_start(),
+            value_range=(0.0, float(max(self._history_total(), 1))),
             manager=self.manager,
         )
 
@@ -1360,14 +1361,41 @@ class App:
         self._set_history_label()
         (self.play_button.disable if self._preview_index is not None else self.play_button.enable)()
 
-    def _rebuild_history_slider(self, n: int) -> None:
-        """Recreate the history slider when the number of checkpoints changes."""
+    def _history_total(self) -> int:
+        """The run's display-step total (the history slider's right edge)."""
+        if self._history:
+            return max(1, self._history[-1].total)
+        frame = self.worker.latest_frame() if self.worker is not None else None
+        return max(1, frame.total if frame is not None else 1)
+
+    def _live_index(self) -> int:
+        """The current live display step (the slider's rightmost snap point)."""
+        frame = self.worker.latest_frame() if self.worker is not None else None
+        if frame is not None:
+            return frame.index
+        return self._history[-1].index if self._history else 0
+
+    def _history_slider_start(self) -> float:
+        """Where the thumb should sit: a previewed checkpoint's step, else the live step."""
+        if self._preview_index is not None and self._preview_index < len(self._history):
+            return float(self._history[self._preview_index].index)
+        return float(self._live_index())
+
+    def _history_snap(self, value: float) -> int | None:
+        """Nearest checkpoint index to a slider step value; None == live (rightmost)."""
+        points: list[tuple[float, int | None]] = [
+            (float(cp.index), i) for i, cp in enumerate(self._history)
+        ]
+        points.append((float(self._live_index()), None))  # the live frame
+        return min(points, key=lambda p: abs(p[0] - value))[1]
+
+    def _rebuild_history_slider(self) -> None:
+        """Recreate the step-space history slider (range follows the run's total steps)."""
         self.history_slider.kill()
-        start = float(self._preview_index if self._preview_index is not None else n)
         self.history_slider = pygame_gui.elements.UIHorizontalSlider(
             self._history_slider_rect,
-            start_value=start,
-            value_range=(0.0, float(max(n, 1))),
+            start_value=self._history_slider_start(),
+            value_range=(0.0, float(max(self._history_total(), 1))),
             manager=self.manager,
         )
 
@@ -1378,8 +1406,12 @@ class App:
             self._hist_len = len(self._history)
             if self._preview_index is not None and self._preview_index >= self._hist_len:
                 self._preview_index = None
-            self._rebuild_history_slider(self._hist_len)
+            self._rebuild_history_slider()
             self._sync_enabled()
+        elif self.running and self._preview_index is None and self._history:
+            # While actively generating (not previewing), let the thumb track the live step as it
+            # advances. When paused/done we leave it alone so a scrub isn't yanked back each frame.
+            self.history_slider.set_current_value(float(self._live_index()))
         self._set_history_label()  # keep the live step current as it ticks
 
     def _displayed_surface(self) -> pygame.Surface | None:
@@ -1530,14 +1562,18 @@ class App:
                     self.worker.seek(self._preview_index)
                     self._preview_index = None
                     self._preview_prompts = None
-                    self.history_slider.set_current_value(float(len(self._history)))
+                    # Branching drops any in-flight strokes (the worker clears its queue on seek),
+                    # so reset the overlay tracking to stay aligned with the worker's apply count.
+                    self._pending_overlays = []
+                    self._paint_submitted = self.worker.paint_applied_count
+                    self.history_slider.set_current_value(float(self._live_index()))
                     self._rebuild_prompt_rows()  # now-live (reverted) prompts
                     self._push_prompts()  # apply them to the resumed run
                     self._sync_enabled()  # re-enable prompt editing
                     self._refresh_preview_state()
             elif event.ui_element == self.cancel_button:
                 self._preview_index = None
-                self.history_slider.set_current_value(float(len(self._history)))
+                self.history_slider.set_current_value(float(self._live_index()))
                 self._refresh_preview_state()
 
         elif event.type == pygame_gui.UI_HORIZONTAL_SLIDER_MOVED:
@@ -1546,13 +1582,21 @@ class App:
             elif event.ui_element == self.strength_slider:
                 self.brush_strength = float(event.value)
             elif event.ui_element == self.history_slider:
-                idx = int(round(event.value))  # rightmost = live; left = older checkpoints
-                self._preview_index = None if idx >= len(self._history) else idx
+                # The slider is in step-space; snap the dragged value to the nearest checkpoint
+                # (or live), and park the thumb on that checkpoint's actual step position.
+                snap_idx = self._history_snap(float(event.value))
+                self._preview_index = snap_idx
+                if snap_idx is not None:
+                    snapped = float(self._history[snap_idx].index)
+                else:
+                    snapped = float(self._live_index())
+                self.history_slider.set_current_value(snapped)
                 self._refresh_preview_state()
             elif event.ui_element == self._eta_slider:
                 # eta is read when the loop's generator is built, so this lands on the next run.
                 self.session.config.eta = float(event.value)
                 self._eta_label.set_text(f"{event.value:.2f}")
+                self._mark_custom()
             elif event.ui_element in self._scale_sliders:
                 attr, is_int, vlabel, fmt = self._scale_sliders[event.ui_element]
                 value: float | int = int(round(event.value)) if is_int else float(event.value)
