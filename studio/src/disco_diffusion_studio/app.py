@@ -26,7 +26,6 @@ import math
 import os
 import threading
 from dataclasses import dataclass, field
-from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -38,8 +37,9 @@ from PIL import Image
 from pydantic import BaseModel, ConfigDict
 from pygame_gui.core import ObjectID
 from pygame_gui.elements import UIDropDownMenu
-from pygame_gui.windows import UIColourPickerDialog, UIConfirmationDialog, UIFileDialog
+from pygame_gui.windows import UIColourPickerDialog, UIConfirmationDialog
 
+from . import native_dialog
 from .layout import (
     CTRL_H,
     DEFAULT_H,
@@ -241,8 +241,6 @@ class App:
     _frame_surface: pygame.Surface | None = None
     _frame_key: tuple[int, int] | None = None  # (id(array), index) to detect new frames
     _pending_size: tuple[int, int] | None = None  # coalesced window resize, applied per frame
-    _file_dialog: UIFileDialog | None = None  # open Save dialog, if any
-    _save_surface: pygame.Surface | None = None  # frame frozen when Save was clicked
 
     # painting tools
     brush_type: str = "Soft"
@@ -364,7 +362,6 @@ class App:
         self._init_label = "none"
         self._init_denoise = 60
         self._init_surface: pygame.Surface | None = None
-        self._init_dialog: UIFileDialog | None = None
         # "Reset canvas" confirmation (discards the rendered frame so the init preview shows).
         self._confirm_dialog: UIConfirmationDialog | None = None
 
@@ -528,19 +525,19 @@ class App:
         )
 
     def _modal_open(self) -> bool:
-        """True while a dialog window (RGB picker / save preset / open or save image) is open.
+        """True while an in-window dialog (RGB picker / save preset / reset confirm) is open.
 
         Those are ``UIWindow``s pygame_gui draws over the canvas, but our raw mouse/keyboard
         canvas handling runs regardless — so while one is up we suppress painting, panning,
         zooming, swatch clicks, shortcuts, and the brush cursor to keep it from leaking through.
+        (The native Save/Open dialogs are separate OS windows that block the loop, so they need
+        no tracking here.)
         """
         return any(
             w is not None and w.alive()
             for w in (
                 self._colour_picker,
                 self._save_preset_window,
-                self._file_dialog,
-                self._init_dialog,
                 self._confirm_dialog,
             )
         )
@@ -1533,37 +1530,25 @@ class App:
             self._stop_run()
             self._status("Steps set")
 
-    def _open_save_dialog(self) -> None:
-        """Freeze the current frame and open a file dialog to choose where to write it."""
+    def _save_image(self) -> None:
+        """Save the current frame via the native Save dialog (blocks while it's open)."""
         if self._frame_surface is None:
             self._status("No frame")
             return
-        if self._file_dialog is not None and self._file_dialog.alive():
-            return  # a dialog is already open
-        self._save_surface = self._frame_surface.copy()  # freeze; generation may advance
+        surface = self._frame_surface.copy()  # freeze; the worker keeps generating
         self.out_dir.mkdir(parents=True, exist_ok=True)
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        win_w, win_h = self._window_size()
-        rect = pygame.Rect(0, 0, 560, 440)
-        rect.center = (win_w // 2, win_h // 2)
-        self._file_dialog = UIFileDialog(
-            rect,
-            self.manager,
-            window_title="Save image",
-            initial_file_path=str(self.out_dir / f"interactive_{stamp}.png"),
-            allow_existing_files_only=False,
-        )
-
-    def _write_save(self, path_str: str) -> None:
-        """Write the frozen frame to the path the dialog returned (defaulting to .png)."""
-        if self._save_surface is None:
+        try:
+            path_str = native_dialog.save_file(title="Save image", start_dir=str(self.out_dir))
+        except native_dialog.Unavailable:
+            self._status("No native dialog (install zenity)")
             return
+        if not path_str:
+            return  # cancelled
         path = Path(path_str)
         if path.suffix.lower() not in (".png", ".jpg", ".jpeg", ".bmp", ".tga"):
             path = path.with_suffix(".png")
         path.parent.mkdir(parents=True, exist_ok=True)
-        pygame.image.save(self._save_surface, str(path))
-        self._save_surface = None
+        pygame.image.save(surface, str(path))
         self._status("Saved")
         log.info("saved %s", path)
 
@@ -1624,21 +1609,16 @@ class App:
             status.set_text("Init: none")
         self._status("Init cleared")
 
-    def _open_init_dialog(self) -> None:
-        """Open a file dialog to pick an image to seed the run from."""
-        if self._init_dialog is not None and self._init_dialog.alive():
-            return
-        win_w, win_h = self._window_size()
-        rect = pygame.Rect(0, 0, 560, 440)
-        rect.center = (win_w // 2, win_h // 2)
+    def _open_init(self) -> None:
+        """Pick an init image via the native Open dialog (blocks while it's open)."""
         self.out_dir.mkdir(parents=True, exist_ok=True)
-        self._init_dialog = UIFileDialog(
-            rect,
-            self.manager,
-            window_title="Open init image",
-            initial_file_path=f"{self.out_dir}/",
-            allow_existing_files_only=True,
-        )
+        try:
+            path_str = native_dialog.open_file(title="Open init image", start_dir=str(self.out_dir))
+        except native_dialog.Unavailable:
+            self._status("No native dialog (install zenity)")
+            return
+        if path_str:
+            self._load_init_file(path_str)
 
     def _open_reset_confirm(self) -> None:
         """Confirm before discarding the rendered frame (so the init / empty canvas shows again)."""
@@ -1921,7 +1901,7 @@ class App:
         if event.type == pygame.KEYDOWN and not self._typing() and not self._modal_open():
             if event.mod & pygame.KMOD_CTRL:  # ctrl combos: Save / Revert
                 if event.key == pygame.K_s:
-                    self._open_save_dialog()
+                    self._save_image()
                 elif event.key == pygame.K_z:
                     self._keyboard_revert()
             elif event.key == pygame.K_SPACE:
@@ -1946,7 +1926,7 @@ class App:
             elif event.ui_element == self.reset_button:
                 self._open_reset_confirm()
             elif event.ui_element == self.save_button:
-                self._open_save_dialog()
+                self._save_image()
             elif event.ui_element in (self.tab_settings, self.tab_current):
                 self._sidebar_tab = (
                     "settings" if event.ui_element == self.tab_settings else "current"
@@ -1957,7 +1937,7 @@ class App:
             elif event.ui_element == self.pick_color_button:
                 self._open_colour_picker()
             elif event.ui_element == self.open_init_button:
-                self._open_init_dialog()
+                self._open_init()
             elif event.ui_element == self.use_current_init_button:
                 self._use_current_as_init()
             elif event.ui_element == self.clear_init_button:
@@ -2100,21 +2080,8 @@ class App:
         elif event.type == pygame.DROPFILE:  # drag-drop an image onto the window -> init image
             self._load_init_file(event.file)
 
-        elif event.type == pygame_gui.UI_FILE_DIALOG_PATH_PICKED:
-            if event.ui_element is self._file_dialog:
-                self._write_save(event.text)
-                self._file_dialog = None
-            elif event.ui_element is self._init_dialog:
-                self._load_init_file(event.text)
-                self._init_dialog = None
-
         elif event.type == pygame_gui.UI_WINDOW_CLOSE:
-            if event.ui_element is self._file_dialog:  # cancelled
-                self._file_dialog = None
-                self._save_surface = None
-            elif event.ui_element is self._init_dialog:
-                self._init_dialog = None
-            elif event.ui_element is self._save_preset_window:
+            if event.ui_element is self._save_preset_window:
                 self._close_save_preset_dialog()
             elif event.ui_element is self._colour_picker:
                 self._colour_picker = None

@@ -150,10 +150,22 @@ def _key(key, mod=0):
     return pygame.event.Event(pygame.KEYDOWN, key=key, mod=mod)
 
 
-def test_ctrl_s_opens_save_dialog(app):
+def test_ctrl_s_saves_via_native_dialog(app, tmp_path, monkeypatch):
+    out = tmp_path / "saved.png"
+    monkeypatch.setattr(A.native_dialog, "save_file", lambda **kw: str(out))
     app._frame_surface = pygame.Surface((app.width, app.height))
     app._handle_event(_key(pygame.K_s, pygame.KMOD_CTRL))
-    assert app._file_dialog is not None and app._file_dialog.alive()
+    assert out.exists()  # the frame was written to the path the native dialog returned
+
+
+def test_save_image_reports_when_no_backend(app, monkeypatch):
+    def _unavailable(**kw):
+        raise A.native_dialog.Unavailable("no backend")
+
+    monkeypatch.setattr(A.native_dialog, "save_file", _unavailable)
+    app._frame_surface = pygame.Surface((app.width, app.height))
+    app._save_image()
+    assert "native dialog" in app.status_label.text.lower()
 
 
 def test_bracket_keys_change_brush_size(app):

@@ -10,6 +10,7 @@ import pygame_gui
 from disco_diffusion import RunConfig
 from PIL import Image
 
+from disco_diffusion_studio import app as A
 from disco_diffusion_studio.worker import GenerationWorker
 
 
@@ -69,9 +70,12 @@ def test_clear_init(app, tmp_path):
     assert app._init_surface is None
 
 
-def test_init_dialog_is_modal(app):
-    app._open_init_dialog()
-    assert app._modal_open()
+def test_open_init_loads_via_native_dialog(app, tmp_path, monkeypatch):
+    path = _png(tmp_path)
+    monkeypatch.setattr(A.native_dialog, "open_file", lambda **kw: str(path))
+    app._open_init()
+    assert app._init_image is not None
+    assert app._init_label == "seed.png"
 
 
 def test_dropfile_loads_init(app, tmp_path):

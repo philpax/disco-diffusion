@@ -33,6 +33,7 @@ in
 pkgs.mkShell {
   nativeBuildInputs = with pkgs; [
     pkg-config
+    zenity  # native file dialogs for the studio (crossfiledialog drives it on Linux)
   ];
 
   buildInputs = electronDeps;
