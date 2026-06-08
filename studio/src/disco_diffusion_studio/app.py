@@ -890,10 +890,12 @@ class App:
             self._current_labels[key] = value
             return y + pitch
 
+        # Headings are plain — the Current tab reflects what the image is generating with, so the
+        # values speak for themselves without a "this run / next run" qualifier.
         y = 2
         ui.UILabel(
             Row(0, y, inner_w, LABEL_H).fill(),
-            "Guidance — live",
+            "Guidance",
             self.manager,
             container=container,
             object_id="#section_label",
@@ -902,7 +904,7 @@ class App:
         for sc in LIVE_SCALES:
             y = row(y, sc.attr, sc.label)
         y += 6
-        self._current_perrun_header = ui.UILabel(
+        ui.UILabel(
             Row(0, y, inner_w, LABEL_H).fill(),
             "Per-run",
             self.manager,
@@ -951,11 +953,10 @@ class App:
                 text = sc.fmt.format(float(getattr(cfg, sc.attr)))
                 if label.text != text:
                     label.set_text(text)
-        running = self.running
-        perrun = self._run_snapshot if running else self._perrun_values()
-        header = "Per-run — this run" if running else "Per-run — next run"
-        if self._current_perrun_header.text != header:
-            self._current_perrun_header.set_text(header)
+        # While a run exists (playing, paused, or done) these reflect that run's frozen snapshot —
+        # what the image on screen was generated with; only once fully stopped do they show the
+        # pending values the next run would use.
+        perrun = self._run_snapshot if self.worker is not None else self._perrun_values()
         for key, _name in CURRENT_PERRUN:
             label = self._current_labels.get(key)
             text = perrun.get(key, "—")
