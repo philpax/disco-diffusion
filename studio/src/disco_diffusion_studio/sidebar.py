@@ -2,11 +2,12 @@
 
 :class:`Sidebar` owns the sidebar's widgets *and* builds them (``build`` + the per-section
 helpers), keeping the right column out of the god-class. It takes the App for shared state /
-actions; the App's event router still drives it (folding the event slice in is the next step).
+actions, and routes its own widget events via ``handle``.
 """
 
 from __future__ import annotations
 
+import random
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -22,8 +23,10 @@ from pygame_gui.elements import (
     UITextEntryLine,
 )
 
+from .constants import GUIDANCE_CHECKPOINT_MS
 from .controls import CURRENT_PERRUN, CUSTOM_PRESET, LIVE_SCALES, SCHEDULES
 from .layout import CTRL_H, LABEL_H, MARGIN, PAD, Row
+from .util import int_or
 
 if TYPE_CHECKING:
     from .app import App
@@ -416,3 +419,96 @@ class Sidebar:
             app.manager,
             container=self.settings_panel,
         )
+
+    def handle(self, app: App, event: pygame.event.Event) -> bool:
+        """Handle an event targeting a sidebar widget; return True if it was ours."""
+        if event.type == pygame_gui.UI_BUTTON_PRESSED:
+            e = event.ui_element
+            if e in (self.tab_settings, self.tab_current):
+                self._sidebar_tab = "settings" if e == self.tab_settings else "current"
+                self.sync_tabs(app)
+            elif e == self.save_preset_button:
+                app._open_save_preset_dialog()
+            elif e == self.save_session_button:
+                app._save_session()
+            elif e == self.load_session_button:
+                app._load_session()
+            elif e == self.open_init_button:
+                app._open_init()
+            elif e == self.use_current_init_button:
+                app._use_current_as_init()
+            elif e == self.clear_init_button:
+                app._clear_init()
+            elif e == self.perlin_button:
+                app.session.config.perlin_init = not app.session.config.perlin_init
+                on = app.session.config.perlin_init
+                (self.perlin_button.select if on else self.perlin_button.unselect)()
+                app._status(f"Perlin {'on' if on else 'off'}")
+                app._mark_custom()
+            elif e in self._clip_buttons:
+                app._toggle_clip_model(e)
+            elif e == self.secondary_button:
+                app._secondary_on = not app._secondary_on
+                (
+                    self.secondary_button.select
+                    if app._secondary_on
+                    else self.secondary_button.unselect
+                )()
+                app._update_reload_queue()
+                app._mark_custom()
+            elif e == self.apply_button:
+                app._apply_size(
+                    int_or(self.width_entry.get_text(), app.width),
+                    int_or(self.height_entry.get_text(), app.height),
+                )
+            elif e == self.swap_button:
+                app._apply_size(app.height, app.width)
+            elif e == self.random_seed_button:
+                app._seed_text = str(random.randrange(2**31))  # roll a fresh, visible seed
+                self.seed_entry.set_text(app._seed_text)
+                app._status(f"Seed {app._seed_text}")
+            else:
+                return False
+            return True
+        if event.type == pygame_gui.UI_HORIZONTAL_SLIDER_MOVED:
+            e = event.ui_element
+            if e == self._eta_slider:
+                # eta is read when the loop's generator is built, so this lands on the next run.
+                app.session.config.eta = float(event.value)
+                self._eta_label.set_text(f"{event.value:.2f}")
+                app._mark_custom()
+            elif e == self._init_denoise_slider:
+                # img2img strength — converted to skip_steps at the next Play.
+                app._init.denoise = int(round(event.value))
+                self._init_denoise_label.set_text(f"{app._init.denoise}%")
+            elif e in self._scale_sliders:
+                attr, is_int, vlabel, fmt = self._scale_sliders[e]
+                value: float | int = int(round(event.value)) if is_int else float(event.value)
+                # session.config is the live config the running Sampler reads each step, so this
+                # retunes guidance on the next step (and seeds the next run when stopped).
+                setattr(app.session.config, attr, value)
+                vlabel.set_text(fmt.format(value))
+                app._mark_custom()
+                # Drop a revert point once the drag settles (debounced in run()).
+                app._guidance_checkpoint_at = pygame.time.get_ticks() + GUIDANCE_CHECKPOINT_MS
+            else:
+                return False
+            return True
+        if event.type == pygame_gui.UI_DROP_DOWN_MENU_CHANGED:
+            if event.ui_element == self.preset_dropdown:
+                app._preset_selection = event.text
+                if event.text != CUSTOM_PRESET:
+                    app._apply_preset(event.text)
+                return True
+            return False
+        if event.type == pygame_gui.UI_TEXT_ENTRY_FINISHED:
+            e = event.ui_element
+            if e == self.steps_entry:
+                app._commit_steps()
+                return True
+            if e in (self.width_entry, self.height_entry):
+                return True  # applied via the Apply button
+            if e in self._schedule_entries:
+                app._commit_schedule_entry(e)
+                return True
+        return False

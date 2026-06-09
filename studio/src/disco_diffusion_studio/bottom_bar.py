@@ -2,7 +2,7 @@
 
 :class:`BottomBar` owns those widgets *and* builds them (``build`` + ``build_palette`` /
 ``rebuild_prompt_rows`` / ``refresh_rows``), keeping the left column's panel out of the god-class.
-It takes the App for shared state / actions; the App's event router still drives it.
+It takes the App for shared state / actions, and routes its own widget events via ``handle``.
 """
 
 from __future__ import annotations
@@ -271,3 +271,89 @@ class BottomBar:
             row._label_state = state  # type: ignore[attr-defined]
             wlabel.text_colour = pygame.Color(*colour)
             wlabel.set_text(text)
+
+    def handle(self, app: App, event: pygame.event.Event) -> bool:
+        """Handle an event targeting a bottom-bar widget; return True if it was ours."""
+        if event.type == pygame_gui.UI_BUTTON_PRESSED:
+            e = event.ui_element
+            if e == self.play_button:
+                app._toggle_play()
+            elif e == self.stop_button:
+                app._stop_run()
+                app._status("Stopped")
+            elif e == self.reset_button:
+                app._open_reset_confirm()
+            elif e == self.save_button:
+                app._save_image()
+            elif e == self.pick_color_button:
+                app._open_colour_picker()
+            elif e == self.add_button:
+                app.prompts.append(PromptRow("", 1.0))
+                self.rebuild_prompt_rows(app)
+                app._push_prompts()
+                app._request_checkpoint("add prompt")
+            elif e in self._remove_buttons:
+                idx = self._remove_buttons[e]
+                if 0 <= idx < len(app.prompts):
+                    app.prompts.pop(idx)
+                    self.rebuild_prompt_rows(app)
+                    app._push_prompts()
+                    app._request_checkpoint("remove prompt")
+            elif e in self._mute_buttons:
+                idx = self._mute_buttons[e]
+                if 0 <= idx < len(app.prompts):
+                    prompt = app.prompts[idx]
+                    prompt.muted = not prompt.muted
+                    (e.select if prompt.muted else e.unselect)()
+                    self.refresh_rows(app)
+                    app._push_prompts()  # re-mix conditioning (muted excluded)
+                    app._request_checkpoint("mute prompt" if prompt.muted else "unmute prompt")
+            elif e in self._brush_buttons:
+                app.brush.type = self._brush_buttons[e]
+                for button, name in self._brush_buttons.items():
+                    (button.select if name == app.brush.type else button.unselect)()
+            elif e == self.noise_button:
+                app.brush.noise = not app.brush.noise
+                (self.noise_button.select if app.brush.noise else self.noise_button.unselect)()
+            elif e == self.clear_paint_button:
+                app.canvas.paint.layer.clear()
+            elif e == self.revert_button:
+                app._do_revert()
+            elif e == self.cancel_button:
+                app._timeline.preview_index = None
+                self.history_slider.set_current_value(float(app._live_index()))
+                app._refresh_preview_state()
+            else:
+                return False
+            return True
+        if event.type == pygame_gui.UI_HORIZONTAL_SLIDER_MOVED:
+            e = event.ui_element
+            if e == self.size_slider:
+                app.brush.size = float(event.value)
+            elif e == self.strength_slider:
+                app.brush.strength = float(event.value)
+            elif e == self.history_slider:
+                # Step-space slider: snap the dragged value to the nearest checkpoint (or live)
+                # and park the thumb on that checkpoint's actual step position.
+                snap_idx = app._timeline.snap(float(event.value), app._live_index())
+                app._timeline.preview_index = snap_idx
+                if snap_idx is not None:
+                    snapped = float(app._timeline.entries[snap_idx].index)
+                else:
+                    snapped = float(app._live_index())
+                self.history_slider.set_current_value(snapped)
+                app._refresh_preview_state()
+            elif e in self._weight_sliders:
+                idx = self._weight_sliders[e]
+                if 0 <= idx < len(app.prompts):
+                    app.prompts[idx].weight = float(event.value)
+                    self.refresh_rows(app)
+                    app._push_prompts()
+            else:
+                return False
+            return True
+        if event.type == pygame_gui.UI_TEXT_ENTRY_FINISHED:
+            if event.ui_element in self._prompt_entries:
+                app._commit_prompt_entry(event.ui_element)
+                return True
+        return False
