@@ -2,16 +2,12 @@
 
 from __future__ import annotations
 
-import threading
 from types import SimpleNamespace
 
 import pygame
 import pygame_gui
 from disco_diffusion import RunConfig
 from PIL import Image
-
-from disco_diffusion_studio import app as A
-from disco_diffusion_studio.worker import GenerationWorker
 
 
 def _png(tmp_path, size=(80, 50)):
@@ -70,9 +66,9 @@ def test_clear_init(app, tmp_path):
     assert app._init_surface is None
 
 
-def test_open_init_loads_via_native_dialog(app, tmp_path, monkeypatch):
+def test_open_init_loads_via_native_dialog(app, tmp_path, stub_dialogs):
     path = _png(tmp_path)
-    monkeypatch.setattr(A.native_dialog, "open_file", lambda **kw: str(path))
+    stub_dialogs(open=path)
     app._open_init()
     assert app._init_image is not None
     assert app._init_label == "seed.png"
@@ -99,7 +95,7 @@ def test_reset_confirm_is_modal_then_clears_frame(app, tmp_path):
     assert app._displayed_surface() is None  # so the init preview shows again
 
 
-def test_worker_forwards_init_to_sampler():
+def test_worker_forwards_init_to_sampler(worker_factory):
     captured: dict = {}
 
     class _Stub:
@@ -125,16 +121,7 @@ def test_worker_forwards_init_to_sampler():
         sampler=sampler,
     )
     init = Image.new("RGB", (8, 8))
-    worker = GenerationWorker(
-        session,
-        width=64,
-        height=64,
-        steps=10,
-        encode_cache={},
-        cache_lock=threading.Lock(),
-        init_image=init,
-        skip_steps=7,
-    )
+    worker = worker_factory(session, steps=10, init_image=init, skip_steps=7)
     worker._start_sampler()  # call directly (no thread) to capture the sampler kwargs
     assert captured["init_image"] is init
     assert captured["skip_steps"] == 7

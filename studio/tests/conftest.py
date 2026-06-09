@@ -17,6 +17,7 @@ os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
 os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
 
 import shutil  # noqa: E402 - after the SDL env hints
+import threading  # noqa: E402
 from types import SimpleNamespace  # noqa: E402
 
 import pygame  # noqa: E402
@@ -60,3 +61,60 @@ def app(studio_sandbox, fake_session, tmp_path):
     from disco_diffusion_studio.app import App
 
     return App(session=fake_session, out_dir=tmp_path / "out")
+
+
+@pytest.fixture
+def fake_worker():
+    """Factory for a stub worker; sane defaults, override any attribute via kwargs.
+
+    The app reads only a handful of worker attributes off the UI thread, so a ``SimpleNamespace``
+    stands in for a real (threaded, sampler-driving) ``GenerationWorker`` in app-level tests.
+    """
+
+    def make(**overrides):
+        attrs: dict = dict(
+            is_alive=lambda: True,
+            finished=False,
+            seek=lambda i: None,
+            set_prompts=lambda p: None,
+            checkpoint=lambda label: None,
+            paint_applied_count=0,
+            latest_frame=lambda: None,
+        )
+        attrs.update(overrides)
+        return SimpleNamespace(**attrs)
+
+    return make
+
+
+@pytest.fixture
+def worker_factory():
+    """Build a real ``GenerationWorker`` over a (stub) ``session`` with the standard rigging."""
+    from disco_diffusion_studio.worker import GenerationWorker
+
+    def make(session, *, width: int = 64, height: int = 64, steps: int = 20, **kwargs):
+        return GenerationWorker(
+            session,
+            width=width,
+            height=height,
+            steps=steps,
+            encode_cache={},
+            cache_lock=threading.Lock(),
+            **kwargs,
+        )
+
+    return make
+
+
+@pytest.fixture
+def stub_dialogs(monkeypatch):
+    """Patch the native Save/Open dialogs to return given paths (str-ified)."""
+    from disco_diffusion_studio import app as app_mod
+
+    def patch(*, save: object = None, open: object = None) -> None:
+        if save is not None:
+            monkeypatch.setattr(app_mod.native_dialog, "save_file", lambda **k: str(save))
+        if open is not None:
+            monkeypatch.setattr(app_mod.native_dialog, "open_file", lambda **k: str(open))
+
+    return patch

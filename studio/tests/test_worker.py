@@ -7,14 +7,13 @@ the live guidance values for revert.
 
 from __future__ import annotations
 
-import threading
 import time
 from types import SimpleNamespace
 
 import numpy as np
 from PIL import Image
 
-from disco_diffusion_studio.worker import GenerationWorker, PromptSpec
+from disco_diffusion_studio.worker import PromptSpec
 
 
 class _StepResult:
@@ -62,15 +61,13 @@ class StubSampler:
         pass
 
 
-def _make_worker(cfg=None) -> GenerationWorker:
+def _stub_session(cfg=None):
+    """A SimpleNamespace session that hands out StubSamplers (no torch/models)."""
     cfg = cfg or SimpleNamespace(clip_guidance_scale=5000, tv_scale=0.0)
-    session = SimpleNamespace(
+    return SimpleNamespace(
         config=cfg,
         diffusion_for=lambda steps: SimpleNamespace(num_timesteps=20),
         sampler=lambda **kw: StubSampler(),
-    )
-    return GenerationWorker(
-        session, width=64, height=64, steps=20, encode_cache={}, cache_lock=threading.Lock()
     )
 
 
@@ -81,8 +78,8 @@ def _paint_batch(value: float = 0.5):
     return rgb, alpha, tint
 
 
-def test_each_stroke_is_its_own_checkpoint():
-    worker = _make_worker()
+def test_each_stroke_is_its_own_checkpoint(worker_factory):
+    worker = worker_factory(_stub_session())
     worker.start()
     time.sleep(0.05)  # let it produce output (has_output) before painting
     for i in range(3):
@@ -96,9 +93,9 @@ def test_each_stroke_is_its_own_checkpoint():
     assert sum(label.startswith("paint") for label in labels) == 3
 
 
-def test_checkpoints_snapshot_guidance_and_eta():
+def test_checkpoints_snapshot_guidance_and_eta(worker_factory):
     cfg = SimpleNamespace(clip_guidance_scale=5000, tv_scale=0.0, eta=0.8)
-    worker = _make_worker(cfg)
+    worker = worker_factory(_stub_session(cfg))
     worker.start()
     time.sleep(0.05)
     cfg.clip_guidance_scale = 12345  # "change guidance"
@@ -116,7 +113,7 @@ def test_checkpoints_snapshot_guidance_and_eta():
     assert guidance.config.eta == 0.3  # eta is captured, so Revert can restore it
 
 
-def test_muted_and_empty_prompts_excluded_from_conditioning():
+def test_muted_and_empty_prompts_excluded_from_conditioning(worker_factory):
     recorded = []
 
     class RecSampler(StubSampler):
@@ -129,9 +126,7 @@ def test_muted_and_empty_prompts_excluded_from_conditioning():
         sampler=lambda **kw: RecSampler(),
         encode=lambda text: f"emb:{text}",
     )
-    worker = GenerationWorker(
-        session, width=64, height=64, steps=20, encode_cache={}, cache_lock=threading.Lock()
-    )
+    worker = worker_factory(session)
     specs = [
         PromptSpec(text="a", weight=1.0, muted=False),
         PromptSpec(text="b", weight=0.5, muted=True),

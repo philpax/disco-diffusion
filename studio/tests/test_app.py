@@ -43,28 +43,28 @@ def test_editing_guidance_marks_custom_and_arms_checkpoint(app):
     assert app._guidance_checkpoint_at is not None
 
 
-def test_apply_preset_sets_guidance_and_requests_checkpoint(app):
+def test_apply_preset_sets_guidance_and_requests_checkpoint(app, fake_worker):
     calls: list[str] = []
-    app.worker = SimpleNamespace(is_alive=lambda: True, checkpoint=calls.append)
+    app.worker = fake_worker(checkpoint=calls.append)
     app._apply_preset("2022 sauce")
     assert app.session.config.clip_guidance_scale == 15000
     assert calls == ["preset 2022 sauce"]
 
 
-def test_history_snap_picks_nearest_checkpoint(app):
+def test_history_snap_picks_nearest_checkpoint(app, fake_worker):
     img = np.zeros((4, 4, 3), np.uint8)
     app._history = [
         HistoryEntry(latent=None, step=0, index=2, total=100, preview=img, label="start"),
         HistoryEntry(latent=None, step=0, index=60, total=100, preview=img, label="paint"),
     ]
     # Live is further along than the last checkpoint, as it is mid-run.
-    app.worker = SimpleNamespace(latest_frame=lambda: SimpleNamespace(index=95, total=100))
+    app.worker = fake_worker(latest_frame=lambda: SimpleNamespace(index=95, total=100))
     assert app._history_snap(3.0) == 0
     assert app._history_snap(58.0) == 1
     assert app._history_snap(95.0) is None  # rightmost == live
 
 
-def test_revert_restores_guidance_and_eta(app):
+def test_revert_restores_guidance_and_eta(app, fake_worker):
     img = np.zeros((4, 4, 3), np.uint8)
     app._history = [
         HistoryEntry(
@@ -75,10 +75,7 @@ def test_revert_restores_guidance_and_eta(app):
     ]
     app._hist_len = 1
     app._preview_index = 0
-    app.worker = SimpleNamespace(
-        is_alive=lambda: True, seek=lambda i: None, set_prompts=lambda p: None,
-        paint_applied_count=0, latest_frame=lambda: None, finished=False,
-    )
+    app.worker = fake_worker()
     app.session.config.clip_guidance_scale = 20000  # diverge from the checkpoint
     app.session.config.eta = 0.2
     revert = pygame.event.Event(pygame_gui.UI_BUTTON_PRESSED, ui_element=app.revert_button)
@@ -155,10 +152,9 @@ def test_random_seed_button_rerolls_to_a_new_seed(app):
     assert app.seed_entry.get_text() != "999"
 
 
-def test_session_save_load_round_trip(app, tmp_path, monkeypatch):
+def test_session_save_load_round_trip(app, tmp_path, stub_dialogs):
     archive = tmp_path / "sess.zip"
-    monkeypatch.setattr(A.native_dialog, "save_file", lambda **k: str(archive))
-    monkeypatch.setattr(A.native_dialog, "open_file", lambda **k: str(archive))
+    stub_dialogs(save=archive, open=archive)
     app._frame_surface = pygame.Surface((app.width, app.height))  # a rendered result to bundle
     app._frame_surface.fill((20, 180, 90))
     app.prompts = [A.PromptRow("castle", 1.3, False), A.PromptRow("bg", 0.4, True)]
@@ -186,10 +182,9 @@ def test_session_save_load_round_trip(app, tmp_path, monkeypatch):
     assert app._init_label == "session result"
 
 
-def test_session_restores_scrubbable_history(app, tmp_path, monkeypatch):
+def test_session_restores_scrubbable_history(app, tmp_path, stub_dialogs):
     archive = tmp_path / "s.zip"
-    monkeypatch.setattr(A.native_dialog, "save_file", lambda **k: str(archive))
-    monkeypatch.setattr(A.native_dialog, "open_file", lambda **k: str(archive))
+    stub_dialogs(save=archive, open=archive)
     img = np.full((app.height, app.width, 3), 7, np.uint8)
     app._history = [
         HistoryEntry(latent=None, step=0, index=1, total=100, preview=img, label="start",
@@ -207,10 +202,9 @@ def test_session_restores_scrubbable_history(app, tmp_path, monkeypatch):
     assert app._history[0].latent is None  # previews only, no latent
 
 
-def test_loaded_result_is_rightmost_scrubbable_endpoint(app, tmp_path, monkeypatch):
+def test_loaded_result_is_rightmost_scrubbable_endpoint(app, tmp_path, stub_dialogs):
     archive = tmp_path / "s.zip"
-    monkeypatch.setattr(A.native_dialog, "save_file", lambda **k: str(archive))
-    monkeypatch.setattr(A.native_dialog, "open_file", lambda **k: str(archive))
+    stub_dialogs(save=archive, open=archive)
     img = np.full((app.height, app.width, 3), 7, np.uint8)
     app._frame_surface = pygame.Surface((app.width, app.height))  # a finished result on the canvas
     app._frame_surface.fill((9, 9, 9))
@@ -238,10 +232,10 @@ def test_session_loaded_via_init_button_shows_error(app, tmp_path):
     assert app._init_image is None  # not mistaken for an image
 
 
-def test_image_loaded_via_session_button_shows_error(app, tmp_path, monkeypatch):
+def test_image_loaded_via_session_button_shows_error(app, tmp_path, stub_dialogs):
     image_file = tmp_path / "pic.png"
     Image.new("RGB", (8, 8)).save(image_file)
-    monkeypatch.setattr(A.native_dialog, "open_file", lambda **k: str(image_file))
+    stub_dialogs(open=image_file)
     before = app.steps
     app._load_session()
     assert app._message_window is not None and app._message_window.alive()
@@ -311,9 +305,9 @@ def _key(key, mod=0):
     return pygame.event.Event(pygame.KEYDOWN, key=key, mod=mod)
 
 
-def test_ctrl_s_saves_via_native_dialog(app, tmp_path, monkeypatch):
+def test_ctrl_s_saves_via_native_dialog(app, tmp_path, stub_dialogs):
     out = tmp_path / "saved.png"
-    monkeypatch.setattr(A.native_dialog, "save_file", lambda **kw: str(out))
+    stub_dialogs(save=out)
     app._frame_surface = pygame.Surface((app.width, app.height))
     app._handle_event(_key(pygame.K_s, pygame.KMOD_CTRL))
     assert out.exists()  # the frame was written to the path the native dialog returned
@@ -343,7 +337,7 @@ def test_digit_selects_palette_colour(app):
     assert app.brush_color == app._swatch_colours()[2]
 
 
-def test_ctrl_z_reverts_to_latest_checkpoint(app):
+def test_ctrl_z_reverts_to_latest_checkpoint(app, fake_worker):
     img = np.zeros((4, 4, 3), np.uint8)
     app._history = [
         HistoryEntry(
@@ -354,10 +348,7 @@ def test_ctrl_z_reverts_to_latest_checkpoint(app):
     ]
     app._hist_len = 1
     seeked = []
-    app.worker = SimpleNamespace(
-        is_alive=lambda: True, finished=True, seek=seeked.append, set_prompts=lambda p: None,
-        paint_applied_count=0, latest_frame=lambda: None,
-    )
+    app.worker = fake_worker(finished=True, seek=seeked.append)
     app.paused = True  # not running -> revert is allowed
     app.session.config.clip_guidance_scale = 20000
     app._handle_event(_key(pygame.K_z, pygame.KMOD_CTRL))
@@ -365,7 +356,7 @@ def test_ctrl_z_reverts_to_latest_checkpoint(app):
     assert app.session.config.clip_guidance_scale == 5000
 
 
-def test_ctrl_z_walks_back_through_history(app):
+def test_ctrl_z_walks_back_through_history(app, fake_worker):
     img = np.zeros((4, 4, 3), np.uint8)
     app._history = [
         HistoryEntry(latent=None, step=0, index=2, total=100, preview=img, label="start",
@@ -382,10 +373,7 @@ def test_ctrl_z_walks_back_through_history(app):
         seeked.append(i)
         del app._history[i + 1:]  # mimic the worker's branch-truncation on seek
 
-    app.worker = SimpleNamespace(
-        is_alive=lambda: True, finished=True, seek=seek, set_prompts=lambda p: None,
-        paint_applied_count=0, latest_frame=lambda: None,
-    )
+    app.worker = fake_worker(finished=True, seek=seek)
     app.paused = True
     for _ in range(3):
         app._handle_event(_key(pygame.K_z, pygame.KMOD_CTRL))
