@@ -320,8 +320,8 @@ class BottomBar:
             elif e == self.revert_button:
                 app._do_revert()
             elif e == self.cancel_button:
-                app._timeline.preview_index = None
-                self.history_slider.set_current_value(float(app._live_index()))
+                app._timeline.clear_preview()
+                self.park_history_thumb(float(app._live_index()))
                 app._refresh_preview_state()
             else:
                 return False
@@ -335,13 +335,8 @@ class BottomBar:
             elif e == self.history_slider:
                 # Step-space slider: snap the dragged value to the nearest checkpoint (or live)
                 # and park the thumb on that checkpoint's actual step position.
-                snap_idx = app._timeline.snap(float(event.value), app._live_index())
-                app._timeline.preview_index = snap_idx
-                if snap_idx is not None:
-                    snapped = float(app._timeline.entries[snap_idx].index)
-                else:
-                    snapped = float(app._live_index())
-                self.history_slider.set_current_value(snapped)
+                snapped = app._timeline.scrub(float(event.value), app._live_index())
+                self.park_history_thumb(snapped)
                 app._refresh_preview_state()
             elif e in self._weight_sliders:
                 idx = self._weight_sliders[e]
@@ -377,6 +372,33 @@ class BottomBar:
         app.brush.color = rgb
         app._palette.remember(rgb)  # records off-palette colours as recents (deduped, persisted)
         self.build_palette(app, self._palette_rect)  # relayout to include any new recent
+
+    def set_step_label(self, text: str) -> None:
+        """Set the transport step counter (e.g. "step 12 / 100")."""
+        self.step_label.set_text(text)
+
+    def set_history_label(self, text: str) -> None:
+        """Set the history readout (live / previewed checkpoint); skips a no-op re-render."""
+        if self.history_label.text != text:
+            self.history_label.set_text(text)
+
+    def gate_play_for_preview(self, previewing: bool) -> None:
+        """Disable Play while previewing a checkpoint (Revert/Cancel first), else enable it."""
+        (self.play_button.disable if previewing else self.play_button.enable)()
+
+    def park_history_thumb(self, step: float) -> None:
+        """Park the scrubber thumb on a step without firing a slider-moved event."""
+        self.history_slider.set_current_value(step)
+
+    def rebuild_history_slider(self, app: App) -> None:
+        """Recreate the step-space history slider (its range follows the run's total steps)."""
+        self.history_slider.kill()
+        self.history_slider = pygame_gui.elements.UIHorizontalSlider(
+            self._history_slider_rect,
+            start_value=app._timeline.slider_start(app._live_index()),
+            value_range=(0.0, float(max(app._history_total(), 1))),
+            manager=app.manager,
+        )
 
     def sync_enabled(self, app: App) -> None:
         """History scrubbing, prompt editing, and the Play button reflect run / preview state."""

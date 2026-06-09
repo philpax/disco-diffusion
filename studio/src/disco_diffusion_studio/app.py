@@ -621,10 +621,7 @@ class App:
             self.canvas.paint.flush(self.worker, self.brush)
         # Freeze the per-run settings this run uses, for the "Current" tab to show while it runs.
         self._run_snapshot = self.sidebar.perrun_values(self)
-        self._timeline.entries = []
-        self._timeline.hist_len = 0
-        self._timeline.preview_index = None
-        self._timeline.undo_cursor = None
+        self._timeline.reset()
         self.paused = False
         self.worker.start()
         self._status("Running")
@@ -636,9 +633,7 @@ class App:
             self.worker.join(timeout=5.0)
         self.worker = None
         self.paused = False
-        self._timeline.entries = []
-        self._timeline.hist_len = 0
-        self._timeline.preview_index = None
+        self._timeline.reset()
         self._sync_enabled()
 
     def _toggle_play(self) -> None:
@@ -649,8 +644,8 @@ class App:
             self._start_run()  # finished -> Play starts a fresh run (Revert continues a branch)
         elif self.paused:
             self.paused = False
-            self._timeline.preview_index = None  # resume from live, drop any history preview
-            self._timeline.undo_cursor = None  # resuming ends the undo chain
+            self._timeline.clear_preview()  # resume from live, drop any history preview
+            self._timeline.end_undo()  # resuming ends the undo chain
             self.worker.resume()
             self._status("Running")
             self._sync_enabled()
@@ -790,7 +785,7 @@ class App:
         self._stop_run()  # also clears history / preview index
         self.canvas.frame_surface = None
         self.canvas.frame_key = None
-        self.bottom_bar.step_label.set_text("step 0 / 0")
+        self.bottom_bar.set_step_label("step 0 / 0")
         self._status("Canvas cleared")
 
     # -- history / revert --
@@ -805,8 +800,7 @@ class App:
         else:
             frame = self.worker.latest_frame() if self.worker is not None else None
             text = f"live {frame.index}/{frame.total}" if frame is not None else "live"
-        if self.bottom_bar.history_label.text != text:  # avoid re-rendering when unchanged
-            self.bottom_bar.history_label.set_text(text)
+        self.bottom_bar.set_history_label(text)
 
     def _sync_preview_prompts(self) -> None:
         """Show the previewed checkpoint's prompts in the rows (live set when not previewing)."""
@@ -829,12 +823,7 @@ class App:
         """Update the prompt rows, label, and Play gating whenever the preview changes."""
         self._sync_preview_prompts()
         self._set_history_label()
-        previewing = self._timeline.preview_index is not None
-        (
-            self.bottom_bar.play_button.disable
-            if previewing
-            else self.bottom_bar.play_button.enable
-        )()
+        self.bottom_bar.gate_play_for_preview(self._timeline.preview_index is not None)
 
     def _do_revert(self) -> None:
         """Branch the run from the previewed checkpoint, restoring its prompts + guidance/eta."""
@@ -852,14 +841,14 @@ class App:
         self._guidance_checkpoint_at = None
         self.sidebar.refresh_advanced_widgets(self)
         self.worker.seek(self._timeline.preview_index)
-        self._timeline.preview_index = None
+        self._timeline.clear_preview()
         self._preview_prompts = None
         # Branching drops any in-flight strokes (the worker clears its queue on seek), so reset
         # the overlay tracking to stay aligned with the worker's apply count.
         self.canvas.paint.reset_overlays(self.worker.paint_applied_count)
         # Park the thumb on the checkpoint's actual step now — the worker processes the seek
         # asynchronously, so _live_index() would still read the stale (forward) live frame here.
-        self.bottom_bar.history_slider.set_current_value(float(entry.index))
+        self.bottom_bar.park_history_thumb(float(entry.index))
         self.bottom_bar.rebuild_prompt_rows(self)  # now-live (reverted) prompts
         self._push_prompts()  # apply them to the resumed run
         self._sync_enabled()  # re-enable prompt editing
@@ -871,29 +860,17 @@ class App:
         entry.config.apply_to(self.session.config)
         self.sidebar.refresh_advanced_widgets(self)
         self._set_init_image(Image.fromarray(entry.preview), f"history: {entry.label}")
-        self._timeline.preview_index = None
+        self._timeline.clear_preview()
         self._preview_prompts = None
         self.bottom_bar.rebuild_prompt_rows(self)
         self._start_run()  # seeds the new run from the checkpoint preview (img2img)
 
     # -- keyboard shortcuts --
     def _keyboard_revert(self) -> None:
-        """Ctrl+Z: step back through the checkpoints, reverting to each in turn (undo).
-
-        A scrubbed preview commits that checkpoint; otherwise the first press targets the latest
-        checkpoint and each further press one earlier (tracked by _undo_cursor, since a revert to
-        the last checkpoint doesn't truncate history so it can't be read back off the list).
-        """
+        """Ctrl+Z: step back through the checkpoints, reverting to each in turn (undo)."""
         if self.worker is None or self.running or not self._timeline.entries:
             return
-        if self._timeline.preview_index is not None:
-            target = self._timeline.preview_index
-        elif self._timeline.undo_cursor is not None:
-            target = max(0, self._timeline.undo_cursor - 1)
-        else:
-            target = len(self._timeline.entries) - 1
-        self._timeline.undo_cursor = target
-        self._timeline.preview_index = target
+        self._timeline.begin_undo()
         self._do_revert()
 
     def _nudge_brush_size(self, factor: float) -> None:
@@ -923,16 +900,6 @@ class App:
             return entries[-1].total
         return entries[-1].index if entries else 0
 
-    def _rebuild_history_slider(self) -> None:
-        """Recreate the step-space history slider (range follows the run's total steps)."""
-        self.bottom_bar.history_slider.kill()
-        self.bottom_bar.history_slider = pygame_gui.elements.UIHorizontalSlider(
-            self.bottom_bar._history_slider_rect,
-            start_value=self._timeline.slider_start(self._live_index()),
-            value_range=(0.0, float(max(self._history_total(), 1))),
-            manager=self.manager,
-        )
-
     def _sync_history(self) -> None:
         """Pull the worker's history each frame; rebuild the slider when it changes length.
 
@@ -940,21 +907,13 @@ class App:
         session (which has no worker until you Play/Revert).
         """
         tl = self._timeline
-        if self.worker is not None:
-            tl.entries = self.worker.get_history()
-        if len(tl.entries) != tl.hist_len:
-            grew = len(tl.entries) > tl.hist_len  # a new checkpoint = a fresh edit
-            tl.hist_len = len(tl.entries)
-            if grew:
-                tl.undo_cursor = None  # start a new undo chain (our reverts only shrink)
-            if tl.preview_index is not None and tl.preview_index >= tl.hist_len:
-                tl.preview_index = None
-            self._rebuild_history_slider()
+        if tl.sync(self.worker.get_history() if self.worker is not None else None):
+            self.bottom_bar.rebuild_history_slider(self)
             self._sync_enabled()
         elif self.running and tl.preview_index is None and tl.entries:
             # While actively generating (not previewing), let the thumb track the live step as it
             # advances. When paused/done we leave it alone so a scrub isn't yanked back each frame.
-            self.bottom_bar.history_slider.set_current_value(float(self._live_index()))
+            self.bottom_bar.park_history_thumb(float(self._live_index()))
         self._set_history_label()  # keep the live step current as it ticks
 
     def _displayed_surface(self) -> pygame.Surface | None:

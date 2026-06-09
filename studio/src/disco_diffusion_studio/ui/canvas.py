@@ -73,7 +73,7 @@ class Canvas:
         # Refresh the step label every frame (cheap — pygame_gui no-ops if unchanged). A UI
         # rebuild (resize / divider drag) recreates the label as "step 0 / 0", so updating it
         # only when the *surface* changes would leave it stale at "0 / 0" once generation stops.
-        app.bottom_bar.step_label.set_text(f"step {frame.index} / {frame.total}")
+        app.bottom_bar.set_step_label(f"step {frame.index} / {frame.total}")
         key = (id(frame.image), frame.index)
         if key == self.frame_key:
             return

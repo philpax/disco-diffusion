@@ -83,20 +83,21 @@ class SessionIO:
             app.canvas.frame_surface = None
         # Restore the scrubbable timeline (previews only, latent=None) — _sync_history keeps it
         # while there's no worker, and Revert continues from a checkpoint's preview via img2img.
-        app._timeline.entries = [
-            HistoryEntry(
-                latent=None,
-                step=item.step,
-                index=item.index,
-                total=item.total,
-                preview=np.asarray(preview),
-                label=item.label,
-                prompts=[PromptSpec(t, w, m) for t, w, m in item.prompts],
-                config=item.config,
-            )
-            for item, preview in history
-        ]
-        app._timeline.preview_index = None
+        app._timeline.load_entries(
+            [
+                HistoryEntry(
+                    latent=None,
+                    step=item.step,
+                    index=item.index,
+                    total=item.total,
+                    preview=np.asarray(preview),
+                    label=item.label,
+                    prompts=[PromptSpec(t, w, m) for t, w, m in item.prompts],
+                    config=item.config,
+                )
+                for item, preview in history
+            ]
+        )
         app._sync_enabled()
 
     def _current_session(self) -> Session:

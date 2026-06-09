@@ -30,6 +30,71 @@ class Timeline:
     _surface: pygame.Surface | None = None  # cached render of the previewed checkpoint
     _surface_key: int | None = None
 
+    def clear_preview(self) -> None:
+        """Stop previewing — drop back to the live frame (leaves the undo chain intact)."""
+        self.preview_index = None
+
+    def end_undo(self) -> None:
+        """End the Ctrl+Z undo chain (next press restarts from the latest checkpoint)."""
+        self.undo_cursor = None
+
+    def reset(self) -> None:
+        """Clear the whole timeline — checkpoints, length tracker, and both cursors."""
+        self.entries = []
+        self.hist_len = 0
+        self.preview_index = None
+        self.undo_cursor = None
+
+    def load_entries(self, entries: list[HistoryEntry]) -> None:
+        """Adopt a restored history (loaded session); show the live frame, not a preview."""
+        self.entries = entries
+        self.preview_index = None
+
+    def scrub(self, value: float, live_index: int) -> float:
+        """Drag the scrubber to ``value``: preview the nearest checkpoint; return its thumb step.
+
+        Snaps the dragged step value to the closest checkpoint (or the live frame), parks the
+        preview cursor there, and returns the step the thumb should sit on.
+        """
+        snap_idx = self.snap(value, live_index)
+        self.preview_index = snap_idx
+        return float(self.entries[snap_idx].index) if snap_idx is not None else float(live_index)
+
+    def begin_undo(self) -> None:
+        """Ctrl+Z: walk the preview + undo cursors one checkpoint earlier (or to the latest).
+
+        A scrubbed preview reverts that checkpoint; otherwise the first press targets the latest
+        and each further press one earlier (tracked by ``undo_cursor``, since reverting to the
+        last checkpoint doesn't truncate history so it can't be read back off the list).
+        """
+        if self.preview_index is not None:
+            target = self.preview_index
+        elif self.undo_cursor is not None:
+            target = max(0, self.undo_cursor - 1)
+        else:
+            target = len(self.entries) - 1
+        self.undo_cursor = target
+        self.preview_index = target
+
+    def sync(self, new_entries: list[HistoryEntry] | None) -> bool:
+        """Adopt the worker's latest history; return True when its length changed (slider rebuild).
+
+        Pass ``None`` to keep the current entries (no worker — empty after a stop, or restored
+        from a loaded session). On a length change the undo chain resets (growth = a fresh edit)
+        and a now-out-of-range preview cursor is dropped.
+        """
+        if new_entries is not None:
+            self.entries = new_entries
+        if len(self.entries) == self.hist_len:
+            return False
+        grew = len(self.entries) > self.hist_len
+        self.hist_len = len(self.entries)
+        if grew:
+            self.undo_cursor = None  # start a new undo chain (our reverts only shrink)
+        if self.preview_index is not None and self.preview_index >= self.hist_len:
+            self.preview_index = None
+        return True
+
     def previewing(self) -> bool:
         """True when a checkpoint is being previewed (the cursor points into the list)."""
         return self.preview_index is not None and self.preview_index < len(self.entries)
