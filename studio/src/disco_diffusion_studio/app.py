@@ -670,15 +670,26 @@ class App:
         sb = self._sidebar_rect()
         x = sb.x + PAD
         inner = max(40, sb.width - 2 * PAD)
-
-        r = Row(x, MARGIN, inner, CTRL_H)
         half = (inner - PAD) // 2
+
+        # Session save/load sits at the very top — a global action (works on either tab), so it's
+        # not buried in Settings; what it saves/loads is clear from context (the whole session).
+        r = Row(x, MARGIN, inner, CTRL_H)
+        self.save_session_button = ui.UIButton(
+            r.left(half), "Save…", self.manager, object_id="#add_button"
+        )
+        self.load_session_button = ui.UIButton(
+            r.fill(), "Load…", self.manager, object_id="#add_button"
+        )
+
+        tabs_y = MARGIN + CTRL_H + PAD
+        r = Row(x, tabs_y, inner, CTRL_H)
         self.tab_settings = ui.UIButton(
             r.left(half), "Settings", self.manager, object_id="#tab_button"
         )
         self.tab_current = ui.UIButton(r.fill(), "Current", self.manager, object_id="#tab_button")
 
-        cont_y = MARGIN + CTRL_H + PAD
+        cont_y = tabs_y + CTRL_H + PAD
         cont_rect = pygame.Rect(x, cont_y, inner, max(60, self.win_h - cont_y - MARGIN))
         self.settings_panel = ui.UIScrollingContainer(cont_rect, self.manager)
         self.current_panel = ui.UIScrollingContainer(cont_rect, self.manager)
@@ -879,19 +890,6 @@ class App:
         )
         self._preset_dd_rect = r.fill()
         self._spawn_preset_dropdown()
-        y += pitch
-
-        # Session: save/load the whole working state (prompts + output + recipe + result + history)
-        # to a .zip of your choosing (via the native dialog) — a superset of a preset.
-        y = section(y + 6, "Session — save/load everything")
-        r = Row(0, y, inner_w, CTRL_H)
-        half = (inner_w - PAD) // 2
-        self.save_session_button = ui.UIButton(
-            r.left(half), "Save…", self.manager, container=container, object_id="#add_button"
-        )
-        self.load_session_button = ui.UIButton(
-            r.fill(), "Load…", self.manager, container=container, object_id="#add_button"
-        )
         y += pitch
 
         # Guidance (live): each slider retunes the running step immediately.
@@ -1709,7 +1707,7 @@ class App:
             self._show_message(
                 "Not an image",
                 f"<b>{Path(path_str).name}</b> looks like a session bundle, not an image."
-                "<br><br>Use <b>Session — save/load everything → Load…</b> to open it.",
+                "<br><br>Use the <b>Load…</b> button at the top of the sidebar to open it.",
             )
             return
         try:
