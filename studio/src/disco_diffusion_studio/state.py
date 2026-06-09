@@ -40,6 +40,10 @@ class SharedState:
     secondary_on: bool
     worker: GenerationWorker | None = None
     paused: bool = False
+    # The selected preset name (or "Custom"); set by Recipe once it has detected the match.
+    preset_selection: str = ""
+    # Snapshot of the per-run settings the active run was started with (the "Current" sidebar tab).
+    run_snapshot: dict[str, str] = field(default_factory=dict)
     timeline: Timeline = field(default_factory=Timeline)
     init: InitImage = field(default_factory=InitImage)
     # Prompt-embedding cache shared with the worker thread (guarded by cache_lock).

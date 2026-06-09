@@ -461,8 +461,10 @@ class Sidebar:
         if self.preset_dropdown is not None:
             self.preset_dropdown.kill()
         options: list[str | tuple[str, str]] = [*app.recipe.presets.keys(), CUSTOM_PRESET]
-        selected = app.recipe.selection if app.recipe.selection in options else CUSTOM_PRESET
-        app.recipe.selection = selected
+        selected = (
+            self.state.preset_selection if self.state.preset_selection in options else CUSTOM_PRESET
+        )
+        self.state.preset_selection = selected
         self.preset_dropdown = UIDropDownMenu(
             options,
             selected,
@@ -542,7 +544,7 @@ class Sidebar:
             return True
         if event.type == pygame_gui.UI_DROP_DOWN_MENU_CHANGED:
             if event.ui_element == self.preset_dropdown:
-                app.recipe.selection = event.text
+                self.state.preset_selection = event.text
                 if event.text != CUSTOM_PRESET:
                     app.recipe.apply_preset(event.text)
                 return True
@@ -599,9 +601,7 @@ class Sidebar:
         # what the image on screen was generated with; only once fully stopped do they show the
         # pending values the next run would use.
         perrun = (
-            app.generation.run_snapshot
-            if self.state.worker is not None
-            else self.perrun_values(app)
+            self.state.run_snapshot if self.state.worker is not None else self.perrun_values(app)
         )
         for key, _name in CURRENT_PERRUN:
             label = self._current_labels.get(key)

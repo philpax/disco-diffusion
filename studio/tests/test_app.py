@@ -34,7 +34,7 @@ def test_compute_window_size_respects_minimums():
 
 
 def test_opens_on_default_preset(app):
-    assert app.recipe.selection == "Default"
+    assert app.state.preset_selection == "Default"
 
 
 def test_editing_guidance_marks_custom_and_arms_checkpoint(app):
@@ -43,7 +43,7 @@ def test_editing_guidance_marks_custom_and_arms_checkpoint(app):
         app,
         pygame.event.Event(pygame_gui.UI_HORIZONTAL_SLIDER_MOVED, ui_element=slider, value=9999.0),
     )
-    assert app.recipe.selection == CUSTOM_PRESET
+    assert app.state.preset_selection == CUSTOM_PRESET
     assert app.history.guidance_checkpoint_at is not None
 
 

@@ -37,9 +37,6 @@ class Generation:
         self.signals = signals
         self.state = state
         self.paint = paint
-        # Snapshot of the per-run settings the active run was started with, for the "Current"
-        # sidebar tab to show while it runs (live knobs are read straight from session.config).
-        self.run_snapshot: dict[str, str] = {}
 
     def seed_for_run(self) -> int:
         """Seed for the next run: the typed value, or a fresh random one (then shown in the field).
@@ -85,7 +82,7 @@ class Generation:
         if not app.canvas.paint.layer.empty():
             app.canvas.paint.flush(self.state.worker, self.paint.brush)
         # Freeze the per-run settings this run uses, for the "Current" tab to show while it runs.
-        self.run_snapshot = app.sidebar.perrun_values(app)
+        self.state.run_snapshot = app.sidebar.perrun_values(app)
         self.state.timeline.reset()
         self.state.paused = False
         self.state.worker.start()

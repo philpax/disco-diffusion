@@ -41,7 +41,8 @@ class Recipe:
         # while a preset is being applied (so its own widget updates don't read as edits).
         self.presets: dict[str, Preset] = load_presets()
         self.applying = False
-        self.selection = self.detect()  # the preset matching the loaded session (or "Custom")
+        # The preset matching the loaded session (or "Custom").
+        self.state.preset_selection = self.detect()
         # "Save preset" modal (filename prompt). None when closed.
         self.save_window: pygame_gui.elements.UIWindow | None = None
         self.save_entry: pygame_gui.elements.UITextEntryLine | None = None
@@ -62,9 +63,9 @@ class Recipe:
 
     def set_selection(self, name: str) -> None:
         """Set the dropdown's selected entry (rebuilding it, since it has no set-selected API)."""
-        if self.selection == name and self.app.sidebar.preset_dropdown is not None:
+        if self.state.preset_selection == name and self.app.sidebar.preset_dropdown is not None:
             return
-        self.selection = name
+        self.state.preset_selection = name
         self.app.sidebar.spawn_preset_dropdown(self.app)
 
     def mark_custom(self) -> None:
@@ -102,7 +103,7 @@ class Recipe:
         if preset is None:
             return
         self.apply_recipe(preset.config, preset.clip_models, preset.use_secondary_model)
-        self.selection = name
+        self.state.preset_selection = name
         # A preset retunes the live guidance, so record a revert point (discrete change — no
         # debounce); supersede any pending guidance-drag checkpoint.
         app.history.cancel_guidance_checkpoint()

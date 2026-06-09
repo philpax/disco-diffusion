@@ -159,7 +159,7 @@ class SessionIO:
         ]
         app.bottom_bar.rebuild_prompt_rows(app)
         app.recipe.apply_recipe(session.config, session.clip_models, session.use_secondary_model)
-        app.recipe.selection = app.recipe.detect()
+        app.state.preset_selection = app.recipe.detect()
         app.sidebar.spawn_preset_dropdown(app)
-        app.generation.run_snapshot = app.sidebar.perrun_values(app)
+        app.state.run_snapshot = app.sidebar.perrun_values(app)
         self.signals.status("Session loaded — press Play")
