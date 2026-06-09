@@ -77,6 +77,7 @@ class GenerationWorker(threading.Thread):
         revert_attrs: list[str] | None = None,
         init_image: Image.Image | None = None,
         skip_steps: int = 0,
+        seed: int | None = None,
     ) -> None:
         super().__init__(daemon=True)
         self._session = session
@@ -86,6 +87,7 @@ class GenerationWorker(threading.Thread):
         self._encode_cache = encode_cache
         self._cache_lock = cache_lock
         self._perlin = perlin  # seed the fresh run from Perlin noise instead of flat gaussian
+        self._seed = seed  # RNG seed for the fresh run (None = don't reseed; same on eager restart)
         # img2img: seed the fresh run from this image, noised to skip_steps in (resized to the
         # generation size by the library). A revert still resumes from a saved latent, not this.
         self._init_image = init_image
@@ -259,7 +261,7 @@ class GenerationWorker(threading.Thread):
             width=self._width,
             height=self._height,
             steps=self._steps,
-            seed=None,
+            seed=self._seed,
             skip_steps=self._init_skip_steps,
             perlin=self._perlin,
             init_image=self._init_image,

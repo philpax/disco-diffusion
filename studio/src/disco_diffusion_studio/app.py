@@ -24,6 +24,7 @@ import json
 import logging
 import math
 import os
+import random
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -301,6 +302,10 @@ class App:
         # Whether the steps box held focus last frame, so we can commit it on blur (mirrors
         # the prompt boxes; without this, typing a value and clicking away wouldn't apply it).
         self._steps_focused = False
+        # Seed field contents, persisted across UI rebuilds. Always holds a concrete seed so the
+        # value in use is visible upfront and replaying (Play again) clearly reuses it; "Rnd"
+        # rolls a fresh one. Seeded random at startup.
+        self._seed_text = str(random.randrange(2**31))
 
         # Right-hand sidebar: the active tab and the coalesced "rebuild after a resize" flag
         # (applied once per frame in run()). Its width (self.sidebar_w) is seeded above.
@@ -575,6 +580,9 @@ class App:
 
     # -- UI construction --
     def _build_ui(self) -> None:
+        # Preserve the seed field's current contents across the rebuild (the widget is recreated).
+        if hasattr(self, "seed_entry"):
+            self._seed_text = self.seed_entry.get_text()
         self.manager.clear_and_reset()
         self._remove_buttons.clear()
         self._mute_buttons.clear()
@@ -823,6 +831,14 @@ class App:
         ui.UILabel(r.left(54), "Steps", self.manager, container=container)
         self.steps_entry = ui.UITextEntryLine(r.fill(), self.manager, container=container)
         self.steps_entry.set_text(str(self.steps))
+        y += pitch
+        # Seed: always shows the concrete seed in use (so it's reproducible and visible); Play
+        # uses whatever's here, and "Rnd" rolls a fresh one.
+        r = Row(0, y, inner_w, CTRL_H)
+        ui.UILabel(r.left(54), "Seed", self.manager, container=container)
+        self.random_seed_button = ui.UIButton(r.right(46), "Rnd", self.manager, container=container)
+        self.seed_entry = ui.UITextEntryLine(r.fill(), self.manager, container=container)
+        self.seed_entry.set_text(self._seed_text)
         y += pitch
         r = Row(0, y, inner_w, CTRL_H)
         ui.UILabel(r.left(20), "W", self.manager, container=container)
@@ -1327,6 +1343,8 @@ class App:
         editable = not self.running
         for el in (
             self.steps_entry,
+            self.seed_entry,
+            self.random_seed_button,
             self.width_entry,
             self.height_entry,
             self.apply_button,
@@ -1393,6 +1411,21 @@ class App:
         self._request_checkpoint("prompt")
 
     # -- run lifecycle --
+    def _seed_for_run(self) -> int:
+        """Seed for the next run: the typed value, or a fresh random one (then shown in the field).
+
+        Filling the field with the seed actually used makes every run reproducible and visible.
+        """
+        try:
+            seed = int(self.seed_entry.get_text().strip())
+            if seed < 0:
+                raise ValueError
+        except ValueError:
+            seed = random.randrange(2**31)  # empty / invalid -> random, then surface it
+        self._seed_text = str(seed)
+        self.seed_entry.set_text(self._seed_text)
+        return seed
+
     def _start_run(self) -> None:
         # Adopt any step count typed into the box but not yet Enter-applied: clicking Play
         # moves focus off the box without firing UI_TEXT_ENTRY_FINISHED, so without this the
@@ -1412,6 +1445,7 @@ class App:
             revert_attrs=[sc.attr for sc in LIVE_SCALES] + ["eta"],
             init_image=self._init_image,
             skip_steps=self._init_skip_steps(),
+            seed=self._seed_for_run(),
         )
         self.worker.set_prompts(self._prompt_snapshot())
         # A fresh worker starts with paint_applied_count == 0; reset the overlay tracking to match
@@ -1975,6 +2009,10 @@ class App:
                 )
             elif event.ui_element == self.swap_button:
                 self._apply_size(self.height, self.width)
+            elif event.ui_element == self.random_seed_button:
+                self._seed_text = str(random.randrange(2**31))  # roll a fresh, visible seed
+                self.seed_entry.set_text(self._seed_text)
+                self._status(f"Seed {self._seed_text}")
             elif event.ui_element in self._remove_buttons:
                 idx = self._remove_buttons[event.ui_element]
                 if 0 <= idx < len(self.prompts):

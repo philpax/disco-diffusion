@@ -120,6 +120,38 @@ def test_mute_button_toggles_and_excludes_from_snapshot(app):
     assert app.prompts[1].muted is False
 
 
+def test_seed_for_run_random_fills_field(app):
+    app.seed_entry.set_text("")
+    seed = app._seed_for_run()
+    assert 0 <= seed < 2**31
+    assert app.seed_entry.get_text() == str(seed)  # the used seed is shown (reproducible)
+
+
+def test_seed_field_is_populated_on_startup(app):
+    assert app.seed_entry.get_text().isdigit()  # always shows a concrete seed, not empty
+
+
+def test_seed_for_run_uses_typed_value_and_is_stable_on_replay(app):
+    app.seed_entry.set_text("12345")
+    assert app._seed_for_run() == 12345
+    assert app._seed_for_run() == 12345  # replaying reuses the same seed (continuity)
+
+
+def test_seed_for_run_invalid_is_randomised(app):
+    app.seed_entry.set_text("not-a-number")
+    seed = app._seed_for_run()
+    assert app.seed_entry.get_text() == str(seed)  # replaced with a real (random) seed
+
+
+def test_random_seed_button_rerolls_to_a_new_seed(app):
+    app.seed_entry.set_text("999")
+    app._handle_event(
+        pygame.event.Event(pygame_gui.UI_BUTTON_PRESSED, ui_element=app.random_seed_button)
+    )
+    assert app.seed_entry.get_text().isdigit()
+    assert app.seed_entry.get_text() != "999"
+
+
 def test_panel_height_clamps(app):
     app._set_panel_height(10**6)
     assert app._image_area_h() >= A.MIN_IMAGE_H
