@@ -86,6 +86,7 @@ from .theme import (
     THEME,
     WINDOW_BG,
 )
+from .timeline import Timeline
 from .view import ViewTransform
 from .worker import GenerationWorker, HistoryEntry, PromptSpec
 
@@ -388,18 +389,12 @@ class App:
         self._navigating = False  # right mouse held: canvas-navigation mode (pan + scroll-zoom)
         self._hud_font = pygame.font.SysFont(None, 19)
 
-        # Edit history / revert preview. _preview_index None = showing the live frame; an int
-        # = showing that checkpoint's image (non-destructive) until Revert commits it.
-        self._history: list[HistoryEntry] = []
-        self._hist_len = 0
-        # Ctrl+Z walks back through the checkpoints: the index it last reverted to (None = at the
-        # live frame, so the first Ctrl+Z targets the latest checkpoint). Reset whenever a new
-        # checkpoint appears (a fresh edit) so a new undo chain starts.
-        self._undo_cursor: int | None = None
-        self._preview_index: int | None = None
+        # Edit history / revert preview. The Timeline owns the checkpoint list, the preview cursor
+        # (None = live frame; an int = previewing that checkpoint non-destructively until Revert),
+        # the Ctrl+Z undo cursor, and the scrub maths. _preview_prompts (the prompt rows shown
+        # while previewing) stays on App, as it's prompt-row UI state.
+        self._timeline = Timeline()
         self._preview_prompts: list[PromptRow] | None = None  # prompts shown while previewing
-        self._preview_surface: pygame.Surface | None = None
-        self._preview_key: int | None = None
         self._history_slider_rect = pygame.Rect(0, 0, 10, 10)
         # Fit the canvas to the available area once the real window size is settled. The window
         # manager may resize the window right after it opens (firing a VIDEORESIZE that only
@@ -572,7 +567,7 @@ class App:
         # thumb position matches its actual progress; drags snap to the nearest checkpoint.
         self.history_slider = ui.UIHorizontalSlider(
             self._history_slider_rect,
-            start_value=self._history_slider_start(),
+            start_value=self._timeline.slider_start(self._live_index()),
             value_range=(0.0, float(max(self._history_total(), 1))),
             manager=self.manager,
         )
@@ -1224,7 +1219,7 @@ class App:
                 ),
                 Image.fromarray(e.preview),
             )
-            for e in self._history
+            for e in self._timeline.entries
         ]
 
     def _native_path(self, kind: str, title: str) -> str | None:
@@ -1288,7 +1283,7 @@ class App:
             self._frame_surface = None
         # Restore the scrubbable timeline (previews only, latent=None) — _sync_history keeps it
         # while there's no worker, and Revert continues from a checkpoint's preview via img2img.
-        self._history = [
+        self._timeline.entries = [
             HistoryEntry(
                 latent=None,
                 step=item.step,
@@ -1301,7 +1296,7 @@ class App:
             )
             for item, preview in history
         ]
-        self._preview_index = None
+        self._timeline.preview_index = None
         self._sync_enabled()
 
     def _apply_session(self, session: Session) -> None:
@@ -1443,17 +1438,17 @@ class App:
         ):
             (el.enable if editable else el.disable)()
         # History controls are usable only while paused/stopped and there's history to scrub.
-        hist_on = editable and len(self._history) > 0
+        hist_on = editable and len(self._timeline.entries) > 0
         for hist_el in (self.history_slider, self.revert_button, self.cancel_button):
             (hist_el.enable if hist_on else hist_el.disable)()
         # Prompt rows are read-only while previewing a checkpoint (they show its prompts).
-        prompts_on = self._preview_index is None
+        prompts_on = self._timeline.preview_index is None
         prompt_widgets = [self.add_button, *self._prompt_entries, *self._weight_sliders]
         for pw in (*prompt_widgets, *self._remove_buttons, *self._mute_buttons):
             (pw.enable if prompts_on else pw.disable)()
         self.play_button.set_text("Pause" if self.running else "Play")
         # Can't resume mid-preview or mid-reload — Revert/Cancel, or wait for the reload.
-        play_off = self._preview_index is not None or self._reloader.reloading
+        play_off = self._timeline.preview_index is not None or self._reloader.reloading
         (self.play_button.disable if play_off else self.play_button.enable)()
 
     def _models_match_session(self) -> bool:
@@ -1544,10 +1539,10 @@ class App:
             self._paint.flush(self.worker, self._brush())
         # Freeze the per-run settings this run uses, for the "Current" tab to show while it runs.
         self._run_snapshot = self._perrun_values()
-        self._history = []
-        self._hist_len = 0
-        self._preview_index = None
-        self._undo_cursor = None
+        self._timeline.entries = []
+        self._timeline.hist_len = 0
+        self._timeline.preview_index = None
+        self._timeline.undo_cursor = None
         self.paused = False
         self.worker.start()
         self._status("Running")
@@ -1559,21 +1554,21 @@ class App:
             self.worker.join(timeout=5.0)
         self.worker = None
         self.paused = False
-        self._history = []
-        self._hist_len = 0
-        self._preview_index = None
+        self._timeline.entries = []
+        self._timeline.hist_len = 0
+        self._timeline.preview_index = None
         self._sync_enabled()
 
     def _toggle_play(self) -> None:
-        if self._preview_index is not None:
+        if self._timeline.preview_index is not None:
             self._status("Previewing")
             return
         if self.worker is None or not self.worker.is_alive() or self.worker.finished:
             self._start_run()  # finished -> Play starts a fresh run (Revert continues a branch)
         elif self.paused:
             self.paused = False
-            self._preview_index = None  # resume from live, drop any history preview
-            self._undo_cursor = None  # resuming ends the undo chain
+            self._timeline.preview_index = None  # resume from live, drop any history preview
+            self._timeline.undo_cursor = None  # resuming ends the undo chain
             self.worker.resume()
             self._status("Running")
             self._sync_enabled()
@@ -1729,8 +1724,6 @@ class App:
         self._stop_run()  # also clears history / preview index
         self._frame_surface = None
         self._frame_key = None
-        self._preview_surface = None
-        self._preview_key = None
         self.step_label.set_text("step 0 / 0")
         self._status("Canvas cleared")
 
@@ -1740,8 +1733,8 @@ class App:
             self.worker.checkpoint(label)
 
     def _set_history_label(self) -> None:
-        if self._preview_index is not None and self._preview_index < len(self._history):
-            e = self._history[self._preview_index]
+        e = self._timeline.preview_entry()
+        if e is not None:
             text = f"{e.label} {e.index}/{e.total}"
         else:
             frame = self.worker.latest_frame() if self.worker is not None else None
@@ -1751,9 +1744,8 @@ class App:
 
     def _sync_preview_prompts(self) -> None:
         """Show the previewed checkpoint's prompts in the rows (live set when not previewing)."""
-        want: list[PromptSpec] | None = None
-        if self._preview_index is not None and self._preview_index < len(self._history):
-            want = self._history[self._preview_index].prompts
+        entry = self._timeline.preview_entry()
+        want: list[PromptSpec] | None = entry.prompts if entry is not None else None
         cur = (
             [PromptSpec(p.text, p.weight, p.muted) for p in self._preview_prompts]
             if self._preview_prompts is not None
@@ -1771,13 +1763,14 @@ class App:
         """Update the prompt rows, label, and Play gating whenever the preview changes."""
         self._sync_preview_prompts()
         self._set_history_label()
-        (self.play_button.disable if self._preview_index is not None else self.play_button.enable)()
+        previewing = self._timeline.preview_index is not None
+        (self.play_button.disable if previewing else self.play_button.enable)()
 
     def _do_revert(self) -> None:
         """Branch the run from the previewed checkpoint, restoring its prompts + guidance/eta."""
-        if self._preview_index is None:
+        if self._timeline.preview_index is None:
             return
-        entry = self._history[self._preview_index]
+        entry = self._timeline.entries[self._timeline.preview_index]
         if self.worker is None:  # loaded-session history (no latent) -> img2img from its preview
             self._revert_loaded(entry)
             return
@@ -1788,8 +1781,8 @@ class App:
         entry.config.apply_to(self.session.config)
         self._guidance_checkpoint_at = None
         self._refresh_advanced_widgets()
-        self.worker.seek(self._preview_index)
-        self._preview_index = None
+        self.worker.seek(self._timeline.preview_index)
+        self._timeline.preview_index = None
         self._preview_prompts = None
         # Branching drops any in-flight strokes (the worker clears its queue on seek), so reset
         # the overlay tracking to stay aligned with the worker's apply count.
@@ -1808,7 +1801,7 @@ class App:
         entry.config.apply_to(self.session.config)
         self._refresh_advanced_widgets()
         self._set_init_image(Image.fromarray(entry.preview), f"history: {entry.label}")
-        self._preview_index = None
+        self._timeline.preview_index = None
         self._preview_prompts = None
         self._rebuild_prompt_rows()
         self._start_run()  # seeds the new run from the checkpoint preview (img2img)
@@ -1821,16 +1814,16 @@ class App:
         checkpoint and each further press one earlier (tracked by _undo_cursor, since a revert to
         the last checkpoint doesn't truncate history so it can't be read back off the list).
         """
-        if self.worker is None or self.running or not self._history:
+        if self.worker is None or self.running or not self._timeline.entries:
             return
-        if self._preview_index is not None:
-            target = self._preview_index
-        elif self._undo_cursor is not None:
-            target = max(0, self._undo_cursor - 1)
+        if self._timeline.preview_index is not None:
+            target = self._timeline.preview_index
+        elif self._timeline.undo_cursor is not None:
+            target = max(0, self._timeline.undo_cursor - 1)
         else:
-            target = len(self._history) - 1
-        self._undo_cursor = target
-        self._preview_index = target
+            target = len(self._timeline.entries) - 1
+        self._timeline.undo_cursor = target
+        self._timeline.preview_index = target
         self._do_revert()
 
     def _nudge_brush_size(self, factor: float) -> None:
@@ -1853,42 +1846,27 @@ class App:
 
     def _history_total(self) -> int:
         """The run's display-step total (the history slider's right edge)."""
-        if self._history:
-            return max(1, self._history[-1].total)
         frame = self.worker.latest_frame() if self.worker is not None else None
-        return max(1, frame.total if frame is not None else 1)
+        return self._timeline.total(frame.total if frame is not None else 1)
 
     def _live_index(self) -> int:
         """The current live display step (the slider's rightmost snap point)."""
         frame = self.worker.latest_frame() if self.worker is not None else None
         if frame is not None:
             return frame.index
-        if self._frame_surface is not None and self._history:
+        entries = self._timeline.entries
+        if self._frame_surface is not None and entries:
             # A loaded session's result is a static final frame (no worker): its endpoint is the
             # run's last step, past every recorded checkpoint, so scrubbing can reach it.
-            return self._history[-1].total
-        return self._history[-1].index if self._history else 0
-
-    def _history_slider_start(self) -> float:
-        """Where the thumb should sit: a previewed checkpoint's step, else the live step."""
-        if self._preview_index is not None and self._preview_index < len(self._history):
-            return float(self._history[self._preview_index].index)
-        return float(self._live_index())
-
-    def _history_snap(self, value: float) -> int | None:
-        """Nearest checkpoint index to a slider step value; None == live (rightmost)."""
-        points: list[tuple[float, int | None]] = [
-            (float(cp.index), i) for i, cp in enumerate(self._history)
-        ]
-        points.append((float(self._live_index()), None))  # the live frame
-        return min(points, key=lambda p: abs(p[0] - value))[1]
+            return entries[-1].total
+        return entries[-1].index if entries else 0
 
     def _rebuild_history_slider(self) -> None:
         """Recreate the step-space history slider (range follows the run's total steps)."""
         self.history_slider.kill()
         self.history_slider = pygame_gui.elements.UIHorizontalSlider(
             self._history_slider_rect,
-            start_value=self._history_slider_start(),
+            start_value=self._timeline.slider_start(self._live_index()),
             value_range=(0.0, float(max(self._history_total(), 1))),
             manager=self.manager,
         )
@@ -1896,21 +1874,22 @@ class App:
     def _sync_history(self) -> None:
         """Pull the worker's history each frame; rebuild the slider when it changes length.
 
-        With no worker we keep ``self._history`` as-is — empty after a stop, or the timeline
-        restored from a loaded session (which has no worker until you Play/Revert).
+        With no worker we keep the timeline as-is — empty after a stop, or restored from a loaded
+        session (which has no worker until you Play/Revert).
         """
+        tl = self._timeline
         if self.worker is not None:
-            self._history = self.worker.get_history()
-        if len(self._history) != self._hist_len:
-            grew = len(self._history) > self._hist_len  # a new checkpoint = a fresh edit
-            self._hist_len = len(self._history)
+            tl.entries = self.worker.get_history()
+        if len(tl.entries) != tl.hist_len:
+            grew = len(tl.entries) > tl.hist_len  # a new checkpoint = a fresh edit
+            tl.hist_len = len(tl.entries)
             if grew:
-                self._undo_cursor = None  # start a new undo chain (our reverts only shrink)
-            if self._preview_index is not None and self._preview_index >= self._hist_len:
-                self._preview_index = None
+                tl.undo_cursor = None  # start a new undo chain (our reverts only shrink)
+            if tl.preview_index is not None and tl.preview_index >= tl.hist_len:
+                tl.preview_index = None
             self._rebuild_history_slider()
             self._sync_enabled()
-        elif self.running and self._preview_index is None and self._history:
+        elif self.running and tl.preview_index is None and tl.entries:
             # While actively generating (not previewing), let the thumb track the live step as it
             # advances. When paused/done we leave it alone so a scrub isn't yanked back each frame.
             self.history_slider.set_current_value(float(self._live_index()))
@@ -1918,13 +1897,7 @@ class App:
 
     def _displayed_surface(self) -> pygame.Surface | None:
         """The canvas surface to show: a previewed checkpoint, else the live frame."""
-        if self._preview_index is not None and self._preview_index < len(self._history):
-            entry = self._history[self._preview_index]
-            if self._preview_key != id(entry.preview):
-                self._preview_key = id(entry.preview)
-                self._preview_surface = pygame.surfarray.make_surface(entry.preview.swapaxes(0, 1))
-            return self._preview_surface
-        return self._frame_surface
+        return self._timeline.preview_surface() or self._frame_surface
 
     # -- events --
     def _handle_event(self, event: pygame.event.Event) -> bool:
@@ -1987,7 +1960,8 @@ class App:
                 if self._on_swatch(event.pos):
                     return True
                 # No painting while previewing history — it would be invisible and unapplied.
-                if self._preview_index is None and self._screen_to_canvas(event.pos) is not None:
+                on_canvas = self._screen_to_canvas(event.pos) is not None
+                if self._timeline.preview_index is None and on_canvas:
                     self._paint.begin()
                     self._paint_at(event.pos)
                 return True
@@ -2125,7 +2099,7 @@ class App:
             elif event.ui_element == self.revert_button:
                 self._do_revert()
             elif event.ui_element == self.cancel_button:
-                self._preview_index = None
+                self._timeline.preview_index = None
                 self.history_slider.set_current_value(float(self._live_index()))
                 self._refresh_preview_state()
 
@@ -2137,10 +2111,10 @@ class App:
             elif event.ui_element == self.history_slider:
                 # The slider is in step-space; snap the dragged value to the nearest checkpoint
                 # (or live), and park the thumb on that checkpoint's actual step position.
-                snap_idx = self._history_snap(float(event.value))
-                self._preview_index = snap_idx
+                snap_idx = self._timeline.snap(float(event.value), self._live_index())
+                self._timeline.preview_index = snap_idx
                 if snap_idx is not None:
-                    snapped = float(self._history[snap_idx].index)
+                    snapped = float(self._timeline.entries[snap_idx].index)
                 else:
                     snapped = float(self._live_index())
                 self.history_slider.set_current_value(snapped)
@@ -2301,7 +2275,7 @@ class App:
             self.screen.blit(label, label.get_rect(center=crect.center))
         # Paint overlays only on the live view (hidden while previewing history): the in-progress
         # stroke plus any flushed strokes not yet baked into a published frame.
-        if self._preview_index is None:
+        if self._timeline.preview_index is None:
             for overlay, _ in self._paint.pending_overlays:
                 self._blit_canvas(overlay)
             if not self._paint.layer.empty():
@@ -2337,7 +2311,7 @@ class App:
         # not while a dialog window is up).
         if (
             not self._navigating
-            and self._preview_index is None
+            and self._timeline.preview_index is None
             and not self._modal_open()
             and region.collidepoint(self._mouse_pos)
         ):
@@ -2357,59 +2331,35 @@ class App:
         self.screen.blit(chip, pos)
         self.screen.blit(text, (pos[0] + pad, pos[1] + pad))
 
-    def _history_tick_x(self, value: float, track: pygame.Rect, button_w: int) -> int:
-        """Screen x where the slider thumb centre sits for a step ``value`` (0..total)."""
-        total = float(max(self._history_total(), 1))
-        span = max(1, track.width - button_w)
-        frac = min(max(value / total, 0.0), 1.0)
-        return int(track.left + button_w / 2 + frac * span)
-
-    @staticmethod
-    def _history_tick_colour(label: str) -> tuple[int, int, int]:
-        """Colour a checkpoint tick by kind, so the history reads at a glance."""
-        if label.startswith("paint"):
-            return (118, 200, 140)  # green — painted strokes
-        if label.startswith("guidance"):
-            return PENDING_COLOR  # amber — guidance retunes
-        if label.startswith("preset"):
-            return (176, 136, 240)  # violet — preset loads
-        if "prompt" in label:
-            return READOUT_COLOR  # blue — prompt edits (edit / add / remove)
-        return MUTED_COLOR  # grey — the run's baseline ("start")
-
-    @staticmethod
-    def _brighten(c: tuple[int, int, int], t: float = 0.55) -> tuple[int, int, int]:
-        """Lerp a colour toward white (for the active / hovered tick), keeping its hue."""
-        return tuple(int(v + (255 - v) * t) for v in c)  # type: ignore[return-value]
-
     def _draw_history_ticks(self) -> None:
         """Mark each checkpoint's position on the (step-space) history slider.
 
         Drawn after the UI so the ticks sit on top of the track; hovering the slider shows the
         nearest checkpoint's label so the otherwise-invisible snap points are discoverable.
         """
-        if not self._history or not self.history_slider.is_enabled:
+        tl = self._timeline
+        if not tl.entries or not self.history_slider.is_enabled:
             return
+        total = self._history_total()
         track = self.history_slider.rect
         button = getattr(self.history_slider, "sliding_button", None)
         button_w = button.rect.width if button is not None else 26
         base_y = track.bottom - 3
-        for i, cp in enumerate(self._history):
-            x = self._history_tick_x(float(cp.index), track, button_w)
-            active = self._preview_index == i
-            kind = self._history_tick_colour(cp.label)
-            colour = self._brighten(kind) if active else kind
+        for i, cp in enumerate(tl.entries):
+            x = tl.tick_x(float(cp.index), track, button_w, total)
+            active = tl.preview_index == i
+            kind = tl.tick_colour(cp.label)
+            colour = tl.brighten(kind) if active else kind
             height = 9 if active else 5
             width = 2 if active else 1
             pygame.draw.line(self.screen, colour, (x, base_y - height), (x, base_y), width)
         # Hover: surface the nearest checkpoint's label above the slider (and accent its tick).
         if track.collidepoint(self._mouse_pos) and not self._modal_open():
-            total = float(max(self._history_total(), 1))
             span = max(1, track.width - button_w)
-            mval = (self._mouse_pos[0] - track.left - button_w / 2) / span * total
-            cp = min(self._history, key=lambda c: abs(c.index - mval))
-            x = self._history_tick_x(float(cp.index), track, button_w)
-            accent = self._brighten(self._history_tick_colour(cp.label))
+            mval = (self._mouse_pos[0] - track.left - button_w / 2) / span * float(max(total, 1))
+            cp = min(tl.entries, key=lambda c: abs(c.index - mval))
+            x = tl.tick_x(float(cp.index), track, button_w, total)
+            accent = tl.brighten(tl.tick_colour(cp.label))
             pygame.draw.line(self.screen, accent, (x, base_y - 9), (x, base_y), 2)
             label = f"{cp.label}  {cp.index}/{cp.total}"
             text = self._hud_font.render(label, True, (228, 232, 240))

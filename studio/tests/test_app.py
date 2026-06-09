@@ -13,6 +13,7 @@ from PIL import Image
 
 from disco_diffusion_studio import app as A
 from disco_diffusion_studio.presets import GuidanceSnapshot
+from disco_diffusion_studio.timeline import Timeline
 from disco_diffusion_studio.worker import HistoryEntry, PromptSpec
 
 
@@ -53,28 +54,28 @@ def test_apply_preset_sets_guidance_and_requests_checkpoint(app, fake_worker):
 
 def test_history_snap_picks_nearest_checkpoint(app, fake_worker):
     img = np.zeros((4, 4, 3), np.uint8)
-    app._history = [
+    app._timeline.entries = [
         HistoryEntry(latent=None, step=0, index=2, total=100, preview=img, label="start"),
         HistoryEntry(latent=None, step=0, index=60, total=100, preview=img, label="paint"),
     ]
     # Live is further along than the last checkpoint, as it is mid-run.
     app.worker = fake_worker(latest_frame=lambda: SimpleNamespace(index=95, total=100))
-    assert app._history_snap(3.0) == 0
-    assert app._history_snap(58.0) == 1
-    assert app._history_snap(95.0) is None  # rightmost == live
+    assert app._timeline.snap(3.0, app._live_index()) == 0
+    assert app._timeline.snap(58.0, app._live_index()) == 1
+    assert app._timeline.snap(95.0, app._live_index()) is None  # rightmost == live
 
 
 def test_revert_restores_guidance_and_eta(app, fake_worker):
     img = np.zeros((4, 4, 3), np.uint8)
-    app._history = [
+    app._timeline.entries = [
         HistoryEntry(
             latent=None, step=0, index=5, total=100, preview=img, label="start",
             prompts=[PromptSpec(text="a prompt", weight=1.0, muted=False)],
             config=GuidanceSnapshot(clip_guidance_scale=5000, eta=0.8),
         )
     ]
-    app._hist_len = 1
-    app._preview_index = 0
+    app._timeline.hist_len = 1
+    app._timeline.preview_index = 0
     app.worker = fake_worker()
     app.session.config.clip_guidance_scale = 20000  # diverge from the checkpoint
     app.session.config.eta = 0.2
@@ -186,7 +187,7 @@ def test_session_restores_scrubbable_history(app, tmp_path, stub_dialogs):
     archive = tmp_path / "s.zip"
     stub_dialogs(save=archive, open=archive)
     img = np.full((app.height, app.width, 3), 7, np.uint8)
-    app._history = [
+    app._timeline.entries = [
         HistoryEntry(latent=None, step=0, index=1, total=100, preview=img, label="start",
                      prompts=[PromptSpec("a", 1.0, False)],
                      config=GuidanceSnapshot(clip_guidance_scale=5000)),
@@ -195,11 +196,11 @@ def test_session_restores_scrubbable_history(app, tmp_path, stub_dialogs):
                      config=GuidanceSnapshot(clip_guidance_scale=9000)),
     ]
     app._save_session()
-    app._history = []
+    app._timeline.entries = []
     app._load_session()
-    assert [e.label for e in app._history] == ["start", "paint soft 48px"]
-    assert app._history[1].index == 40
-    assert app._history[0].latent is None  # previews only, no latent
+    assert [e.label for e in app._timeline.entries] == ["start", "paint soft 48px"]
+    assert app._timeline.entries[1].index == 40
+    assert app._timeline.entries[0].latent is None  # previews only, no latent
 
 
 def test_loaded_result_is_rightmost_scrubbable_endpoint(app, tmp_path, stub_dialogs):
@@ -208,18 +209,19 @@ def test_loaded_result_is_rightmost_scrubbable_endpoint(app, tmp_path, stub_dial
     img = np.full((app.height, app.width, 3), 7, np.uint8)
     app._frame_surface = pygame.Surface((app.width, app.height))  # a finished result on the canvas
     app._frame_surface.fill((9, 9, 9))
-    app._history = [
+    app._timeline.entries = [
         HistoryEntry(latent=None, step=0, index=1, total=100, preview=img, label="start"),
         HistoryEntry(latent=None, step=0, index=40, total=100, preview=img, label="paint"),
     ]
     app._save_session()
-    app._frame_surface, app._history = None, []
+    app._frame_surface, app._timeline.entries = None, []
     app._load_session()
     # The result is painted back as a static final frame, and is the timeline's rightmost step.
     assert app._frame_surface is not None
     assert app._live_index() == 100  # the run's last step, past the index=40 checkpoint
-    assert app._history_snap(100.0) is None  # rightmost snaps to the result (live), not a tick
-    assert app._history_snap(1.0) == 0  # earlier scrubbing still reaches the checkpoints
+    live = app._live_index()
+    assert app._timeline.snap(100.0, live) is None  # rightmost snaps to the result (live), no tick
+    assert app._timeline.snap(1.0, live) == 0  # earlier scrubbing still reaches the checkpoints
     assert app._displayed_surface() is app._frame_surface  # at rest the crisp result shows
 
 
@@ -259,14 +261,14 @@ def test_loaded_revert_continues_via_img2img(app, monkeypatch):
     monkeypatch.setattr(app, "_start_run", lambda: started.append(True))
     img = np.full((app.height, app.width, 3), 5, np.uint8)
     app.worker = None
-    app._history = [
+    app._timeline.entries = [
         HistoryEntry(
             latent=None, step=0, index=10, total=100, preview=img, label="prompt",
             prompts=[PromptSpec("castle", 1.0, False)],
             config=GuidanceSnapshot(clip_guidance_scale=3333),
         ),
     ]
-    app._preview_index = 0
+    app._timeline.preview_index = 0
     app._do_revert()  # worker is None -> img2img from the checkpoint preview
     assert started == [True]
     assert app._init.image is not None
@@ -283,11 +285,11 @@ def test_panel_height_clamps(app):
 
 
 def test_history_tick_colours_by_kind():
-    paint = A.App._history_tick_colour("paint soft 48px")
+    paint = Timeline.tick_colour("paint soft 48px")
     assert paint[1] > paint[0] and paint[1] > paint[2]  # green-dominant
-    assert A.App._history_tick_colour("guidance") == A.PENDING_COLOR
-    assert A.App._history_tick_colour("preset 2022 sauce") != A.MUTED_COLOR
-    assert A.App._history_tick_colour("start") == A.MUTED_COLOR
+    assert Timeline.tick_colour("guidance") == A.PENDING_COLOR
+    assert Timeline.tick_colour("preset 2022 sauce") != A.MUTED_COLOR
+    assert Timeline.tick_colour("start") == A.MUTED_COLOR
 
 
 def test_loading_screen_returns_true_when_done(app):
@@ -339,14 +341,14 @@ def test_digit_selects_palette_colour(app):
 
 def test_ctrl_z_reverts_to_latest_checkpoint(app, fake_worker):
     img = np.zeros((4, 4, 3), np.uint8)
-    app._history = [
+    app._timeline.entries = [
         HistoryEntry(
             latent=None, step=0, index=5, total=100, preview=img, label="start",
             prompts=[PromptSpec(text="p", weight=1.0, muted=False)],
             config=GuidanceSnapshot(clip_guidance_scale=5000),
         )
     ]
-    app._hist_len = 1
+    app._timeline.hist_len = 1
     seeked = []
     app.worker = fake_worker(finished=True, seek=seeked.append)
     app.paused = True  # not running -> revert is allowed
@@ -358,7 +360,7 @@ def test_ctrl_z_reverts_to_latest_checkpoint(app, fake_worker):
 
 def test_ctrl_z_walks_back_through_history(app, fake_worker):
     img = np.zeros((4, 4, 3), np.uint8)
-    app._history = [
+    app._timeline.entries = [
         HistoryEntry(latent=None, step=0, index=2, total=100, preview=img, label="start",
                      prompts=[PromptSpec(text="p", weight=1.0, muted=False)],
                      config=GuidanceSnapshot()),
@@ -366,12 +368,12 @@ def test_ctrl_z_walks_back_through_history(app, fake_worker):
                      prompts=[PromptSpec(text="p", weight=1.0, muted=False)],
                      config=GuidanceSnapshot()),
     ]
-    app._hist_len = 2
+    app._timeline.hist_len = 2
     seeked = []
 
     def seek(i):
         seeked.append(i)
-        del app._history[i + 1:]  # mimic the worker's branch-truncation on seek
+        del app._timeline.entries[i + 1:]  # mimic the worker's branch-truncation on seek
 
     app.worker = fake_worker(finished=True, seek=seek)
     app.paused = True
