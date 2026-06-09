@@ -256,7 +256,6 @@ class App:
         # The History controller drives the edit timeline (state.timeline): checkpoint requests,
         # preview scrubbing, undo, revert, and the per-frame sync (see history.py).
         self.history = History(self, self.signals, self.state)
-        self.bottom_bar._history_slider_rect = pygame.Rect(0, 0, 10, 10)
         # Fit the canvas to the available area once the real window size is settled. The window
         # manager may resize the window right after it opens (firing a VIDEORESIZE that only
         # re-clamps), so the fit happens on the first run-loop frame, not here — by then any
@@ -328,11 +327,7 @@ class App:
         if hasattr(self.sidebar, "seed_entry"):
             self.state.seed_text = self.sidebar.seed_text()
         self.manager.clear_and_reset()
-        self.bottom_bar._remove_buttons.clear()
-        self.bottom_bar._mute_buttons.clear()
-        self.bottom_bar._prompt_entries.clear()
-        self.bottom_bar._weight_sliders.clear()
-        self.bottom_bar._row_elements.clear()
+        self.bottom_bar.forget_prompt_widgets()  # drop refs the manager just destroyed
         self.bottom_bar.build(self)
         self.sidebar.build(self)
         self.signals.invalidate()
@@ -457,7 +452,7 @@ class App:
         away from is adopted just as if Enter had been pressed.
         """
         focus = self.manager.get_focus_set() or set()
-        current = next((e for e in self.bottom_bar._prompt_entries if e in focus), None)
+        current = self.bottom_bar.focused_entry(focus)
         if current is not self._focused_entry:
             previous = self._focused_entry
             self._focused_entry = current
@@ -467,7 +462,7 @@ class App:
         if self._steps_focused and not steps_focused:
             self.generation.commit_steps()
         self._steps_focused = steps_focused
-        sched = next((e for e in self.sidebar._schedule_entries if e in focus), None)
+        sched = self.sidebar.focused_schedule(focus)
         if sched is not self._focused_schedule:
             previous = self._focused_schedule
             self._focused_schedule = sched

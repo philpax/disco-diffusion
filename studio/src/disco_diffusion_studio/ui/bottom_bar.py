@@ -7,6 +7,7 @@ It takes the App for shared state / actions, and routes its own widget events vi
 
 from __future__ import annotations
 
+from collections.abc import Collection
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -64,7 +65,8 @@ class BottomBar:
     history_slider: UIHorizontalSlider = field(init=False)
     cancel_button: UIButton = field(init=False)
     revert_button: UIButton = field(init=False)
-    _history_slider_rect: pygame.Rect = field(default_factory=_empty_rect)
+    # Seeded non-empty so the slider has a valid rect before the first build sets the real one.
+    _history_slider_rect: pygame.Rect = field(default_factory=lambda: pygame.Rect(0, 0, 10, 10))
     # Paint tools.
     noise_button: UIButton = field(init=False)
     clear_paint_button: UIButton = field(init=False)
@@ -202,6 +204,23 @@ class BottomBar:
             if app.history.preview_prompts is not None
             else self.state.prompts
         )
+
+    def focused_entry(self, focus: Collection[object]) -> UITextEntryLine | None:
+        """The prompt text box currently holding keyboard focus, if any (for apply-on-blur)."""
+        return next((e for e in self._prompt_entries if e in focus), None)
+
+    def forget_prompt_widgets(self) -> None:
+        """Drop the prompt-row widget registries *without* killing — for a full UI rebuild.
+
+        ``manager.clear_and_reset()`` has already destroyed every widget, so the stale refs must
+        be dropped without re-killing dead elements (unlike rebuild_prompt_rows, which kills live
+        rows before rebuilding).
+        """
+        self._row_elements.clear()
+        self._remove_buttons.clear()
+        self._mute_buttons.clear()
+        self._prompt_entries.clear()
+        self._weight_sliders.clear()
 
     def rebuild_prompt_rows(self, app: App) -> None:
         for el in self._row_elements:

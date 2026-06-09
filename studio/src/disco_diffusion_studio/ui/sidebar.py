@@ -8,6 +8,7 @@ actions, and routes its own widget events via ``handle``.
 from __future__ import annotations
 
 import random
+from collections.abc import Collection
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -608,6 +609,10 @@ class Sidebar:
             text = perrun.get(key, "—")
             if label is not None and label.text != text:
                 label.set_text(text)
+
+    def focused_schedule(self, focus: Collection[object]) -> UITextEntryLine | None:
+        """The cut-schedule text box currently holding keyboard focus, if any (apply-on-blur)."""
+        return next((e for e in self._schedule_entries if e in focus), None)
 
     def commit_schedule_entry(self, app: App, entry: UITextEntryLine) -> None:
         """Validate a cut-schedule box and store it on the config (applies on next Play).
