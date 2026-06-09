@@ -357,3 +357,40 @@ class BottomBar:
                 app._commit_prompt_entry(event.ui_element)
                 return True
         return False
+
+    def on_swatch(self, app: App, pos: tuple[int, int]) -> bool:
+        """If ``pos`` hits a palette swatch, adopt it as the brush colour. True if it did."""
+        for sr, color in self._swatch_rects:
+            if sr.collidepoint(pos):
+                app.brush.color = color
+                return True
+        return False
+
+    def select_palette_index(self, app: App, index: int) -> None:
+        """Digit keys: pick the nth swatch (palette + recents) as the brush colour, if it exists."""
+        colours = app._palette.swatches()
+        if 0 <= index < len(colours):
+            app.brush.color = colours[index]
+
+    def apply_picked_colour(self, app: App, rgb: tuple[int, int, int]) -> None:
+        """Adopt a picked colour as the brush colour and remember it (capped, persisted)."""
+        app.brush.color = rgb
+        app._palette.remember(rgb)  # records off-palette colours as recents (deduped, persisted)
+        self.build_palette(app, self._palette_rect)  # relayout to include any new recent
+
+    def sync_enabled(self, app: App) -> None:
+        """History scrubbing, prompt editing, and the Play button reflect run / preview state."""
+        editable = not app.running
+        # History controls are usable only while paused/stopped and there's history to scrub.
+        hist_on = editable and len(app._timeline.entries) > 0
+        for hist_el in (self.history_slider, self.revert_button, self.cancel_button):
+            (hist_el.enable if hist_on else hist_el.disable)()
+        # Prompt rows are read-only while previewing a checkpoint (they show its prompts).
+        prompts_on = app._timeline.preview_index is None
+        prompt_widgets = [self.add_button, *self._prompt_entries, *self._weight_sliders]
+        for pw in (*prompt_widgets, *self._remove_buttons, *self._mute_buttons):
+            (pw.enable if prompts_on else pw.disable)()
+        self.play_button.set_text("Pause" if app.running else "Play")
+        # Can't resume mid-preview or mid-reload — Revert/Cancel, or wait for the reload.
+        play_off = app._timeline.preview_index is not None or app._reloader.reloading
+        (self.play_button.disable if play_off else self.play_button.enable)()

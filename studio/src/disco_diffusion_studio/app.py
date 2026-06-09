@@ -33,7 +33,7 @@ import numpy as np
 import pygame
 import pygame_gui
 from disco_diffusion import DiscoSession, EncodedPrompt, RunConfig
-from disco_diffusion.config import AVAILABLE_CLIP_MODELS, parse_schedule
+from disco_diffusion.config import AVAILABLE_CLIP_MODELS
 from PIL import Image
 from pygame_gui.windows import UIColourPickerDialog, UIConfirmationDialog, UIMessageWindow
 
@@ -44,7 +44,7 @@ from .constants import (
     APP_TITLE,
     RELOAD_DEBOUNCE_MS,
 )
-from .controls import CURRENT_PERRUN, CUSTOM_PRESET, LIVE_SCALES, PromptRow
+from .controls import CUSTOM_PRESET, PromptRow
 from .init_image import InitImage
 from .layout import (
     CTRL_H,
@@ -335,80 +335,6 @@ class App:
     def _build_ui(self) -> None:
         return _ui_build._build_ui(self)
 
-    def _perrun_values(self) -> dict[str, str]:
-        """Display strings for every CURRENT_PERRUN key from the current (pending) state.
-
-        Driven by the key list itself: the two synthesised keys are special-cased, the rest are
-        read off ``session.config`` by name (so they can't drift from the listed keys).
-        """
-        cfg = self.session.config
-        out: dict[str, str] = {}
-        for key, _label in CURRENT_PERRUN:
-            if key == "steps":
-                out[key] = str(self.steps)
-            elif key == "size":
-                out[key] = f"{self.width} × {self.height}"
-            elif key == "clip_models":
-                out[key] = ", ".join(cfg.clip_models)
-            else:
-                value = getattr(cfg, key)
-                if isinstance(value, bool):
-                    out[key] = "on" if value else "off"
-                elif isinstance(value, float):
-                    out[key] = f"{value:.2f}"
-                else:
-                    out[key] = str(value)
-        return out
-
-    def _refresh_current(self) -> None:
-        """Update the Current tab: live knobs from session.config, per-run from the snapshot."""
-        if not self.sidebar._current_labels:
-            return
-        cfg = self.session.config
-        for sc in LIVE_SCALES:  # live: reflect session.config as sliders move
-            label = self.sidebar._current_labels.get(sc.attr)
-            if label is not None:
-                text = sc.fmt.format(float(getattr(cfg, sc.attr)))
-                if label.text != text:
-                    label.set_text(text)
-        # While a run exists (playing, paused, or done) these reflect that run's frozen snapshot —
-        # what the image on screen was generated with; only once fully stopped do they show the
-        # pending values the next run would use.
-        perrun = self._run_snapshot if self.worker is not None else self._perrun_values()
-        for key, _name in CURRENT_PERRUN:
-            label = self.sidebar._current_labels.get(key)
-            text = perrun.get(key, "—")
-            if label is not None and label.text != text:
-                label.set_text(text)
-
-    def _commit_schedule_entry(self, entry: pygame_gui.elements.UITextEntryLine) -> None:
-        """Validate a cut-schedule box and store it on the config (applies on next Play).
-
-        Schedules are parsed with the library's own parser; on a malformed string we flag it
-        and restore the previous value rather than letting the worker blow up at run start.
-        """
-        attr = self.sidebar._schedule_entries.get(entry)
-        if attr is None:
-            return
-        text = entry.get_text().strip()
-        if text == str(getattr(self.session.config, attr)):
-            return
-        try:
-            parsed = parse_schedule(text)
-        except ValueError:
-            self._status("Bad schedule")
-            entry.set_text(str(getattr(self.session.config, attr)))
-            return
-        # cond_fn indexes these over the full 1000-step internal timeline, so a short schedule
-        # would IndexError mid-run. Require it to cover 1000 (extra entries are harmless).
-        if len(parsed) < 1000:
-            self._status("Schedule short")
-            entry.set_text(str(getattr(self.session.config, attr)))
-            return
-        setattr(self.session.config, attr, text)
-        self._status("Schedule set")
-        self._mark_custom()
-
     def _current_preset(self) -> Preset:
         """Capture the live settings (guidance + per-run + schedules + models) as a Preset."""
         config = PresetConfig.from_run_config(self.session.config)
@@ -601,7 +527,7 @@ class App:
         self._apply_recipe(session.config, session.clip_models, session.use_secondary_model)
         self._preset_selection = self._detect_preset()
         self.sidebar.spawn_preset_dropdown(self)
-        self._run_snapshot = self._perrun_values()
+        self._run_snapshot = self.sidebar.perrun_values(self)
         self._status("Session loaded — press Play")
 
     def _open_save_preset_dialog(self) -> None:
@@ -712,7 +638,9 @@ class App:
         self._sync_enabled()
 
     def _sync_enabled(self) -> None:
-        return _ui_build._sync_enabled(self)
+        """Resync which widgets are enabled to the run / preview / reload state (both areas)."""
+        self.sidebar.sync_enabled(self)
+        self.bottom_bar.sync_enabled(self)
 
     def _models_match_session(self) -> bool:
         """True when the staged CLIP set + secondary toggle equal the loaded session's."""
@@ -801,7 +729,7 @@ class App:
         if not self.canvas.paint.layer.empty():
             self.canvas.paint.flush(self.worker, self.brush)
         # Freeze the per-run settings this run uses, for the "Current" tab to show while it runs.
-        self._run_snapshot = self._perrun_values()
+        self._run_snapshot = self.sidebar.perrun_values(self)
         self._timeline.entries = []
         self._timeline.hist_len = 0
         self._timeline.preview_index = None
@@ -1091,12 +1019,6 @@ class App:
         self.brush.nudge_strength(delta)
         self.bottom_bar.strength_slider.set_current_value(self.brush.strength)
 
-    def _select_palette_index(self, index: int) -> None:
-        """Digit keys: pick the nth swatch (palette + recents) as the brush colour, if it exists."""
-        colours = self._palette.swatches()
-        if 0 <= index < len(colours):
-            self.brush.color = colours[index]
-
     def _history_total(self) -> int:
         """The run's display-step total (the history slider's right edge)."""
         frame = self.worker.latest_frame() if self.worker is not None else None
@@ -1178,7 +1100,7 @@ class App:
             previous = self._focused_schedule
             self._focused_schedule = sched
             if previous is not None and previous.alive():
-                self._commit_schedule_entry(previous)
+                self.sidebar.commit_schedule_entry(self, previous)
 
     def _draw(self) -> None:
         return _ui_draw._draw(self)
@@ -1200,21 +1122,6 @@ class App:
             initial_colour=pygame.Color(*self.brush.color),
             window_title="Pick a colour",
         )
-
-    def _apply_picked_colour(self, rgb: tuple[int, int, int]) -> None:
-        """Adopt a picked colour as the brush colour and remember it (capped, persisted)."""
-        self.brush.color = rgb
-        self._palette.remember(rgb)  # records off-palette colours as recents (deduped, persisted)
-        # relayout the swatches to include any new recent
-        self.bottom_bar.build_palette(self, self.bottom_bar._palette_rect)
-
-    # -- painting --
-    def _on_swatch(self, pos: tuple[int, int]) -> bool:
-        for sr, color in self.bottom_bar._swatch_rects:
-            if sr.collidepoint(pos):
-                self.brush.color = color
-                return True
-        return False
 
     # -- main loop --
     def run(self) -> None:
@@ -1269,7 +1176,7 @@ class App:
             self._auto_apply_on_blur()
             # Live "edited · Enter" badge while typing (cheap; only mutates on change).
             self.bottom_bar.refresh_rows(self)
-            self._refresh_current()  # keep the "Current" sidebar tab in sync
+            self.sidebar.refresh_current(self)  # keep the "Current" sidebar tab in sync
             self.canvas.paint.sync(self.worker)
             self._sync_history()
             self.canvas.update_frame_surface()

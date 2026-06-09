@@ -75,7 +75,7 @@ def _handle_event(app: App, event: pygame.event.Event) -> bool:
             app._panning = True
             return True
         if event.button == 1:  # left-drag on the canvas paints
-            if app._on_swatch(event.pos):
+            if app.bottom_bar.on_swatch(app, event.pos):
                 return True
             # No painting while previewing history — it would be invisible and unapplied.
             on_canvas = app.canvas.screen_to_canvas(event.pos) is not None
@@ -121,7 +121,7 @@ def _handle_event(app: App, event: pygame.event.Event) -> bool:
         elif event.key == pygame.K_RIGHTBRACKET:
             app._nudge_brush_size(1.1)
         elif pygame.K_1 <= event.key <= pygame.K_9:  # digit -> nth palette/recents swatch
-            app._select_palette_index(event.key - pygame.K_1)
+            app.bottom_bar.select_palette_index(app, event.key - pygame.K_1)
 
     # Widget events route to the area that owns the widget; the App keeps the modal dialog
     # widgets (save-preset window, colour picker, reset-confirm) + drag-drop below.
@@ -138,7 +138,7 @@ def _handle_event(app: App, event: pygame.event.Event) -> bool:
     elif event.type == pygame_gui.UI_COLOUR_PICKER_COLOUR_PICKED:
         if event.ui_element is app._colour_picker:
             col = event.colour
-            app._apply_picked_colour((col.r, col.g, col.b))
+            app.bottom_bar.apply_picked_colour(app, (col.r, col.g, col.b))
     elif event.type == pygame_gui.UI_TEXT_ENTRY_FINISHED:
         if event.ui_element is app._save_preset_entry:
             app._save_current_preset()  # Enter in the filename box saves

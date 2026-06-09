@@ -104,12 +104,12 @@ def test_modal_blocks_canvas_painting(app):
 
 def test_picked_colour_is_remembered(app):
     before = len(app._palette.recent)
-    app._apply_picked_colour((1, 2, 3))
+    app.bottom_bar.apply_picked_colour(app, (1, 2, 3))
     assert app.brush.color == (1, 2, 3)
     assert (1, 2, 3) in app._palette.recent and len(app._palette.recent) == before + 1
     # a palette colour is already shown, so it doesn't earn a recents slot
     after_custom = len(app._palette.recent)
-    app._apply_picked_colour(app._palette.fixed[0])
+    app.bottom_bar.apply_picked_colour(app, app._palette.fixed[0])
     assert len(app._palette.recent) == after_custom
 
 

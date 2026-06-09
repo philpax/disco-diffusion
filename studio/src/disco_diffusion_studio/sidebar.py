@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING
 
 import pygame
 import pygame_gui
-from disco_diffusion.config import AVAILABLE_CLIP_MODELS
+from disco_diffusion.config import AVAILABLE_CLIP_MODELS, parse_schedule
 from pygame_gui.elements import (
     UIButton,
     UIDropDownMenu,
@@ -382,7 +382,7 @@ class Sidebar:
         for key, name in CURRENT_PERRUN:
             y = row(y, key, name)
         container.set_scrollable_area_dimensions((inner_w, y + 8))
-        app._refresh_current()
+        self.refresh_current(app)
 
     def sync_tabs(self, app: App) -> None:
         """Show exactly one of the Settings / Current panels for the active sidebar tab."""
@@ -509,6 +509,94 @@ class Sidebar:
             if e in (self.width_entry, self.height_entry):
                 return True  # applied via the Apply button
             if e in self._schedule_entries:
-                app._commit_schedule_entry(e)
+                self.commit_schedule_entry(app, e)
                 return True
         return False
+
+    def perrun_values(self, app: App) -> dict[str, str]:
+        """Display strings for every CURRENT_PERRUN key from the current (pending) state.
+
+        Driven by the key list itself: the two synthesised keys are special-cased, the rest are
+        read off ``session.config`` by name (so they can't drift from the listed keys).
+        """
+        cfg = app.session.config
+        out: dict[str, str] = {}
+        for key, _label in CURRENT_PERRUN:
+            if key == "steps":
+                out[key] = str(app.steps)
+            elif key == "size":
+                out[key] = f"{app.width} × {app.height}"
+            elif key == "clip_models":
+                out[key] = ", ".join(cfg.clip_models)
+            else:
+                value = getattr(cfg, key)
+                if isinstance(value, bool):
+                    out[key] = "on" if value else "off"
+                elif isinstance(value, float):
+                    out[key] = f"{value:.2f}"
+                else:
+                    out[key] = str(value)
+        return out
+
+    def refresh_current(self, app: App) -> None:
+        """Update the Current tab: live knobs from session.config, per-run from the snapshot."""
+        if not self._current_labels:
+            return
+        cfg = app.session.config
+        for sc in LIVE_SCALES:  # live: reflect session.config as sliders move
+            label = self._current_labels.get(sc.attr)
+            if label is not None:
+                text = sc.fmt.format(float(getattr(cfg, sc.attr)))
+                if label.text != text:
+                    label.set_text(text)
+        # While a run exists (playing, paused, or done) these reflect that run's frozen snapshot —
+        # what the image on screen was generated with; only once fully stopped do they show the
+        # pending values the next run would use.
+        perrun = app._run_snapshot if app.worker is not None else self.perrun_values(app)
+        for key, _name in CURRENT_PERRUN:
+            label = self._current_labels.get(key)
+            text = perrun.get(key, "—")
+            if label is not None and label.text != text:
+                label.set_text(text)
+
+    def commit_schedule_entry(self, app: App, entry: UITextEntryLine) -> None:
+        """Validate a cut-schedule box and store it on the config (applies on next Play).
+
+        Schedules are parsed with the library's own parser; on a malformed string we flag it
+        and restore the previous value rather than letting the worker blow up at run start.
+        """
+        attr = self._schedule_entries.get(entry)
+        if attr is None:
+            return
+        text = entry.get_text().strip()
+        if text == str(getattr(app.session.config, attr)):
+            return
+        try:
+            parsed = parse_schedule(text)
+        except ValueError:
+            app._status("Bad schedule")
+            entry.set_text(str(getattr(app.session.config, attr)))
+            return
+        # cond_fn indexes these over the full 1000-step internal timeline, so a short schedule
+        # would IndexError mid-run. Require it to cover 1000 (extra entries are harmless).
+        if len(parsed) < 1000:
+            app._status("Schedule short")
+            entry.set_text(str(getattr(app.session.config, attr)))
+            return
+        setattr(app.session.config, attr, text)
+        app._status("Schedule set")
+        app._mark_custom()
+
+    def sync_enabled(self, app: App) -> None:
+        """The output boxes (steps / seed / size) are editable only when not generating."""
+        editable = not app.running
+        for el in (
+            self.steps_entry,
+            self.seed_entry,
+            self.random_seed_button,
+            self.width_entry,
+            self.height_entry,
+            self.apply_button,
+            self.swap_button,
+        ):
+            (el.enable if editable else el.disable)()
