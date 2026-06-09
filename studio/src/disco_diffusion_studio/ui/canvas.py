@@ -62,6 +62,20 @@ class Canvas:
         self.frame_surface = None
         self.frame_key = None
 
+    def apply_size(self, width: int, height: int) -> None:
+        """Adopt a new generation size: rebuild the paint layer, drop the frame, refit the view."""
+        self.resize(width, height)
+        self.fit()
+
+    def clear_frame(self) -> None:
+        """Drop the rendered frame, revealing the init preview / empty canvas underneath."""
+        self.frame_surface = None
+        self.frame_key = None
+
+    def frame_for_save(self) -> pygame.Surface | None:
+        """A frozen copy of the current frame to save (or None if nothing's rendered yet)."""
+        return self.frame_surface.copy() if self.frame_surface is not None else None
+
     def update_frame_surface(self) -> None:
         """Pull the worker's latest frame into ``frame_surface`` (+ refresh the step label)."""
         app = self.app

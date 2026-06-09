@@ -335,7 +335,7 @@ class App:
         """Rebuild every widget (the bottom panel + sidebar own their own build)."""
         # Preserve the seed field's contents across the rebuild (the widget is recreated).
         if hasattr(self.sidebar, "seed_entry"):
-            self._seed_text = self.sidebar.seed_entry.get_text()
+            self._seed_text = self.sidebar.seed_text()
         self.manager.clear_and_reset()
         self.bottom_bar._remove_buttons.clear()
         self.bottom_bar._mute_buttons.clear()
@@ -385,10 +385,7 @@ class App:
             self.sidebar.refresh_advanced_widgets(self)
             self._clip_selected = set(clip_models)
             self._secondary_on = use_secondary
-            for button, mname in self.sidebar._clip_buttons.items():
-                (button.select if mname in self._clip_selected else button.unselect)()
-            sec = self.sidebar.secondary_button
-            (sec.select if self._secondary_on else sec.unselect)()
+            self.sidebar.sync_model_buttons(self._clip_selected, self._secondary_on)
             self._update_reload_queue()
         finally:
             self._applying_preset = False
@@ -475,13 +472,9 @@ class App:
 
     def _toggle_clip_model(self, button: pygame_gui.elements.UIButton) -> None:
         """Stage a CLIP model in/out of the pending selection (queues the auto-reload)."""
-        name = self.sidebar._clip_buttons[button]
-        if name in self._clip_selected:
-            self._clip_selected.discard(name)
-            button.unselect()
-        else:
-            self._clip_selected.add(name)
-            button.select()
+        name = self.sidebar.model_name(button)
+        self._clip_selected.symmetric_difference_update({name})  # toggle in/out
+        self.sidebar.sync_model_buttons(self._clip_selected, self._secondary_on)
         self._update_reload_queue()
         self._mark_custom()
 
@@ -556,7 +549,7 @@ class App:
             self._status("Reload queued")
 
     def _status(self, text: str) -> None:
-        self.bottom_bar.status_label.set_text(text)
+        self.bottom_bar.set_status(text)
 
     # -- prompt snapshot --
     def _prompt_snapshot(self) -> list[PromptSpec]:
@@ -566,18 +559,6 @@ class App:
         if self.worker is not None and self.worker.is_alive():
             self.worker.set_prompts(self._prompt_snapshot())
 
-    def _commit_prompt_entry(self, entry: pygame_gui.elements.UITextEntryLine) -> None:
-        """Apply a prompt text box's contents (on Enter or when focus moves away)."""
-        idx = self.bottom_bar._prompt_entries.get(entry)
-        if idx is None or not (0 <= idx < len(self.prompts)):
-            return
-        if entry.get_text() == self.prompts[idx].text:
-            return
-        self.prompts[idx].text = entry.get_text()
-        self.bottom_bar.refresh_rows(self)
-        self._push_prompts()
-        self._request_checkpoint("prompt")
-
     # -- run lifecycle --
     def _seed_for_run(self) -> int:
         """Seed for the next run: the typed value, or a fresh random one (then shown in the field).
@@ -585,13 +566,13 @@ class App:
         Filling the field with the seed actually used makes every run reproducible and visible.
         """
         try:
-            seed = int(self.sidebar.seed_entry.get_text().strip())
+            seed = int(self.sidebar.seed_text().strip())
             if seed < 0:
                 raise ValueError
         except ValueError:
             seed = random.randrange(2**31)  # empty / invalid -> random, then surface it
         self._seed_text = str(seed)
-        self.sidebar.seed_entry.set_text(self._seed_text)
+        self.sidebar.set_seed_text(self._seed_text)
         return seed
 
     def _start_run(self) -> None:
@@ -661,13 +642,11 @@ class App:
         self._stop_run()
         self.width = snap_side(width)
         self.height = snap_side(height)
-        self.sidebar.width_entry.set_text(str(self.width))
-        self.sidebar.height_entry.set_text(str(self.height))
-        # Generation size changed: rebuild the paint layer + drop the stale frame (Canvas.resize),
-        # rebuild the init preview (also generation-res), and refit the view.
-        self.canvas.resize(self.width, self.height)
+        self.sidebar.set_size_text(self.width, self.height)
+        # Generation size changed: rebuild the init preview (also generation-res), then have the
+        # canvas adopt the new size (rebuild the paint layer, drop the stale frame, refit the view).
         self._init.rebuild_surface(self.width, self.height)
-        self.canvas.fit()
+        self.canvas.apply_size(self.width, self.height)
         self._status("Size set")
 
     def _set_sidebar_width(self, width: int) -> None:
@@ -696,11 +675,11 @@ class App:
         starts (to pick up a number typed but not Enter-applied) never disturbs anything.
         """
         try:
-            value = clamp_steps(self.sidebar.steps_entry.get_text())
+            value = clamp_steps(self.sidebar.steps_text())
         except ValueError:
-            self.sidebar.steps_entry.set_text(str(self.steps))
+            self.sidebar.set_steps_text(str(self.steps))
             return
-        self.sidebar.steps_entry.set_text(str(value))
+        self.sidebar.set_steps_text(str(value))
         if value == self.steps:
             return
         self.steps = value
@@ -711,10 +690,10 @@ class App:
 
     def _save_image(self) -> None:
         """Save the current frame via the native Save dialog (blocks while it's open)."""
-        if self.canvas.frame_surface is None:
+        surface = self.canvas.frame_for_save()  # freeze; the worker keeps generating
+        if surface is None:
             self._status("No frame")
             return
-        surface = self.canvas.frame_surface.copy()  # freeze; the worker keeps generating
         path_str = self._native_path("save", "Save image")
         if not path_str:
             return  # cancelled
@@ -783,8 +762,7 @@ class App:
     def _reset_canvas(self) -> None:
         """Stop the run and drop the rendered frame, revealing the init preview / empty canvas."""
         self._stop_run()  # also clears history / preview index
-        self.canvas.frame_surface = None
-        self.canvas.frame_key = None
+        self.canvas.clear_frame()
         self.bottom_bar.set_step_label("step 0 / 0")
         self._status("Canvas cleared")
 
@@ -873,16 +851,6 @@ class App:
         self._timeline.begin_undo()
         self._do_revert()
 
-    def _nudge_brush_size(self, factor: float) -> None:
-        """Scale the brush size (clamped) and sync the slider — shared by [ / ] and the wheel."""
-        self.brush.nudge_size(factor)
-        self.bottom_bar.size_slider.set_current_value(self.brush.size)
-
-    def _nudge_brush_strength(self, delta: float) -> None:
-        """Shift the brush opacity (clamped) and sync the slider — shared by the wheel."""
-        self.brush.nudge_strength(delta)
-        self.bottom_bar.strength_slider.set_current_value(self.brush.strength)
-
     def _history_total(self) -> int:
         """The run's display-step total (the history slider's right edge)."""
         frame = self.worker.latest_frame() if self.worker is not None else None
@@ -936,7 +904,7 @@ class App:
             previous = self._focused_entry
             self._focused_entry = current
             if previous is not None and previous.alive():
-                self._commit_prompt_entry(previous)
+                self.bottom_bar.commit_prompt_entry(self, previous)
         steps_focused = self.sidebar.steps_entry in focus
         if self._steps_focused and not steps_focused:
             self._commit_steps()

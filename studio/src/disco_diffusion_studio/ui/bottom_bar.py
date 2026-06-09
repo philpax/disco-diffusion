@@ -349,7 +349,7 @@ class BottomBar:
             return True
         if event.type == pygame_gui.UI_TEXT_ENTRY_FINISHED:
             if event.ui_element in self._prompt_entries:
-                app._commit_prompt_entry(event.ui_element)
+                self.commit_prompt_entry(app, event.ui_element)
                 return True
         return False
 
@@ -376,6 +376,32 @@ class BottomBar:
     def set_step_label(self, text: str) -> None:
         """Set the transport step counter (e.g. "step 12 / 100")."""
         self.step_label.set_text(text)
+
+    def set_status(self, text: str) -> None:
+        """Set the transport status line (e.g. "Running" / "Paused" / "Saved")."""
+        self.status_label.set_text(text)
+
+    def nudge_brush_size(self, app: App, factor: float) -> None:
+        """Scale the brush size (clamped) and sync the slider — shared by [ / ] and the wheel."""
+        app.brush.nudge_size(factor)
+        self.size_slider.set_current_value(app.brush.size)
+
+    def nudge_brush_strength(self, app: App, delta: float) -> None:
+        """Shift the brush opacity (clamped) and sync the slider — shared by the wheel."""
+        app.brush.nudge_strength(delta)
+        self.strength_slider.set_current_value(app.brush.strength)
+
+    def commit_prompt_entry(self, app: App, entry: UITextEntryLine) -> None:
+        """Apply a prompt text box's contents (on Enter or when focus moves away)."""
+        idx = self._prompt_entries.get(entry)
+        if idx is None or not (0 <= idx < len(app.prompts)):
+            return
+        if entry.get_text() == app.prompts[idx].text:
+            return
+        app.prompts[idx].text = entry.get_text()
+        self.refresh_rows(app)
+        app._push_prompts()
+        app._request_checkpoint("prompt")
 
     def set_history_label(self, text: str) -> None:
         """Set the history readout (live / previewed checkpoint); skips a no-op re-render."""

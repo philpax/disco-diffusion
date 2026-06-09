@@ -143,12 +143,11 @@ class SessionIO:
         app = self.app
         app._apply_size(session.width, session.height)  # also stops the run + rebuilds the canvas
         app.steps = session.steps
-        app.sidebar.steps_entry.set_text(str(app.steps))
+        app.sidebar.set_steps_text(str(app.steps))
         app._seed_text = str(session.seed)
-        app.sidebar.seed_entry.set_text(app._seed_text)
+        app.sidebar.set_seed_text(app._seed_text)
         app._init.denoise = session.denoise
-        app.sidebar._init_denoise_slider.set_current_value(float(app._init.denoise))
-        app.sidebar._init_denoise_label.set_text(f"{app._init.denoise}%")
+        app.sidebar.set_denoise(app._init.denoise)
         app.prompts = [PromptRow(t, w, m) for t, w, m in session.prompts] or [PromptRow("", 1.0)]
         app.bottom_bar.rebuild_prompt_rows(app)
         app._apply_recipe(session.config, session.clip_models, session.use_secondary_model)

@@ -100,9 +100,9 @@ def _handle_event(app: App, event: pygame.event.Event) -> bool:
         if app._navigating:  # canvas mode: wheel zooms toward the cursor
             app.canvas.zoom_at(app._mouse_pos, 1.15**event.y)
         elif pygame.key.get_mods() & pygame.KMOD_SHIFT:
-            app._nudge_brush_strength(event.y * 0.05)
+            app.bottom_bar.nudge_brush_strength(app, event.y * 0.05)
         else:
-            app._nudge_brush_size(1.1**event.y)
+            app.bottom_bar.nudge_brush_size(app, 1.1**event.y)
         return True
     if event.type == pygame.KEYDOWN and not app._typing() and not app._modal_open():
         if event.mod & pygame.KMOD_CTRL:  # ctrl combos: Save / Revert
@@ -117,9 +117,9 @@ def _handle_event(app: App, event: pygame.event.Event) -> bool:
         elif event.key == pygame.K_0:
             app.canvas.zoom_at(app.layout.image_region().center, 1.0 / app.canvas.view.zoom)
         elif event.key == pygame.K_LEFTBRACKET:
-            app._nudge_brush_size(1.0 / 1.1)
+            app.bottom_bar.nudge_brush_size(app, 1.0 / 1.1)
         elif event.key == pygame.K_RIGHTBRACKET:
-            app._nudge_brush_size(1.1)
+            app.bottom_bar.nudge_brush_size(app, 1.1)
         elif pygame.K_1 <= event.key <= pygame.K_9:  # digit -> nth palette/recents swatch
             app.bottom_bar.select_palette_index(app, event.key - pygame.K_1)
 

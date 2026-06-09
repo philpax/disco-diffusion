@@ -396,6 +396,42 @@ class Sidebar:
         """Update the init-image status line (e.g. "Init: foo.png" or "Init: none")."""
         self._init_status_label.set_text(label)
 
+    def steps_text(self) -> str:
+        """The raw text in the steps box (parse/clamp is the caller's job)."""
+        return self.steps_entry.get_text()
+
+    def set_steps_text(self, text: str) -> None:
+        """Show a (clamped) step count in the steps box."""
+        self.steps_entry.set_text(text)
+
+    def seed_text(self) -> str:
+        """The raw text in the seed box."""
+        return self.seed_entry.get_text()
+
+    def set_seed_text(self, text: str) -> None:
+        """Show the seed in use in the seed box."""
+        self.seed_entry.set_text(text)
+
+    def set_size_text(self, width: int, height: int) -> None:
+        """Reflect the (snapped) output size in the width/height boxes."""
+        self.width_entry.set_text(str(width))
+        self.height_entry.set_text(str(height))
+
+    def set_denoise(self, percent: int) -> None:
+        """Reflect the img2img denoise percentage in its slider + label."""
+        self._init_denoise_slider.set_current_value(float(percent))
+        self._init_denoise_label.set_text(f"{percent}%")
+
+    def model_name(self, button: UIButton) -> str:
+        """The CLIP model a toggle button represents."""
+        return self._clip_buttons[button]
+
+    def sync_model_buttons(self, selected: set[str], secondary: bool) -> None:
+        """Light the CLIP / secondary toggles to match a staged model selection."""
+        for button, name in self._clip_buttons.items():
+            (button.select if name in selected else button.unselect)()
+        (self.secondary_button.select if secondary else self.secondary_button.unselect)()
+
     def refresh_advanced_widgets(self, app: App) -> None:
         """Re-sync every Advanced widget from the current config (after a preset load)."""
         cfg = app.session.config
