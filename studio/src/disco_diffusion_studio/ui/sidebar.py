@@ -392,6 +392,10 @@ class Sidebar:
         (self.tab_settings.select if settings else self.tab_settings.unselect)()
         (self.tab_current.select if not settings else self.tab_current.unselect)()
 
+    def set_init_status(self, label: str) -> None:
+        """Update the init-image status line (e.g. "Init: foo.png" or "Init: none")."""
+        self._init_status_label.set_text(label)
+
     def refresh_advanced_widgets(self, app: App) -> None:
         """Re-sync every Advanced widget from the current config (after a preset load)."""
         cfg = app.session.config

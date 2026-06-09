@@ -22,6 +22,7 @@ def test_load_init_file_sets_image_and_preview(app, tmp_path):
     assert app._init.label == "seed.png"
     assert app._init.surface is not None
     assert app._init.surface.get_size() == (app.width, app.height)  # resized to gen size
+    assert app.sidebar._init_status_label.text == "Init: seed.png"  # status line updated
 
 
 def test_denoise_maps_to_skip_steps(app, tmp_path):
@@ -59,6 +60,13 @@ def test_denoise_slider_updates_value(app):
         )
     )
     assert app._init.denoise == 25
+
+
+def test_clear_init_updates_status(app, tmp_path):
+    app._load_init_file(str(_png(tmp_path)))
+    app._clear_init()
+    assert app._init.image is None
+    assert app.sidebar._init_status_label.text == "Init: none"
 
 
 def test_clear_init(app, tmp_path):

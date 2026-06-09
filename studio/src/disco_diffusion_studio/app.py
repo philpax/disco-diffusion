@@ -734,9 +734,7 @@ class App:
     # -- init image (img2img) --
     def _set_init_image(self, image: Image.Image, label: str) -> None:
         self._init.set(image, label, self.width, self.height)
-        status = getattr(self, "_init_status_label", None)
-        if status is not None:
-            status.set_text(f"Init: {label}")
+        self.sidebar.set_init_status(f"Init: {label}")
         self._status(f"Init set ({label})")
 
     def _load_init_file(self, path_str: str) -> None:
@@ -765,9 +763,7 @@ class App:
 
     def _clear_init(self) -> None:
         self._init.clear()
-        status = getattr(self, "_init_status_label", None)
-        if status is not None:
-            status.set_text("Init: none")
+        self.sidebar.set_init_status("Init: none")
         self._status("Init cleared")
 
     def _open_init(self) -> None:
