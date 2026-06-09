@@ -22,7 +22,6 @@ import argparse
 import io
 import json
 import logging
-import math
 import os
 import random
 import threading
@@ -88,13 +87,13 @@ from .theme import (
     THEME,
     WINDOW_BG,
 )
+from .view import ViewTransform
 from .worker import GenerationWorker, HistoryEntry, PromptSpec
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger("disco_diffusion_studio")
 
 APP_TITLE = "Disco Diffusion Studio"  # window caption + loading-screen heading
-MIN_ZOOM, MAX_ZOOM = 0.1, 16.0  # view zoom bounds
 BRUSH_SIZE_MIN, BRUSH_SIZE_MAX = 4.0, 160.0  # brush radius bounds (slider + scroll/[])
 BRUSH_STRENGTH_MIN, BRUSH_STRENGTH_MAX = 0.05, 1.0  # brush opacity bounds (slider + shift-scroll)
 # Help HUD text per interaction mode (hold right mouse = navigate, release = draw).
@@ -407,8 +406,7 @@ class App:
 
         # View transform: the canvas is decoupled from the window, which is just a viewport
         # onto it. zoom = screen px per canvas px; pan = screen pos of canvas pixel (0, 0).
-        self._zoom = 1.0
-        self._pan = pygame.Vector2(0, 0)
+        self._view = ViewTransform()
         self._panning = False
         self._navigating = False  # right mouse held: canvas-navigation mode (pan + scroll-zoom)
         self._hud_font = pygame.font.SysFont(None, 19)
@@ -477,65 +475,25 @@ class App:
     def _canvas_size(self) -> tuple[int, int]:
         return (self.width, self.height)
 
+    # The view transform (zoom/pan + canvas<->screen mapping) lives in ViewTransform; these
+    # supply it with the current image region and canvas size, which re-flow with the window.
     def _canvas_screen_rect(self) -> pygame.Rect:
-        """The canvas bounds in screen coords under the current view transform."""
-        w, h = self._canvas_size()
-        return pygame.Rect(
-            int(self._pan.x), int(self._pan.y), int(w * self._zoom), int(h * self._zoom)
-        )
+        return self._view.canvas_screen_rect(*self._canvas_size())
 
     def _fit_view(self) -> None:
-        """Reset the view so the whole canvas fits the viewport, centred."""
-        region = self._image_region()
-        w, h = self._canvas_size()
-        self._zoom = min(region.width / w, region.height / h) if w and h else 1.0
-        self._pan = pygame.Vector2(
-            region.x + (region.width - w * self._zoom) / 2,
-            region.y + (region.height - h * self._zoom) / 2,
-        )
+        self._view.fit(self._image_region(), *self._canvas_size())
 
     def _zoom_at(self, pos: tuple[int, int], factor: float) -> None:
-        """Multiply the zoom by ``factor``, keeping the canvas point under ``pos`` fixed."""
-        new_zoom = max(MIN_ZOOM, min(MAX_ZOOM, self._zoom * factor))
-        ratio = new_zoom / self._zoom
-        anchor = pygame.Vector2(pos)
-        self._pan = anchor - (anchor - self._pan) * ratio
-        self._zoom = new_zoom
-        self._clamp_pan()
+        self._view.zoom_at(pos, factor, self._image_region(), *self._canvas_size())
 
     def _clamp_pan(self) -> None:
-        """Keep the canvas centre within the viewport so the canvas can't be lost off-screen."""
-        region = self._image_region()
-        w, h = self._canvas_size()
-        cw, ch = w * self._zoom, h * self._zoom
-        cx = max(region.left, min(region.right, self._pan.x + cw / 2))
-        cy = max(region.top, min(region.bottom, self._pan.y + ch / 2))
-        self._pan = pygame.Vector2(cx - cw / 2, cy - ch / 2)
+        self._view.clamp_pan(self._image_region(), *self._canvas_size())
 
     def _screen_to_canvas(self, pos: tuple[int, int]) -> tuple[float, float] | None:
-        """Map a screen position to canvas-pixel coords, or None if outside the canvas."""
-        if not self._image_region().collidepoint(pos):
-            return None
-        cx = (pos[0] - self._pan.x) / self._zoom
-        cy = (pos[1] - self._pan.y) / self._zoom
-        w, h = self._canvas_size()
-        return (cx, cy) if 0 <= cx < w and 0 <= cy < h else None
+        return self._view.screen_to_canvas(pos, self._image_region(), *self._canvas_size())
 
     def _blit_canvas(self, surf: pygame.Surface) -> None:
-        """Blit only the visible part of a canvas-resolution surface under the view transform."""
-        w, h = surf.get_size()
-        z = self._zoom
-        region = self._image_region()
-        cx0 = max(0, int((region.left - self._pan.x) / z))
-        cy0 = max(0, int((region.top - self._pan.y) / z))
-        cx1 = min(w, math.ceil((region.right - self._pan.x) / z))
-        cy1 = min(h, math.ceil((region.bottom - self._pan.y) / z))
-        if cx1 <= cx0 or cy1 <= cy0:
-            return
-        sub = surf.subsurface(pygame.Rect(cx0, cy0, cx1 - cx0, cy1 - cy0))
-        dest = (max(1, int((cx1 - cx0) * z)), max(1, int((cy1 - cy0) * z)))
-        scaled = pygame.transform.smoothscale(sub, dest)
-        self.screen.blit(scaled, (self._pan.x + cx0 * z, self._pan.y + cy0 * z))
+        self._view.blit(self.screen, surf, self._image_region())
 
     def _typing(self) -> bool:
         """True while a text box has keyboard focus (so shortcut keys don't steal input)."""
@@ -2077,7 +2035,7 @@ class App:
             elif self._dragging_panel:
                 self._set_panel_height(self.win_h - event.pos[1] - DIVIDER_W // 2)
             elif self._panning:
-                self._pan += pygame.Vector2(event.rel)
+                self._view.pan += pygame.Vector2(event.rel)
                 self._clamp_pan()
             elif self._painting:
                 self._paint_to(event.pos)
@@ -2144,7 +2102,7 @@ class App:
             elif event.key == pygame.K_f:
                 self._fit_view()
             elif event.key == pygame.K_0:
-                self._zoom_at(self._image_region().center, 1.0 / self._zoom)
+                self._zoom_at(self._image_region().center, 1.0 / self._view.zoom)
             elif event.key == pygame.K_LEFTBRACKET:
                 self._nudge_brush_size(1.0 / 1.1)
             elif event.key == pygame.K_RIGHTBRACKET:
@@ -2462,7 +2420,7 @@ class App:
             and not self._modal_open()
             and region.collidepoint(self._mouse_pos)
         ):
-            ring = max(2, int(self.brush_size * self._zoom))
+            ring = max(2, int(self.brush_size * self._view.zoom))
             pygame.draw.circle(self.screen, self.brush_color, self._mouse_pos, ring, 2)
             pygame.draw.circle(self.screen, (255, 255, 255), self._mouse_pos, ring + 1, 1)
         # Help HUD in the corner of the canvas (doesn't cost panel height), per mode.
