@@ -39,7 +39,6 @@ from pygame_gui.windows import UIColourPickerDialog, UIConfirmationDialog, UIMes
 from . import native_dialog
 from .constants import (
     APP_TITLE,
-    RELOAD_DEBOUNCE_MS,
 )
 from .controls import CUSTOM_PRESET, PromptRow
 from .generation import Generation
@@ -61,6 +60,7 @@ from .layout import (
     snap_side,
 )
 from .loading import LoadingState, loading_screen
+from .models import Models
 from .paint import Brush
 from .palette import Palette
 from .presets import (
@@ -70,7 +70,6 @@ from .presets import (
     match_preset,
     save_preset,
 )
-from .reload import ModelReloader
 from .session_io import SessionIO
 from .theme import (
     THEME,
@@ -146,6 +145,7 @@ class App:
     session_io: SessionIO = field(init=False)  # save/load the working state as a .zip
     history: History = field(init=False)  # checkpoints / preview scrubbing / undo / revert
     generation: Generation = field(init=False)  # run lifecycle: start/stop/size/steps/seed/save
+    models: Models = field(init=False)  # staged CLIP/secondary set + debounced weight reload
 
     def __post_init__(self) -> None:
         self.width = snap_side(self.width)
@@ -226,9 +226,9 @@ class App:
         # Model selection (CLIP set + secondary). Changing these needs a full weight reload,
         # so the toggles stage a pending selection and *queue* an auto-reload (debounced); it
         # fires after the user stops changing, and un-queues if they revert to the loaded set.
-        self._clip_selected: set[str] = set(self.session.config.clip_models)
-        self._secondary_on: bool = self.session.config.use_secondary_model
-        self._reloader = ModelReloader()  # background weight reload + debounced trigger
+        # Model selection (staged CLIP set + secondary) and the debounced background weight
+        # reload — changing the model set rebuilds the session off-thread (see models.py).
+        self.models = Models(self)
         self.session_io = SessionIO(self)  # save/load the working state as a .zip
         # The run lifecycle: start/stop/pause, output size + steps, seed, save (see generation.py).
         # It also holds the "Current" tab's per-run snapshot (read straight from session.config for
@@ -350,8 +350,10 @@ class App:
     def _current_preset(self) -> Preset:
         """Capture the live settings (guidance + per-run + schedules + models) as a Preset."""
         config = PresetConfig.from_run_config(self.session.config)
-        models = [m for m in AVAILABLE_CLIP_MODELS if m in self._clip_selected]
-        return Preset(config=config, clip_models=models, use_secondary_model=self._secondary_on)
+        models = [m for m in AVAILABLE_CLIP_MODELS if m in self.models.clip_selected]
+        return Preset(
+            config=config, clip_models=models, use_secondary_model=self.models.secondary_on
+        )
 
     def _detect_preset(self) -> str:
         """The saved preset whose recipe matches the live settings, else "Custom"."""
@@ -384,10 +386,10 @@ class App:
             for attr, value in config.model_dump().items():
                 setattr(cfg, attr, value)
             self.sidebar.refresh_advanced_widgets(self)
-            self._clip_selected = set(clip_models)
-            self._secondary_on = use_secondary
-            self.sidebar.sync_model_buttons(self._clip_selected, self._secondary_on)
-            self._update_reload_queue()
+            self.models.clip_selected = set(clip_models)
+            self.models.secondary_on = use_secondary
+            self.sidebar.sync_model_buttons(self.models.clip_selected, self.models.secondary_on)
+            self.models.update_queue()
         finally:
             self._applying_preset = False
 
@@ -471,83 +473,10 @@ class App:
         self._set_preset_selection(name)
         self._status(f"Saved {name}")
 
-    def _toggle_clip_model(self, button: pygame_gui.elements.UIButton) -> None:
-        """Stage a CLIP model in/out of the pending selection (queues the auto-reload)."""
-        name = self.sidebar.model_name(button)
-        self._clip_selected.symmetric_difference_update({name})  # toggle in/out
-        self.sidebar.sync_model_buttons(self._clip_selected, self._secondary_on)
-        self._update_reload_queue()
-        self._mark_custom()
-
-    def _start_reload(self) -> None:
-        """Rebuild the session with the staged CLIP set / secondary toggle on a worker thread.
-
-        Reloading weights takes ~a minute, so it runs off the UI thread; the run loop polls
-        :meth:`_poll_reload` and swaps the session in when it's done. Play stays disabled and
-        the staged selection is locked (via _sync_enabled) until then.
-        """
-        if self._reloader.reloading:
-            return
-        selected = [m for m in AVAILABLE_CLIP_MODELS if m in self._clip_selected]
-        if not selected:
-            self._status("Pick a model")
-            return
-        cfg = self.session.config
-        # Order is irrelevant for the CLIP set (guidance sums over all models), so compare as
-        # sets — otherwise a reselection in a different order would look like a change.
-        if set(selected) == set(cfg.clip_models) and self._secondary_on == cfg.use_secondary_model:
-            self._status("No change")
-            return
-        self.generation.stop()  # the worker holds the old session; tear it down first
-        new_cfg = cfg.model_copy(
-            update={"clip_models": selected, "use_secondary_model": self._secondary_on}
-        )
-        self._reloader.start(new_cfg, self.session.device)
-        self._status("Reloading…")
-        self._sync_enabled()
-
-    def _poll_reload(self) -> None:
-        """Swap in a reloaded session once the background reload finishes (called per frame)."""
-        result = self._reloader.poll()
-        if result is None:
-            return
-        if result and "session" in result:
-            self.session = result["session"]  # type: ignore[assignment]
-            self._encode_cache.clear()  # embeds came from the old CLIP set — now stale
-            self._clip_selected = set(self.session.config.clip_models)
-            self._secondary_on = self.session.config.use_secondary_model
-            self._status("Reloaded")
-        else:
-            self._status("Reload failed")  # the traceback was logged by the reload thread
-        self._build_ui()  # rebuild so the advanced controls reflect the (new) session config
-        self._sync_enabled()
-
     def _sync_enabled(self) -> None:
         """Resync which widgets are enabled to the run / preview / reload state (both areas)."""
         self.sidebar.sync_enabled(self)
         self.bottom_bar.sync_enabled(self)
-
-    def _models_match_session(self) -> bool:
-        """True when the staged CLIP set + secondary toggle equal the loaded session's."""
-        cfg = self.session.config
-        return set(self._clip_selected) == set(cfg.clip_models) and (
-            self._secondary_on == cfg.use_secondary_model
-        )
-
-    def _update_reload_queue(self) -> None:
-        """Queue (or cancel) the debounced auto-reload after a model toggle / preset load.
-
-        Changing the CLIP set or secondary toggle needs a full weight reload. Rather than a
-        button, we queue the reload to fire shortly after the user stops changing things, and
-        cancel it if they land back on the currently-loaded set.
-        """
-        if self._models_match_session():
-            if self._reloader.queued:
-                self._reloader.cancel()
-                self._status("Reload cancelled")
-        else:
-            self._reloader.schedule(pygame.time.get_ticks() + RELOAD_DEBOUNCE_MS)
-            self._status("Reload queued")
 
     def _status(self, text: str) -> None:
         self.bottom_bar.set_status(text)
@@ -716,9 +645,7 @@ class App:
                 self._build_ui()
                 self.canvas.clamp_pan()
             # Fire the debounced model auto-reload once its delay has elapsed.
-            if self._reloader.due(pygame.time.get_ticks()):
-                self._reloader.cancel()  # clear the debounce; _start_reload re-validates the change
-                self._start_reload()
+            self.models.tick_reload(pygame.time.get_ticks())
             # Drop a "guidance" checkpoint once a guidance slider has settled (no-op if no run).
             self.history.tick_guidance_checkpoint(pygame.time.get_ticks())
             # When the run finishes (worker idles) or exits unexpectedly, drop to a paused
@@ -733,7 +660,7 @@ class App:
             if wk is not None and wk.notice is not None:  # e.g. compile OOM -> eager fallback
                 self._status(wk.notice)
                 wk.notice = None
-            self._poll_reload()  # swap in a reloaded session once its background thread finishes
+            self.models.poll()  # swap in a reloaded session once its background thread finishes
             self._auto_apply_on_blur()
             # Live "edited · Enter" badge while typing (cheap; only mutates on change).
             self.bottom_bar.refresh_rows(self)

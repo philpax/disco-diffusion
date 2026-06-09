@@ -444,5 +444,5 @@ class BottomBar:
             (pw.enable if prompts_on else pw.disable)()
         self.play_button.set_text("Pause" if app.running else "Play")
         # Can't resume mid-preview or mid-reload — Revert/Cancel, or wait for the reload.
-        play_off = app._timeline.preview_index is not None or app._reloader.reloading
+        play_off = app._timeline.preview_index is not None or app.models.reloader.reloading
         (self.play_button.disable if play_off else self.play_button.enable)()

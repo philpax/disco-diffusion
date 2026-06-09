@@ -317,7 +317,7 @@ class Sidebar:
                 r.left(bw), name, app.manager, container=container, object_id="#brush_button"
             )
             self._clip_buttons[button] = name
-            if name in app._clip_selected:
+            if name in app.models.clip_selected:
                 button.select()
             if i % per_row == per_row - 1:
                 y += pitch
@@ -331,7 +331,7 @@ class Sidebar:
             container=container,
             object_id="#brush_button",
         )
-        if app._secondary_on:
+        if app.models.secondary_on:
             self.secondary_button.select()
         return y + pitch
 
@@ -486,16 +486,9 @@ class Sidebar:
                 app._status(f"Perlin {'on' if on else 'off'}")
                 app._mark_custom()
             elif e in self._clip_buttons:
-                app._toggle_clip_model(e)
+                app.models.toggle_clip(e)
             elif e == self.secondary_button:
-                app._secondary_on = not app._secondary_on
-                (
-                    self.secondary_button.select
-                    if app._secondary_on
-                    else self.secondary_button.unselect
-                )()
-                app._update_reload_queue()
-                app._mark_custom()
+                app.models.toggle_secondary()
             elif e == self.apply_button:
                 app.generation.apply_size(
                     int_or(self.width_entry.get_text(), app.width),
