@@ -29,7 +29,6 @@ import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
-import numpy as np
 import pygame
 import pygame_gui
 from disco_diffusion import DiscoSession, EncodedPrompt, RunConfig
@@ -62,17 +61,14 @@ from .layout import (
 from .paint import Brush
 from .palette import Palette
 from .presets import (
-    HistoryItem,
     Preset,
     PresetConfig,
-    Session,
     load_presets,
-    load_session,
     match_preset,
     save_preset,
-    save_session,
 )
 from .reload import ModelReloader
+from .session_io import SessionIO
 from .theme import (
     THEME,
     WINDOW_BG,
@@ -82,7 +78,7 @@ from .ui import draw, events
 from .ui.bottom_bar import BottomBar
 from .ui.canvas import Canvas
 from .ui.sidebar import Sidebar
-from .util import clamp_steps
+from .util import clamp_steps, surface_to_pil
 from .worker import GenerationWorker, HistoryEntry, PromptSpec
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
@@ -145,6 +141,7 @@ class App:
     canvas: Canvas = field(init=False)  # image area: view transform + paint layer + frame
     sidebar: Sidebar = field(init=False)  # right sidebar: Settings/Current tabs + their widgets
     bottom_bar: BottomBar = field(init=False)  # transport / history / paint tools / prompts
+    session_io: SessionIO = field(init=False)  # save/load the working state as a .zip
 
     def __post_init__(self) -> None:
         self.width = snap_side(self.width)
@@ -228,6 +225,7 @@ class App:
         self._clip_selected: set[str] = set(self.session.config.clip_models)
         self._secondary_on: bool = self.session.config.use_secondary_model
         self._reloader = ModelReloader()  # background weight reload + debounced trigger
+        self.session_io = SessionIO(self)  # save/load the working state as a .zip
         # pygame ticks at which to drop a guidance-change checkpoint (set when a guidance slider
         # moves, pushed back on each further move, fired once the value settles). None = idle.
         self._guidance_checkpoint_at: int | None = None
@@ -409,45 +407,6 @@ class App:
         self._status(f"Loaded {name}")
 
     # -- sessions (full working state) --
-    def _current_session(self) -> Session:
-        """Capture the whole working state (prompts + output + denoise + recipe) as a Session."""
-        recipe = self._current_preset()
-        return Session(
-            width=self.width,
-            height=self.height,
-            steps=self.steps,
-            seed=self._seed_for_run(),  # also fills the field with the seed in use
-            denoise=self._init.denoise,
-            prompts=[PromptSpec(r.text, r.weight, r.muted) for r in self.prompts],
-            config=recipe.config,
-            clip_models=recipe.clip_models,
-            use_secondary_model=recipe.use_secondary_model,
-        )
-
-    def _current_image(self) -> Image.Image | None:
-        """The rendered result currently on the canvas as a PIL image (for the session zip)."""
-        surface = self._displayed_surface()
-        if surface is None:
-            return None
-        return surface_to_pil(surface)
-
-    def _history_for_save(self) -> list[tuple[HistoryItem, Image.Image]]:
-        """The current edit history as (metadata, preview image) pairs for the session zip."""
-        return [
-            (
-                HistoryItem(
-                    label=e.label,
-                    step=e.step,
-                    index=e.index,
-                    total=e.total,
-                    prompts=[PromptSpec(t, w, m) for t, w, m in e.prompts],
-                    config=e.config,
-                ),
-                Image.fromarray(e.preview),
-            )
-            for e in self._timeline.entries
-        ]
-
     def _native_path(self, kind: str, title: str) -> str | None:
         """Open a native file dialog (``kind`` ``"save"``/``"open"``) rooted at ``out_dir``.
 
@@ -461,87 +420,6 @@ class App:
         except native_dialog.Unavailable:
             self._status("No native dialog (install zenity)")
             return None
-
-    def _save_session(self) -> None:
-        """Save the whole working state + result + history to a .zip via the native Save dialog."""
-        path = self._native_path("save", "Save session")
-        if not path:
-            return
-        try:
-            saved = save_session(
-                path, self._current_session(), self._current_image(), self._history_for_save()
-            )
-        except Exception as exc:  # noqa: BLE001 - surface the failure instead of crashing
-            log.exception("saving session failed")
-            self._status(f"Save failed: {exc}")
-            return
-        self._status(f"Saved session {saved.name}")
-
-    def _load_session(self) -> None:
-        """Load a session .zip via the native Open dialog and apply it (result -> init image)."""
-        path = self._native_path("open", "Open session")
-        if not path:
-            return
-        if not zipfile.is_zipfile(path):  # an image (or other file) picked via the session button
-            self._show_message(
-                "Not a session",
-                f"<b>{Path(path).name}</b> isn't a session bundle (.zip)."
-                "<br><br>If it's an image, use the <b>Init image → Open…</b> button to load it.",
-            )
-            return
-        try:
-            session, image, history = load_session(path)
-        except Exception as exc:  # noqa: BLE001 - bad/old file shouldn't crash the app
-            log.exception("loading session failed")
-            self._show_message("Bad session", f"Couldn't load <b>{Path(path).name}</b>:<br>{exc}")
-            return
-        self._apply_session(session)
-        # The bundled result becomes the init image so Play continues from it; without one, clear.
-        # It's also painted onto the canvas as the (static) final frame, so the timeline treats it
-        # as the rightmost endpoint — scrubbing visits it just like a freshly finished run's last
-        # step, rather than snapping back to the last recorded checkpoint.
-        if image is not None:
-            self._set_init_image(image, "session result")
-            arr = np.asarray(image.convert("RGB"))  # (H, W, 3)
-            self.canvas.frame_surface = pygame.surfarray.make_surface(arr.swapaxes(0, 1))
-        else:
-            self._clear_init()
-            self.canvas.frame_surface = None
-        # Restore the scrubbable timeline (previews only, latent=None) — _sync_history keeps it
-        # while there's no worker, and Revert continues from a checkpoint's preview via img2img.
-        self._timeline.entries = [
-            HistoryEntry(
-                latent=None,
-                step=item.step,
-                index=item.index,
-                total=item.total,
-                preview=np.asarray(preview),
-                label=item.label,
-                prompts=[PromptSpec(t, w, m) for t, w, m in item.prompts],
-                config=item.config,
-            )
-            for item, preview in history
-        ]
-        self._timeline.preview_index = None
-        self._sync_enabled()
-
-    def _apply_session(self, session: Session) -> None:
-        """Adopt a loaded session: stop the run, set output + prompts + the recipe for next Play."""
-        self._apply_size(session.width, session.height)  # also stops the run + rebuilds the canvas
-        self.steps = session.steps
-        self.sidebar.steps_entry.set_text(str(self.steps))
-        self._seed_text = str(session.seed)
-        self.sidebar.seed_entry.set_text(self._seed_text)
-        self._init.denoise = session.denoise
-        self.sidebar._init_denoise_slider.set_current_value(float(self._init.denoise))
-        self.sidebar._init_denoise_label.set_text(f"{self._init.denoise}%")
-        self.prompts = [PromptRow(t, w, m) for t, w, m in session.prompts] or [PromptRow("", 1.0)]
-        self.bottom_bar.rebuild_prompt_rows(self)
-        self._apply_recipe(session.config, session.clip_models, session.use_secondary_model)
-        self._preset_selection = self._detect_preset()
-        self.sidebar.spawn_preset_dropdown(self)
-        self._run_snapshot = self.sidebar.perrun_values(self)
-        self._status("Session loaded — press Play")
 
     def _open_save_preset_dialog(self) -> None:
         """Open a small modal asking for a filename to save the current settings as a preset."""
@@ -1200,12 +1078,6 @@ class App:
             self._draw_history_ticks()
             pygame.display.flip()
         self._stop_run()
-
-
-def surface_to_pil(surface: pygame.Surface) -> Image.Image:
-    """Copy a pygame surface to a PIL image (transposing pygame's column-major (W, H) layout)."""
-    arr = pygame.surfarray.array3d(surface).swapaxes(0, 1).astype("uint8")  # (H, W, 3)
-    return Image.fromarray(arr)
 
 
 @dataclass

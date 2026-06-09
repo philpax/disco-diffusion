@@ -172,7 +172,7 @@ def test_session_save_load_round_trip(app, tmp_path, stub_dialogs):
     app.sidebar.seed_entry.set_text("424242")
     app._init.denoise = 35
     app.session.config.clip_guidance_scale = 9999
-    app._save_session()
+    app.session_io.save()
     assert archive.exists()
     # mutate everything, then load the session back
     app.steps = 50
@@ -181,7 +181,7 @@ def test_session_save_load_round_trip(app, tmp_path, stub_dialogs):
     app.session.config.clip_guidance_scale = 100
     app.prompts = [A.PromptRow("x", 1.0)]
     app._init.image = None
-    app._load_session()
+    app.session_io.load()
     assert app.steps == 137
     assert app.sidebar.seed_entry.get_text() == "424242"
     assert app._init.denoise == 35
@@ -218,9 +218,9 @@ def test_session_restores_scrubbable_history(app, tmp_path, stub_dialogs):
             config=GuidanceSnapshot(clip_guidance_scale=9000),
         ),
     ]
-    app._save_session()
+    app.session_io.save()
     app._timeline.entries = []
-    app._load_session()
+    app.session_io.load()
     assert [e.label for e in app._timeline.entries] == ["start", "paint soft 48px"]
     assert app._timeline.entries[1].index == 40
     assert app._timeline.entries[0].latent is None  # previews only, no latent
@@ -238,9 +238,9 @@ def test_loaded_result_is_rightmost_scrubbable_endpoint(app, tmp_path, stub_dial
         HistoryEntry(latent=None, step=0, index=1, total=100, preview=img, label="start"),
         HistoryEntry(latent=None, step=0, index=40, total=100, preview=img, label="paint"),
     ]
-    app._save_session()
+    app.session_io.save()
     app.canvas.frame_surface, app._timeline.entries = None, []
-    app._load_session()
+    app.session_io.load()
     # The result is painted back as a static final frame, and is the timeline's rightmost step.
     assert app.canvas.frame_surface is not None
     assert app._live_index() == 100  # the run's last step, past the index=40 checkpoint
@@ -264,7 +264,7 @@ def test_image_loaded_via_session_button_shows_error(app, tmp_path, stub_dialogs
     Image.new("RGB", (8, 8)).save(image_file)
     stub_dialogs(open=image_file)
     before = app.steps
-    app._load_session()
+    app.session_io.load()
     assert app._message_window is not None and app._message_window.alive()
     assert app.steps == before  # the session wasn't applied
 

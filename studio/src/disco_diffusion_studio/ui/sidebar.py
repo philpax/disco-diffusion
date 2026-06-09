@@ -430,9 +430,9 @@ class Sidebar:
             elif e == self.save_preset_button:
                 app._open_save_preset_dialog()
             elif e == self.save_session_button:
-                app._save_session()
+                app.session_io.save()
             elif e == self.load_session_button:
-                app._load_session()
+                app.session_io.load()
             elif e == self.open_init_button:
                 app._open_init()
             elif e == self.use_current_init_button:
