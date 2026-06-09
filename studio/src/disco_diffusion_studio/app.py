@@ -77,6 +77,7 @@ from .presets import (
     save_preset,
     save_session,
 )
+from .reload import ModelReloader
 from .theme import (
     DIVIDER,
     IMAGE_BG,
@@ -349,10 +350,7 @@ class App:
         self._clip_buttons: dict[pygame_gui.elements.UIButton, str] = {}
         self._clip_selected: set[str] = set(self.session.config.clip_models)
         self._secondary_on: bool = self.session.config.use_secondary_model
-        self._reloading = False
-        self._reload_thread: threading.Thread | None = None
-        self._reload_result: dict[str, object] | None = None
-        self._reload_queued_at: int | None = None  # pygame ticks at which to fire the auto-reload
+        self._reloader = ModelReloader()  # background weight reload + debounced trigger
         # pygame ticks at which to drop a guidance-change checkpoint (set when a guidance slider
         # moves, pushed back on each further move, fired once the value settles). None = idle.
         self._guidance_checkpoint_at: int | None = None
@@ -1426,7 +1424,7 @@ class App:
         :meth:`_poll_reload` and swaps the session in when it's done. Play stays disabled and
         the staged selection is locked (via _sync_enabled) until then.
         """
-        if self._reloading:
+        if self._reloader.reloading:
             return
         selected = [m for m in AVAILABLE_CLIP_MODELS if m in self._clip_selected]
         if not selected:
@@ -1442,32 +1440,15 @@ class App:
         new_cfg = cfg.model_copy(
             update={"clip_models": selected, "use_secondary_model": self._secondary_on}
         )
-        device = self.session.device
-        self._reload_result = None
-        self._reloading = True
+        self._reloader.start(new_cfg, self.session.device)
         self._status("Reloading…")
         self._sync_enabled()
 
-        def work() -> None:
-            try:
-                # Pass the existing device so there's no interactive CPU-fallback prompt.
-                new_session = DiscoSession(new_cfg, device=device)
-                self._reload_result = {"session": new_session}
-            except Exception as exc:  # surfaced on the UI thread by _poll_reload
-                log.exception("model reload failed")
-                self._reload_result = {"error": str(exc)}
-
-        self._reload_thread = threading.Thread(target=work, daemon=True)
-        self._reload_thread.start()
-
     def _poll_reload(self) -> None:
         """Swap in a reloaded session once the background reload finishes (called per frame)."""
-        if not self._reloading or self._reload_thread is None or self._reload_thread.is_alive():
+        result = self._reloader.poll()
+        if result is None:
             return
-        self._reloading = False
-        self._reload_thread = None
-        result = self._reload_result
-        self._reload_result = None
         if result and "session" in result:
             self.session = result["session"]  # type: ignore[assignment]
             self._encode_cache.clear()  # embeds came from the old CLIP set — now stale
@@ -1503,7 +1484,7 @@ class App:
             (pw.enable if prompts_on else pw.disable)()
         self.play_button.set_text("Pause" if self.running else "Play")
         # Can't resume mid-preview or mid-reload — Revert/Cancel, or wait for the reload.
-        play_off = self._preview_index is not None or self._reloading
+        play_off = self._preview_index is not None or self._reloader.reloading
         (self.play_button.disable if play_off else self.play_button.enable)()
 
     def _models_match_session(self) -> bool:
@@ -1521,11 +1502,11 @@ class App:
         cancel it if they land back on the currently-loaded set.
         """
         if self._models_match_session():
-            if self._reload_queued_at is not None:
-                self._reload_queued_at = None
+            if self._reloader.queued:
+                self._reloader.cancel()
                 self._status("Reload cancelled")
         else:
-            self._reload_queued_at = pygame.time.get_ticks() + RELOAD_DEBOUNCE_MS
+            self._reloader.schedule(pygame.time.get_ticks() + RELOAD_DEBOUNCE_MS)
             self._status("Reload queued")
 
     def _status(self, text: str) -> None:
@@ -2624,12 +2605,8 @@ class App:
                 self._build_ui()
                 self._clamp_pan()
             # Fire the debounced model auto-reload once its delay has elapsed.
-            if (
-                self._reload_queued_at is not None
-                and not self._reloading
-                and pygame.time.get_ticks() >= self._reload_queued_at
-            ):
-                self._reload_queued_at = None
+            if self._reloader.due(pygame.time.get_ticks()):
+                self._reloader.cancel()  # clear the debounce; _start_reload re-validates the change
                 self._start_reload()
             # Drop a "guidance" checkpoint once a guidance slider has settled (no-op if no run).
             if (
