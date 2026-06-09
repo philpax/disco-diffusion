@@ -16,6 +16,7 @@ import pygame
 from PIL import Image
 
 from .controls import PromptRow
+from .signals import Signals
 from .worker import HistoryEntry, PromptSpec
 
 if TYPE_CHECKING:
@@ -25,8 +26,9 @@ if TYPE_CHECKING:
 class History:
     """Checkpoint requests, preview scrubbing, undo, and revert for the edit timeline."""
 
-    def __init__(self, app: App) -> None:
+    def __init__(self, app: App, signals: Signals) -> None:
         self.app = app
+        self.signals = signals
         self.preview_prompts: list[PromptRow] | None = None  # prompts shown while previewing
         # pygame ticks at which to drop a guidance-change checkpoint (set when a guidance slider
         # moves, pushed back on each further move, fired once the value settles). None = idle.
@@ -105,7 +107,7 @@ class History:
             [PromptRow(t, w, m) for t, w, m in want] if want is not None else None
         )
         app.bottom_bar.rebuild_prompt_rows(app)
-        app._sync_enabled()
+        self.signals.invalidate()
 
     def refresh_preview_state(self) -> None:
         """Update the prompt rows, label, and Play gating whenever the preview changes."""
@@ -141,7 +143,7 @@ class History:
         app.bottom_bar.park_history_thumb(float(entry.index))
         app.bottom_bar.rebuild_prompt_rows(app)  # now-live (reverted) prompts
         app._push_prompts()  # apply them to the resumed run
-        app._sync_enabled()  # re-enable prompt editing
+        self.signals.invalidate()  # re-enable prompt editing
         self.refresh_preview_state()
 
     def _revert_loaded(self, entry: HistoryEntry) -> None:
@@ -175,7 +177,7 @@ class History:
         tl = app._timeline
         if tl.sync(app.worker.get_history() if app.worker is not None else None):
             app.bottom_bar.rebuild_history_slider(app)
-            app._sync_enabled()
+            self.signals.invalidate()
         elif app.running and tl.preview_index is None and tl.entries:
             # While actively generating (not previewing), let the thumb track the live step as it
             # advances. When paused/done we leave it alone so a scrub isn't yanked back each frame.

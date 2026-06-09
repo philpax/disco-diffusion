@@ -62,6 +62,7 @@ from .paint import Brush
 from .palette import Palette
 from .recipe import Recipe
 from .session_io import SessionIO
+from .signals import Signals
 from .theme import (
     THEME,
 )
@@ -146,6 +147,10 @@ class App:
             self.prompts = [PromptRow("a vast alien landscape, oil painting", 1.0)]
         self._encode_cache: dict[str, EncodedPrompt] = {}
         self._cache_lock = threading.Lock()
+        # The UI event bus: controllers announce status messages / enablement-invalidation through
+        # it instead of reaching back into the bottom bar + sidebar. Listeners are wired below,
+        # once those areas exist (see _resync_enabled / bottom_bar.set_status).
+        self.signals = Signals()
         # The window size is independent of the generation size: it's seeded once, then owned
         # by the user (resizable). Seed it so the image region — the window minus the sidebar
         # and the bottom panel — matches the canvas aspect, so the canvas fills it with minimal
@@ -208,15 +213,15 @@ class App:
 
         # Model selection (staged CLIP set + secondary) and the debounced background weight
         # reload — changing the model set rebuilds the session off-thread (see models.py).
-        self.models = Models(self)
-        self.session_io = SessionIO(self)  # save/load the working state as a .zip
+        self.models = Models(self, self.signals)
+        self.session_io = SessionIO(self, self.signals)  # save/load the working state as a .zip
         # The run lifecycle: start/stop/pause, output size + steps, seed, save (see generation.py).
         # It also holds the "Current" tab's per-run snapshot (read straight from session.config for
         # live knobs).
-        self.generation = Generation(self)
+        self.generation = Generation(self, self.signals)
         # Presets / recipes (TOML on disk): capture/apply the full guidance recipe, the dropdown
         # selection, the "Custom" flip on edits, and the save-as modal (see recipe.py).
-        self.recipe = Recipe(self)
+        self.recipe = Recipe(self, self.signals)
 
         # img2img init image (per-run, applies on next Play): seed the run from an image instead
         # of noise, set by Open…/drag-drop (a file) or "Use current" (the on-screen frame). The
@@ -250,13 +255,17 @@ class App:
         # the Ctrl+Z undo cursor, and the scrub maths. The History controller drives it: checkpoint
         # requests, preview scrubbing, undo, revert, and the per-frame sync (see history.py).
         self._timeline = Timeline()
-        self.history = History(self)
+        self.history = History(self, self.signals)
         self.bottom_bar._history_slider_rect = pygame.Rect(0, 0, 10, 10)
         # Fit the canvas to the available area once the real window size is settled. The window
         # manager may resize the window right after it opens (firing a VIDEORESIZE that only
         # re-clamps), so the fit happens on the first run-loop frame, not here — by then any
         # startup resize has landed. (_zoom/_pan keep their defaults above until then.)
         self._did_initial_fit = False
+        # Wire the event bus now that the bottom bar + sidebar exist: status messages go to the
+        # bottom bar's status line, and an invalidation re-syncs both areas' widget enablement.
+        self.signals.on_status(self.bottom_bar.set_status)
+        self.signals.on_invalidate(self._resync_enabled)
         self._build_ui()
 
     # -- geometry --
@@ -325,7 +334,7 @@ class App:
         self.bottom_bar._row_elements.clear()
         self.bottom_bar.build(self)
         self.sidebar.build(self)
-        self._sync_enabled()
+        self.signals.invalidate()
 
     # -- sessions (full working state) --
     def _native_path(self, kind: str, title: str) -> str | None:
@@ -339,16 +348,16 @@ class App:
         try:
             return pick(title=title, start_dir=str(self.out_dir))
         except native_dialog.Unavailable:
-            self._status("No native dialog (install zenity)")
+            self.signals.status("No native dialog (install zenity)")
             return None
 
-    def _sync_enabled(self) -> None:
-        """Resync which widgets are enabled to the run / preview / reload state (both areas)."""
+    def _resync_enabled(self) -> None:
+        """Re-sync widget enablement to the run / preview / reload state (the invalidate handler).
+
+        Wired to ``signals.invalidate()`` — both areas re-evaluate which widgets are enabled.
+        """
         self.sidebar.sync_enabled(self)
         self.bottom_bar.sync_enabled(self)
-
-    def _status(self, text: str) -> None:
-        self.bottom_bar.set_status(text)
 
     # -- prompt snapshot --
     def _prompt_snapshot(self) -> list[PromptSpec]:
@@ -381,7 +390,7 @@ class App:
     def _set_init_image(self, image: Image.Image, label: str) -> None:
         self._init.set(image, label, self.width, self.height)
         self.sidebar.set_init_status(f"Init: {label}")
-        self._status(f"Init set ({label})")
+        self.signals.status(f"Init set ({label})")
 
     def _load_init_file(self, path_str: str) -> None:
         if zipfile.is_zipfile(path_str):  # a session bundle picked via the init-image button
@@ -403,14 +412,14 @@ class App:
         """Seed the next run from whatever is currently on the canvas (live frame or preview)."""
         surface = self.history.displayed_surface()
         if surface is None:
-            self._status("No frame")
+            self.signals.status("No frame")
             return
         self._set_init_image(surface_to_pil(surface), "current result")
 
     def _clear_init(self) -> None:
         self._init.clear()
         self.sidebar.set_init_status("Init: none")
-        self._status("Init cleared")
+        self.signals.status("Init cleared")
 
     def _open_init(self) -> None:
         """Pick an init image via the native Open dialog (blocks while it's open)."""
@@ -421,7 +430,7 @@ class App:
     def _open_reset_confirm(self) -> None:
         """Confirm before discarding the rendered frame (so the init / empty canvas shows again)."""
         if self.canvas.frame_surface is None and self.worker is None:
-            self._status("Nothing to clear")
+            self.signals.status("Nothing to clear")
             return
         if self._confirm_dialog is not None and self._confirm_dialog.alive():
             return
@@ -436,7 +445,7 @@ class App:
         self.generation.stop()  # also clears history / preview index
         self.canvas.clear_frame()
         self.bottom_bar.set_step_label("step 0 / 0")
-        self._status("Canvas cleared")
+        self.signals.status("Canvas cleared")
 
     # -- events --
     def _auto_apply_on_blur(self) -> None:
@@ -512,10 +521,10 @@ class App:
                 self.paused = True
                 if wk.is_alive():
                     wk.pause()
-                self._status("Done")
-                self._sync_enabled()
+                self.signals.status("Done")
+                self.signals.invalidate()
             if wk is not None and wk.notice is not None:  # e.g. compile OOM -> eager fallback
-                self._status(wk.notice)
+                self.signals.status(wk.notice)
                 wk.notice = None
             self.models.poll()  # swap in a reloaded session once its background thread finishes
             self._auto_apply_on_blur()

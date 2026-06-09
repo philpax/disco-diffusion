@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING
 import pygame
 
 from .layout import snap_side
+from .signals import Signals
 from .util import clamp_steps
 from .worker import GenerationWorker
 
@@ -30,8 +31,9 @@ log = logging.getLogger("disco_diffusion_studio.generation")
 class Generation:
     """Starting, stopping, and reconfiguring the generation run (+ saving its output)."""
 
-    def __init__(self, app: App) -> None:
+    def __init__(self, app: App, signals: Signals) -> None:
         self.app = app
+        self.signals = signals
         # Snapshot of the per-run settings the active run was started with, for the "Current"
         # sidebar tab to show while it runs (live knobs are read straight from session.config).
         self.run_snapshot: dict[str, str] = {}
@@ -84,8 +86,8 @@ class Generation:
         app._timeline.reset()
         app.paused = False
         app.worker.start()
-        app._status("Running")
-        app._sync_enabled()
+        self.signals.status("Running")
+        self.signals.invalidate()
 
     def stop(self) -> None:
         """Tear down the worker and clear the timeline (no-op if nothing's running)."""
@@ -96,13 +98,13 @@ class Generation:
         app.worker = None
         app.paused = False
         app._timeline.reset()
-        app._sync_enabled()
+        self.signals.invalidate()
 
     def toggle_play(self) -> None:
         """Play/Pause: start a fresh run, pause a running one, or resume a paused one."""
         app = self.app
         if app._timeline.preview_index is not None:
-            app._status("Previewing")
+            self.signals.status("Previewing")
             return
         if app.worker is None or not app.worker.is_alive() or app.worker.finished:
             self.start()  # finished -> Play starts a fresh run (Revert continues a branch)
@@ -111,13 +113,13 @@ class Generation:
             app._timeline.clear_preview()  # resume from live, drop any history preview
             app._timeline.end_undo()  # resuming ends the undo chain
             app.worker.resume()
-            app._status("Running")
-            app._sync_enabled()
+            self.signals.status("Running")
+            self.signals.invalidate()
         else:
             app.paused = True
             app.worker.pause()
-            app._status("Paused")
-            app._sync_enabled()
+            self.signals.status("Paused")
+            self.signals.invalidate()
 
     def apply_size(self, width: int, height: int) -> None:
         """Set the output size (snapped). A shape change needs a fresh run, so it stops the run."""
@@ -132,7 +134,7 @@ class Generation:
         # canvas adopt the new size (rebuild the paint layer, drop the stale frame, refit the view).
         app._init.rebuild_surface(app.width, app.height)
         app.canvas.apply_size(app.width, app.height)
-        app._status("Size set")
+        self.signals.status("Size set")
 
     def commit_steps(self) -> None:
         """Adopt the steps box value (clamped). Safe to call on Enter, on blur, or at Play.
@@ -153,14 +155,14 @@ class Generation:
         # If a run is paused, changing steps abandons it (respacing is fixed per run).
         if app.worker is not None and app.worker.is_alive():
             self.stop()
-            app._status("Steps set")
+            self.signals.status("Steps set")
 
     def save_image(self) -> None:
         """Save the current frame via the native Save dialog (blocks while it's open)."""
         app = self.app
         surface = app.canvas.frame_for_save()  # freeze; the worker keeps generating
         if surface is None:
-            app._status("No frame")
+            self.signals.status("No frame")
             return
         path_str = app._native_path("save", "Save image")
         if not path_str:
@@ -170,5 +172,5 @@ class Generation:
             path = path.with_suffix(".png")
         path.parent.mkdir(parents=True, exist_ok=True)
         pygame.image.save(surface, str(path))
-        app._status("Saved")
+        self.signals.status("Saved")
         log.info("saved %s", path)

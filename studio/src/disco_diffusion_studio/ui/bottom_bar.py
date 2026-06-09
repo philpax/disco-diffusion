@@ -282,7 +282,7 @@ class BottomBar:
                 app.generation.toggle_play()
             elif e == self.stop_button:
                 app.generation.stop()
-                app._status("Stopped")
+                app.signals.status("Stopped")
             elif e == self.reset_button:
                 app._open_reset_confirm()
             elif e == self.save_button:

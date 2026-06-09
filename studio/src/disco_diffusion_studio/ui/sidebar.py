@@ -483,7 +483,7 @@ class Sidebar:
                 app.session.config.perlin_init = not app.session.config.perlin_init
                 on = app.session.config.perlin_init
                 (self.perlin_button.select if on else self.perlin_button.unselect)()
-                app._status(f"Perlin {'on' if on else 'off'}")
+                app.signals.status(f"Perlin {'on' if on else 'off'}")
                 app.recipe.mark_custom()
             elif e in self._clip_buttons:
                 app.models.toggle_clip(e)
@@ -499,7 +499,7 @@ class Sidebar:
             elif e == self.random_seed_button:
                 app._seed_text = str(random.randrange(2**31))  # roll a fresh, visible seed
                 self.seed_entry.set_text(app._seed_text)
-                app._status(f"Seed {app._seed_text}")
+                app.signals.status(f"Seed {app._seed_text}")
             else:
                 return False
             return True
@@ -609,17 +609,17 @@ class Sidebar:
         try:
             parsed = parse_schedule(text)
         except ValueError:
-            app._status("Bad schedule")
+            app.signals.status("Bad schedule")
             entry.set_text(str(getattr(app.session.config, attr)))
             return
         # cond_fn indexes these over the full 1000-step internal timeline, so a short schedule
         # would IndexError mid-run. Require it to cover 1000 (extra entries are harmless).
         if len(parsed) < 1000:
-            app._status("Schedule short")
+            app.signals.status("Schedule short")
             entry.set_text(str(getattr(app.session.config, attr)))
             return
         setattr(app.session.config, attr, text)
-        app._status("Schedule set")
+        app.signals.status("Schedule set")
         app.recipe.mark_custom()
 
     def sync_enabled(self, app: App) -> None:

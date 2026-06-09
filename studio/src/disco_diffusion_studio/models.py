@@ -18,6 +18,7 @@ from disco_diffusion.config import AVAILABLE_CLIP_MODELS
 
 from .constants import RELOAD_DEBOUNCE_MS
 from .reload import ModelReloader
+from .signals import Signals
 
 if TYPE_CHECKING:
     from .app import App
@@ -26,8 +27,9 @@ if TYPE_CHECKING:
 class Models:
     """The staged CLIP set + secondary toggle, and the debounced background weight reload."""
 
-    def __init__(self, app: App) -> None:
+    def __init__(self, app: App, signals: Signals) -> None:
         self.app = app
+        self.signals = signals
         # Staged selection (what the toggles show). Changing it queues an auto-reload (debounced);
         # it fires after the user stops, and un-queues if they revert to the loaded set.
         self.clip_selected: set[str] = set(app.session.config.clip_models)
@@ -73,10 +75,10 @@ class Models:
         if self.matches_session():
             if self.reloader.queued:
                 self.reloader.cancel()
-                self.app._status("Reload cancelled")
+                self.signals.status("Reload cancelled")
         else:
             self.reloader.schedule(pygame.time.get_ticks() + RELOAD_DEBOUNCE_MS)
-            self.app._status("Reload queued")
+            self.signals.status("Reload queued")
 
     def tick_reload(self, now: int) -> None:
         """Fire the debounced auto-reload once its delay has elapsed (called per frame)."""
@@ -89,28 +91,28 @@ class Models:
 
         Reloading weights takes ~a minute, so it runs off the UI thread; the run loop polls
         :meth:`poll` and swaps the session in when it's done. Play stays disabled and the staged
-        selection is locked (via App._sync_enabled) until then.
+        selection is locked (via the enablement re-sync) until then.
         """
         app = self.app
         if self.reloader.reloading:
             return
         selected = [m for m in AVAILABLE_CLIP_MODELS if m in self.clip_selected]
         if not selected:
-            app._status("Pick a model")
+            self.signals.status("Pick a model")
             return
         cfg = app.session.config
         # Order is irrelevant for the CLIP set (guidance sums over all models), so compare as
         # sets — otherwise a reselection in a different order would look like a change.
         if set(selected) == set(cfg.clip_models) and self.secondary_on == cfg.use_secondary_model:
-            app._status("No change")
+            self.signals.status("No change")
             return
         app.generation.stop()  # the worker holds the old session; tear it down first
         new_cfg = cfg.model_copy(
             update={"clip_models": selected, "use_secondary_model": self.secondary_on}
         )
         self.reloader.start(new_cfg, app.session.device)
-        app._status("Reloading…")
-        app._sync_enabled()
+        self.signals.status("Reloading…")
+        self.signals.invalidate()
 
     def poll(self) -> None:
         """Swap in a reloaded session once the background reload finishes (called per frame)."""
@@ -123,8 +125,8 @@ class Models:
             app._encode_cache.clear()  # embeds came from the old CLIP set — now stale
             self.clip_selected = set(app.session.config.clip_models)
             self.secondary_on = app.session.config.use_secondary_model
-            app._status("Reloaded")
+            self.signals.status("Reloaded")
         else:
-            app._status("Reload failed")  # the traceback was logged by the reload thread
+            self.signals.status("Reload failed")  # the traceback was logged by the reload thread
         app._build_ui()  # rebuild so the advanced controls reflect the (new) session config
-        app._sync_enabled()
+        self.signals.invalidate()

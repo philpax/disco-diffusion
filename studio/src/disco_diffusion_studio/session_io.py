@@ -19,6 +19,7 @@ from PIL import Image
 
 from .controls import PromptRow
 from .presets import HistoryItem, Session, load_session, save_session
+from .signals import Signals
 from .util import surface_to_pil
 from .worker import HistoryEntry, PromptSpec
 
@@ -31,8 +32,9 @@ log = logging.getLogger("disco_diffusion_studio.session_io")
 class SessionIO:
     """Captures / restores the whole working state as a session ``.zip``."""
 
-    def __init__(self, app: App) -> None:
+    def __init__(self, app: App, signals: Signals) -> None:
         self.app = app
+        self.signals = signals
 
     def save(self) -> None:
         """Save the whole working state + result + history to a .zip via the native Save dialog."""
@@ -46,9 +48,9 @@ class SessionIO:
             )
         except Exception as exc:  # noqa: BLE001 - surface the failure instead of crashing
             log.exception("saving session failed")
-            app._status(f"Save failed: {exc}")
+            self.signals.status(f"Save failed: {exc}")
             return
-        app._status(f"Saved session {saved.name}")
+        self.signals.status(f"Saved session {saved.name}")
 
     def load(self) -> None:
         """Load a session .zip via the native Open dialog and apply it (result -> init image)."""
@@ -98,7 +100,7 @@ class SessionIO:
                 for item, preview in history
             ]
         )
-        app._sync_enabled()
+        self.signals.invalidate()
 
     def _current_session(self) -> Session:
         """Capture the whole working state (prompts + output + denoise + recipe) as a Session."""
@@ -156,4 +158,4 @@ class SessionIO:
         app.recipe.selection = app.recipe.detect()
         app.sidebar.spawn_preset_dropdown(app)
         app.generation.run_snapshot = app.sidebar.perrun_values(app)
-        app._status("Session loaded — press Play")
+        self.signals.status("Session loaded — press Play")

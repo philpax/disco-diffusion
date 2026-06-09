@@ -20,6 +20,7 @@ from disco_diffusion.config import AVAILABLE_CLIP_MODELS
 from .controls import CUSTOM_PRESET
 from .layout import CTRL_H, LABEL_H
 from .presets import Preset, PresetConfig, load_presets, match_preset, save_preset
+from .signals import Signals
 
 if TYPE_CHECKING:
     from .app import App
@@ -30,8 +31,9 @@ log = logging.getLogger("disco_diffusion_studio.recipe")
 class Recipe:
     """The loaded presets, the dropdown selection, recipe apply/detect, and the save-as modal."""
 
-    def __init__(self, app: App) -> None:
+    def __init__(self, app: App, signals: Signals) -> None:
         self.app = app
+        self.signals = signals
         # Presets are loaded from studio/presets/*.toml and surfaced as a dropdown that flips to
         # "Custom" once any preset-controlled knob is edited. ``applying`` suppresses that flip
         # while a preset is being applied (so its own widget updates don't read as edits).
@@ -104,7 +106,7 @@ class Recipe:
         # debounce); supersede any pending guidance-drag checkpoint.
         app.history.cancel_guidance_checkpoint()
         app.history.request_checkpoint(f"preset {name}")
-        app._status(f"Loaded {name}")
+        self.signals.status(f"Loaded {name}")
 
     # -- save-as modal --
     def save_modal_alive(self) -> bool:
@@ -155,9 +157,9 @@ class Recipe:
             name, _path = save_preset(filename, self.current())
         except Exception as exc:  # noqa: BLE001 - surface the failure instead of crashing
             log.exception("saving preset failed")
-            self.app._status(f"Save failed: {exc}")
+            self.signals.status(f"Save failed: {exc}")
             return
         self.presets = load_presets()
         self.close_save_dialog()
         self.set_selection(name)
-        self.app._status(f"Saved {name}")
+        self.signals.status(f"Saved {name}")
