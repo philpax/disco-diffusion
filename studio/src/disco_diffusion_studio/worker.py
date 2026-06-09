@@ -12,31 +12,27 @@ import logging
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any, NamedTuple
+from typing import NamedTuple
 
 import numpy as np
 import torch
-from disco_diffusion import DiscoSession, EncodedPrompt
+from disco_diffusion import DiscoSession, EncodedPrompt, Sampler
 from PIL import Image
 
-from .presets import GuidanceSnapshot
+from .presets import GuidanceSnapshot, PromptSpec
 
 log = logging.getLogger("disco_diffusion_studio.worker")
 
 MAX_HISTORY = 60  # cap on edit-history checkpoints (each holds a CPU latent)
 
 
-class PromptSpec(NamedTuple):
-    """One prompt as handed to the worker / stored in a checkpoint.
+class PaintBatch(NamedTuple):
+    """One completed stroke queued for injection: the RGBA paint plus its checkpoint label."""
 
-    A ``NamedTuple`` (not a dataclass) so it stays tuple-compatible — it unpacks as
-    ``text, weight, muted`` and compares equal to a plain 3-tuple — while giving the wire
-    format between the UI and the worker a name and typed fields.
-    """
-
-    text: str
-    weight: float
-    muted: bool
+    rgb: np.ndarray
+    alpha: np.ndarray
+    tint: np.ndarray
+    label: str
 
 
 @dataclass
@@ -53,7 +49,7 @@ class Frame:
 class HistoryEntry:
     """A revertible checkpoint: the latent to resume from, plus a preview + label."""
 
-    latent: Any  # CPU torch tensor (the sampler's latent at `step`)
+    latent: torch.Tensor | None  # CPU latent at `step` (None for loaded-session checkpoints)
     step: int  # internal diffusion step the latent belongs to
     index: int  # display step index when captured
     total: int
@@ -102,14 +98,13 @@ class GenerationWorker(threading.Thread):
 
         self._lock = threading.Lock()
         self._pending: list[PromptSpec] | None = None  # prompts awaiting (re)encode
-        # A FIFO of paint batches (rgb, alpha, tint, label). Each is injected on its own step
-        # with its own checkpoint, so successive strokes stay separate edits in the history
-        # rather than coalescing into one.
-        self._pending_paints: list[tuple[np.ndarray, np.ndarray, np.ndarray, str]] = []
+        # A FIFO of paint batches. Each is injected on its own step with its own checkpoint, so
+        # successive strokes stay separate edits in the history rather than coalescing into one.
+        self._pending_paints: list[PaintBatch] = []
         self._pending_seek: int | None = None  # history index to revert to
         self._checkpoint_label: str | None = None  # request a checkpoint before the next step
         self._frame: Frame | None = None
-        self._sampler: Any = None
+        self._sampler: Sampler | None = None
         self._last_items: list[tuple[EncodedPrompt, float]] = []  # conditioning to re-apply
         self._last_prompts: list[PromptSpec] = []  # (text, weight, muted) shown in the UI
         self.history: list[HistoryEntry] = []
@@ -144,7 +139,7 @@ class GenerationWorker(threading.Thread):
     ) -> None:
         """Queue a paint batch (one completed stroke); injected on its own step."""
         with self._lock:
-            self._pending_paints.append((rgb, alpha, tint, label))
+            self._pending_paints.append(PaintBatch(rgb, alpha, tint, label))
 
     def has_pending_paint(self) -> bool:
         with self._lock:
@@ -176,6 +171,8 @@ class GenerationWorker(threading.Thread):
         return encoded
 
     def _apply_pending(self) -> None:
+        # These run-loop helpers only fire after _start_sampler(), so the sampler is live.
+        assert self._sampler is not None
         with self._lock:
             pending = self._pending
             self._pending = None
@@ -190,6 +187,7 @@ class GenerationWorker(threading.Thread):
         self._sampler.set_conditioning(self._last_items)
 
     def _apply_pending_paint(self) -> None:
+        assert self._sampler is not None
         # Needs a stepped latent to inject into; just after a revert there isn't one yet, so
         # keep the paint pending (don't drop it) until the resumed sampler has produced a step.
         if not self._sampler.has_output:
@@ -198,10 +196,11 @@ class GenerationWorker(threading.Thread):
             if not self._pending_paints:
                 return
             paint = self._pending_paints.pop(0)  # one stroke per step (FIFO)
-        self._sampler.paint(paint[0], paint[1], paint[2])  # injects into the sample, in place
+        self._sampler.paint(paint.rgb, paint.alpha, paint.tint)  # injects into the sample, in place
         self.paint_applied_count += 1
 
     def _add_checkpoint(self, label: str) -> None:
+        assert self._sampler is not None
         state = self._sampler.state()
         pil = self._sampler.current_pil()
         if state is None or pil is None:
@@ -307,6 +306,7 @@ class GenerationWorker(threading.Thread):
         try:
             while not self._stop_event.is_set():
                 self._process_seek()  # revert works while paused, playing, or finished
+                assert self._sampler is not None  # _start_sampler() ran; seek only re-points it
                 if self.finished or not self._resume.is_set():
                     time.sleep(0.03)  # idle (done/paused) but stay responsive to seek/stop
                     continue
@@ -316,7 +316,7 @@ class GenerationWorker(threading.Thread):
                 with self._lock:
                     label = self._checkpoint_label
                     self._checkpoint_label = None
-                    paint_label = self._pending_paints[0][3] if self._pending_paints else None
+                    paint_label = self._pending_paints[0].label if self._pending_paints else None
                 if label is not None or paint_label is not None:
                     self._add_checkpoint(label or paint_label or "paint")
 

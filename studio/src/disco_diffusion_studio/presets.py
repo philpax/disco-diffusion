@@ -3,8 +3,8 @@
 Presets (full one-click recipes: guidance + per-run knobs + cut schedules + the model set) live
 as ``studio/presets/*.toml``; the colour palette and recently-picked colours live in
 ``studio/config.toml``. Keeping them on disk means they can be hand-edited, version-controlled,
-and saved from the UI. Reading uses the stdlib ``tomllib``; writing uses a tiny serialiser below
-(our schema is just scalars, strings, and flat lists — no need for a third-party writer).
+and saved from the UI. Reading uses the stdlib ``tomllib``; writing uses ``tomli_w`` (the standard
+companion to ``tomllib``, which is read-only).
 """
 
 from __future__ import annotations
@@ -14,10 +14,10 @@ import logging
 import re
 import tomllib
 import zipfile
-from collections.abc import Mapping
 from pathlib import Path
-from typing import Any
+from typing import NamedTuple
 
+import tomli_w
 from disco_diffusion import RunConfig
 from disco_diffusion.config import parse_schedule
 from PIL import Image
@@ -35,6 +35,19 @@ CONFIG_PATH = _STUDIO_ROOT / "config.toml"
 MAX_RECENT = 8  # how many recently-picked colours to remember
 
 RGB = tuple[int, int, int]
+
+
+class PromptSpec(NamedTuple):
+    """One prompt as a typed, tuple-compatible triple.
+
+    Lives here (torch-free) so both the session models and the worker share one prompt type; it
+    unpacks as ``text, weight, muted`` and compares equal to a plain 3-tuple, while giving the
+    UI↔worker wire format named, typed fields.
+    """
+
+    text: str
+    weight: float
+    muted: bool
 
 # Seed palette, used only if config.toml is missing/empty (a friendly default spread).
 DEFAULT_PALETTE: list[str] = [
@@ -110,47 +123,6 @@ class ColourConfig(BaseModel):
     recent: list[RGB]
 
 
-# --- tiny TOML writer (our schema only: scalars, strings, flat lists, one table level) --------
-
-
-def _fmt_str(s: str) -> str:
-    return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
-
-
-def _fmt_value(v: object) -> str:
-    if isinstance(v, bool):
-        return "true" if v else "false"
-    if isinstance(v, int):
-        return str(v)
-    if isinstance(v, float):
-        return repr(v)  # repr round-trips floats (e.g. 150.0, 0.05)
-    if isinstance(v, str):
-        return _fmt_str(v)
-    if isinstance(v, dict):  # inline table, e.g. a prompt {text = "...", weight = 1.0, ...}
-        return "{" + ", ".join(f"{k} = {_fmt_value(val)}" for k, val in v.items()) + "}"
-    if isinstance(v, (list, tuple)):
-        return "[" + ", ".join(_fmt_value(x) for x in v) + "]"
-    raise TypeError(f"unsupported TOML value: {v!r}")
-
-
-def _dumps_toml(data: Mapping[str, Any]) -> str:
-    """Serialise a flat dict (scalars/lists at top level, dicts as ``[table]`` sections)."""
-    lines: list[str] = []
-    tables: list[tuple[str, Mapping[str, Any]]] = []
-    for key, value in data.items():
-        if isinstance(value, dict):
-            tables.append((key, value))
-        else:
-            lines.append(f"{key} = {_fmt_value(value)}")
-    for name, table in tables:
-        if lines:
-            lines.append("")
-        lines.append(f"[{name}]")
-        for key, value in table.items():
-            lines.append(f"{key} = {_fmt_value(value)}")
-    return "\n".join(lines) + "\n"
-
-
 # --- presets: load / save ----------------------------------------------------
 
 
@@ -197,7 +169,7 @@ def save_preset(filename: str, preset: Preset) -> tuple[str, Path]:
         },
     }
     PRESETS_DIR.mkdir(parents=True, exist_ok=True)
-    path.write_text(_dumps_toml(data))
+    path.write_text(tomli_w.dumps(data))
     log.info("saved preset %s", path)
     return stem, path
 
@@ -221,7 +193,7 @@ class Session(BaseModel):
     steps: int
     seed: int
     denoise: int  # init-image denoise % to continue the bundled result with
-    prompts: list[tuple[str, float, bool]]  # (text, weight, muted)
+    prompts: list[PromptSpec]
     config: PresetConfig
     clip_models: list[str]
     use_secondary_model: bool
@@ -279,7 +251,7 @@ class _SessionDoc(BaseModel):
             steps=self.output.steps,
             seed=self.output.seed,
             denoise=self.output.denoise,
-            prompts=[(p.text, p.weight, p.muted) for p in self.prompts],
+            prompts=[PromptSpec(p.text, p.weight, p.muted) for p in self.prompts],
             config=self.config,
             clip_models=self.models.clip_models,
             use_secondary_model=self.models.use_secondary_model,
@@ -338,7 +310,7 @@ class HistoryItem(BaseModel):
     step: int
     index: int
     total: int
-    prompts: list[tuple[str, float, bool]] = Field(default_factory=list)
+    prompts: list[PromptSpec] = Field(default_factory=list)
     config: GuidanceSnapshot = Field(default_factory=GuidanceSnapshot)
 
 
@@ -383,7 +355,7 @@ def save_session(
         out = out.with_suffix(".zip")
     out.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr(_SESSION_TOML, _dumps_toml(_SessionDoc.from_session(session).model_dump()))
+        zf.writestr(_SESSION_TOML, tomli_w.dumps(_SessionDoc.from_session(session).model_dump()))
         if image is not None:
             zf.writestr(_SESSION_IMAGE, _png_bytes(image))
         if history:
@@ -452,4 +424,4 @@ def save_colours(colours: ColourConfig) -> None:
         }
     }
     CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    CONFIG_PATH.write_text(_dumps_toml(data))
+    CONFIG_PATH.write_text(tomli_w.dumps(data))

@@ -1272,7 +1272,7 @@ class App:
             steps=self.steps,
             seed=self._seed_for_run(),  # also fills the field with the seed in use
             denoise=self._init_denoise,
-            prompts=[(r.text, r.weight, r.muted) for r in self.prompts],
+            prompts=[PromptSpec(r.text, r.weight, r.muted) for r in self.prompts],
             config=recipe.config,
             clip_models=recipe.clip_models,
             use_secondary_model=recipe.use_secondary_model,
@@ -1294,7 +1294,7 @@ class App:
                     step=e.step,
                     index=e.index,
                     total=e.total,
-                    prompts=[(t, w, m) for t, w, m in e.prompts],
+                    prompts=[PromptSpec(t, w, m) for t, w, m in e.prompts],
                     config=e.config,
                 ),
                 Image.fromarray(e.preview),
