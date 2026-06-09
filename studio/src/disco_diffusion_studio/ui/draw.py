@@ -43,7 +43,7 @@ def _draw(app: App) -> None:
     # the viewport so a zoomed/panned canvas never spills into the panel.
     app.screen.set_clip(app.layout.image_region())
     crect = app.canvas.canvas_screen_rect()
-    surface = app._displayed_surface()
+    surface = app.history.displayed_surface()
     if surface is not None:
         app.canvas.blit(surface)
     elif app._init.surface is not None:
@@ -135,7 +135,7 @@ def _draw_history_ticks(app: App) -> None:
     tl = app._timeline
     if not tl.entries or not app.bottom_bar.history_slider.is_enabled:
         return
-    total = app._history_total()
+    total = app.history.total()
     track = app.bottom_bar.history_slider.rect
     button = getattr(app.bottom_bar.history_slider, "sliding_button", None)
     button_w = button.rect.width if button is not None else 26

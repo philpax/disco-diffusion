@@ -102,7 +102,7 @@ def test_reset_confirm_is_modal_then_clears_frame(app, tmp_path):
     assert app._modal_open()  # confirmation is up
     app._reset_canvas()  # confirm
     assert app.canvas.frame_surface is None
-    assert app._displayed_surface() is None  # so the init preview shows again
+    assert app.history.displayed_surface() is None  # so the init preview shows again
 
 
 def test_worker_forwards_init_to_sampler(worker_factory):

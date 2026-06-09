@@ -118,7 +118,7 @@ class SessionIO:
 
     def _current_image(self) -> Image.Image | None:
         """The rendered result currently on the canvas as a PIL image (for the session zip)."""
-        surface = self.app._displayed_surface()
+        surface = self.app.history.displayed_surface()
         return surface_to_pil(surface) if surface is not None else None
 
     def _history_for_save(self) -> list[tuple[HistoryItem, Image.Image]]:

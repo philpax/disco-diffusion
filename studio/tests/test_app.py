@@ -41,7 +41,7 @@ def test_editing_guidance_marks_custom_and_arms_checkpoint(app):
         pygame.event.Event(pygame_gui.UI_HORIZONTAL_SLIDER_MOVED, ui_element=slider, value=9999.0)
     )
     assert app._preset_selection == A.CUSTOM_PRESET
-    assert app._guidance_checkpoint_at is not None
+    assert app.history.guidance_checkpoint_at is not None
 
 
 def test_apply_preset_sets_guidance_and_requests_checkpoint(app, fake_worker):
@@ -60,9 +60,9 @@ def test_history_snap_picks_nearest_checkpoint(app, fake_worker):
     ]
     # Live is further along than the last checkpoint, as it is mid-run.
     app.worker = fake_worker(latest_frame=lambda: SimpleNamespace(index=95, total=100))
-    assert app._timeline.snap(3.0, app._live_index()) == 0
-    assert app._timeline.snap(58.0, app._live_index()) == 1
-    assert app._timeline.snap(95.0, app._live_index()) is None  # rightmost == live
+    assert app._timeline.snap(3.0, app.history.live_index()) == 0
+    assert app._timeline.snap(58.0, app.history.live_index()) == 1
+    assert app._timeline.snap(95.0, app.history.live_index()) is None  # rightmost == live
 
 
 def test_revert_restores_guidance_and_eta(app, fake_worker):
@@ -243,11 +243,13 @@ def test_loaded_result_is_rightmost_scrubbable_endpoint(app, tmp_path, stub_dial
     app.session_io.load()
     # The result is painted back as a static final frame, and is the timeline's rightmost step.
     assert app.canvas.frame_surface is not None
-    assert app._live_index() == 100  # the run's last step, past the index=40 checkpoint
-    live = app._live_index()
+    assert app.history.live_index() == 100  # the run's last step, past the index=40 checkpoint
+    live = app.history.live_index()
     assert app._timeline.snap(100.0, live) is None  # rightmost snaps to the result (live), no tick
     assert app._timeline.snap(1.0, live) == 0  # earlier scrubbing still reaches the checkpoints
-    assert app._displayed_surface() is app.canvas.frame_surface  # at rest the crisp result shows
+    assert (
+        app.history.displayed_surface() is app.canvas.frame_surface
+    )  # at rest the crisp result shows
 
 
 def test_session_loaded_via_init_button_shows_error(app, tmp_path):
@@ -299,7 +301,7 @@ def test_loaded_revert_continues_via_img2img(app, monkeypatch):
         ),
     ]
     app._timeline.preview_index = 0
-    app._do_revert()  # worker is None -> img2img from the checkpoint preview
+    app.history.revert()  # worker is None -> img2img from the checkpoint preview
     assert started == [True]
     assert app._init.image is not None
     assert app._init.label == "history: prompt"

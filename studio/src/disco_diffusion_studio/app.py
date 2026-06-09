@@ -42,6 +42,7 @@ from .constants import (
     RELOAD_DEBOUNCE_MS,
 )
 from .controls import CUSTOM_PRESET, PromptRow
+from .history import History
 from .init_image import InitImage
 from .layout import (
     CTRL_H,
@@ -79,7 +80,7 @@ from .ui.bottom_bar import BottomBar
 from .ui.canvas import Canvas
 from .ui.sidebar import Sidebar
 from .util import clamp_steps, surface_to_pil
-from .worker import GenerationWorker, HistoryEntry, PromptSpec
+from .worker import GenerationWorker, PromptSpec
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger("disco_diffusion_studio")
@@ -142,6 +143,7 @@ class App:
     sidebar: Sidebar = field(init=False)  # right sidebar: Settings/Current tabs + their widgets
     bottom_bar: BottomBar = field(init=False)  # transport / history / paint tools / prompts
     session_io: SessionIO = field(init=False)  # save/load the working state as a .zip
+    history: History = field(init=False)  # checkpoints / preview scrubbing / undo / revert
 
     def __post_init__(self) -> None:
         self.width = snap_side(self.width)
@@ -226,9 +228,6 @@ class App:
         self._secondary_on: bool = self.session.config.use_secondary_model
         self._reloader = ModelReloader()  # background weight reload + debounced trigger
         self.session_io = SessionIO(self)  # save/load the working state as a .zip
-        # pygame ticks at which to drop a guidance-change checkpoint (set when a guidance slider
-        # moves, pushed back on each further move, fired once the value settles). None = idle.
-        self._guidance_checkpoint_at: int | None = None
         # The preset matching the loaded session (or "Custom"); the dropdown's selected entry.
         self._preset_selection = self._detect_preset()
 
@@ -265,10 +264,10 @@ class App:
 
         # Edit history / revert preview. The Timeline owns the checkpoint list, the preview cursor
         # (None = live frame; an int = previewing that checkpoint non-destructively until Revert),
-        # the Ctrl+Z undo cursor, and the scrub maths. _preview_prompts (the prompt rows shown
-        # while previewing) stays on App, as it's prompt-row UI state.
+        # the Ctrl+Z undo cursor, and the scrub maths. The History controller drives it: checkpoint
+        # requests, preview scrubbing, undo, revert, and the per-frame sync (see history.py).
         self._timeline = Timeline()
-        self._preview_prompts: list[PromptRow] | None = None  # prompts shown while previewing
+        self.history = History(self)
         self.bottom_bar._history_slider_rect = pygame.Rect(0, 0, 10, 10)
         # Fit the canvas to the available area once the real window size is settled. The window
         # manager may resize the window right after it opens (firing a VIDEORESIZE that only
@@ -399,8 +398,8 @@ class App:
         self._preset_selection = name
         # A preset retunes the live guidance, so record a revert point (discrete change — no
         # debounce); supersede any pending guidance-drag checkpoint.
-        self._guidance_checkpoint_at = None
-        self._request_checkpoint(f"preset {name}")
+        self.history.cancel_guidance_checkpoint()
+        self.history.request_checkpoint(f"preset {name}")
         self._status(f"Loaded {name}")
 
     # -- sessions (full working state) --
@@ -729,7 +728,7 @@ class App:
 
     def _use_current_as_init(self) -> None:
         """Seed the next run from whatever is currently on the canvas (live frame or preview)."""
-        surface = self._displayed_surface()
+        surface = self.history.displayed_surface()
         if surface is None:
             self._status("No frame")
             return
@@ -765,128 +764,6 @@ class App:
         self.canvas.clear_frame()
         self.bottom_bar.set_step_label("step 0 / 0")
         self._status("Canvas cleared")
-
-    # -- history / revert --
-    def _request_checkpoint(self, label: str) -> None:
-        if self.worker is not None and self.worker.is_alive():
-            self.worker.checkpoint(label)
-
-    def _set_history_label(self) -> None:
-        e = self._timeline.preview_entry()
-        if e is not None:
-            text = f"{e.label} {e.index}/{e.total}"
-        else:
-            frame = self.worker.latest_frame() if self.worker is not None else None
-            text = f"live {frame.index}/{frame.total}" if frame is not None else "live"
-        self.bottom_bar.set_history_label(text)
-
-    def _sync_preview_prompts(self) -> None:
-        """Show the previewed checkpoint's prompts in the rows (live set when not previewing)."""
-        entry = self._timeline.preview_entry()
-        want: list[PromptSpec] | None = entry.prompts if entry is not None else None
-        cur = (
-            [PromptSpec(p.text, p.weight, p.muted) for p in self._preview_prompts]
-            if self._preview_prompts is not None
-            else None
-        )
-        if (list(want) if want is not None else None) == cur:
-            return  # already showing the right prompts
-        self._preview_prompts = (
-            [PromptRow(t, w, m) for t, w, m in want] if want is not None else None
-        )
-        self.bottom_bar.rebuild_prompt_rows(self)
-        self._sync_enabled()
-
-    def _refresh_preview_state(self) -> None:
-        """Update the prompt rows, label, and Play gating whenever the preview changes."""
-        self._sync_preview_prompts()
-        self._set_history_label()
-        self.bottom_bar.gate_play_for_preview(self._timeline.preview_index is not None)
-
-    def _do_revert(self) -> None:
-        """Branch the run from the previewed checkpoint, restoring its prompts + guidance/eta."""
-        if self._timeline.preview_index is None:
-            return
-        entry = self._timeline.entries[self._timeline.preview_index]
-        if self.worker is None:  # loaded-session history (no latent) -> img2img from its preview
-            self._revert_loaded(entry)
-            return
-        # Adopt the checkpoint's prompts as the live set, then branch from it.
-        self.prompts = [PromptRow(t, w, m) for t, w, m in entry.prompts]
-        # Restore the guidance + eta captured at the checkpoint (undo the changes made since),
-        # syncing the sliders; cancel any pending guidance checkpoint.
-        entry.config.apply_to(self.session.config)
-        self._guidance_checkpoint_at = None
-        self.sidebar.refresh_advanced_widgets(self)
-        self.worker.seek(self._timeline.preview_index)
-        self._timeline.clear_preview()
-        self._preview_prompts = None
-        # Branching drops any in-flight strokes (the worker clears its queue on seek), so reset
-        # the overlay tracking to stay aligned with the worker's apply count.
-        self.canvas.paint.reset_overlays(self.worker.paint_applied_count)
-        # Park the thumb on the checkpoint's actual step now — the worker processes the seek
-        # asynchronously, so _live_index() would still read the stale (forward) live frame here.
-        self.bottom_bar.park_history_thumb(float(entry.index))
-        self.bottom_bar.rebuild_prompt_rows(self)  # now-live (reverted) prompts
-        self._push_prompts()  # apply them to the resumed run
-        self._sync_enabled()  # re-enable prompt editing
-        self._refresh_preview_state()
-
-    def _revert_loaded(self, entry: HistoryEntry) -> None:
-        """Revert into a loaded checkpoint (no latent): continue from its preview via img2img."""
-        self.prompts = [PromptRow(t, w, m) for t, w, m in entry.prompts]
-        entry.config.apply_to(self.session.config)
-        self.sidebar.refresh_advanced_widgets(self)
-        self._set_init_image(Image.fromarray(entry.preview), f"history: {entry.label}")
-        self._timeline.clear_preview()
-        self._preview_prompts = None
-        self.bottom_bar.rebuild_prompt_rows(self)
-        self._start_run()  # seeds the new run from the checkpoint preview (img2img)
-
-    # -- keyboard shortcuts --
-    def _keyboard_revert(self) -> None:
-        """Ctrl+Z: step back through the checkpoints, reverting to each in turn (undo)."""
-        if self.worker is None or self.running or not self._timeline.entries:
-            return
-        self._timeline.begin_undo()
-        self._do_revert()
-
-    def _history_total(self) -> int:
-        """The run's display-step total (the history slider's right edge)."""
-        frame = self.worker.latest_frame() if self.worker is not None else None
-        return self._timeline.total(frame.total if frame is not None else 1)
-
-    def _live_index(self) -> int:
-        """The current live display step (the slider's rightmost snap point)."""
-        frame = self.worker.latest_frame() if self.worker is not None else None
-        if frame is not None:
-            return frame.index
-        entries = self._timeline.entries
-        if self.canvas.frame_surface is not None and entries:
-            # A loaded session's result is a static final frame (no worker): its endpoint is the
-            # run's last step, past every recorded checkpoint, so scrubbing can reach it.
-            return entries[-1].total
-        return entries[-1].index if entries else 0
-
-    def _sync_history(self) -> None:
-        """Pull the worker's history each frame; rebuild the slider when it changes length.
-
-        With no worker we keep the timeline as-is — empty after a stop, or restored from a loaded
-        session (which has no worker until you Play/Revert).
-        """
-        tl = self._timeline
-        if tl.sync(self.worker.get_history() if self.worker is not None else None):
-            self.bottom_bar.rebuild_history_slider(self)
-            self._sync_enabled()
-        elif self.running and tl.preview_index is None and tl.entries:
-            # While actively generating (not previewing), let the thumb track the live step as it
-            # advances. When paused/done we leave it alone so a scrub isn't yanked back each frame.
-            self.bottom_bar.park_history_thumb(float(self._live_index()))
-        self._set_history_label()  # keep the live step current as it ticks
-
-    def _displayed_surface(self) -> pygame.Surface | None:
-        """The canvas surface to show: a previewed checkpoint, else the live frame."""
-        return self._timeline.preview_surface() or self.canvas.frame_surface
 
     # -- events --
     def _handle_event(self, event: pygame.event.Event) -> bool:
@@ -968,12 +845,7 @@ class App:
                 self._reloader.cancel()  # clear the debounce; _start_reload re-validates the change
                 self._start_reload()
             # Drop a "guidance" checkpoint once a guidance slider has settled (no-op if no run).
-            if (
-                self._guidance_checkpoint_at is not None
-                and pygame.time.get_ticks() >= self._guidance_checkpoint_at
-            ):
-                self._guidance_checkpoint_at = None
-                self._request_checkpoint("guidance")
+            self.history.tick_guidance_checkpoint(pygame.time.get_ticks())
             # When the run finishes (worker idles) or exits unexpectedly, drop to a paused
             # state so controls/history are usable and the image can still be reverted.
             wk = self.worker
@@ -992,7 +864,7 @@ class App:
             self.bottom_bar.refresh_rows(self)
             self.sidebar.refresh_current(self)  # keep the "Current" sidebar tab in sync
             self.canvas.paint.sync(self.worker)
-            self._sync_history()
+            self.history.sync()
             self.canvas.update_frame_surface()
             self.manager.update(dt)
             self._draw()

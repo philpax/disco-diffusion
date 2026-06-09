@@ -109,7 +109,7 @@ def _handle_event(app: App, event: pygame.event.Event) -> bool:
             if event.key == pygame.K_s:
                 app._save_image()
             elif event.key == pygame.K_z:
-                app._keyboard_revert()
+                app.history.keyboard_revert()
         elif event.key == pygame.K_SPACE:
             app._toggle_play()
         elif event.key == pygame.K_f:

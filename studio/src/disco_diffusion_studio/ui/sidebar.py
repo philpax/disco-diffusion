@@ -530,7 +530,9 @@ class Sidebar:
                 vlabel.set_text(fmt.format(value))
                 app._mark_custom()
                 # Drop a revert point once the drag settles (debounced in run()).
-                app._guidance_checkpoint_at = pygame.time.get_ticks() + GUIDANCE_CHECKPOINT_MS
+                app.history.arm_guidance_checkpoint(
+                    pygame.time.get_ticks() + GUIDANCE_CHECKPOINT_MS
+                )
             else:
                 return False
             return True

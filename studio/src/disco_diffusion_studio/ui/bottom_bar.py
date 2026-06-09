@@ -103,8 +103,8 @@ class BottomBar:
         # thumb position matches its actual progress; drags snap to the nearest checkpoint.
         self.history_slider = ui.UIHorizontalSlider(
             self._history_slider_rect,
-            start_value=app._timeline.slider_start(app._live_index()),
-            value_range=(0.0, float(max(app._history_total(), 1))),
+            start_value=app._timeline.slider_start(app.history.live_index()),
+            value_range=(0.0, float(max(app.history.total(), 1))),
             manager=app.manager,
         )
 
@@ -184,7 +184,9 @@ class BottomBar:
 
     def displayed_prompts(self, app: App) -> list[PromptRow]:
         """The prompts shown in the rows: a previewed checkpoint's, else the live set."""
-        return app._preview_prompts if app._preview_prompts is not None else app.prompts
+        return (
+            app.history.preview_prompts if app.history.preview_prompts is not None else app.prompts
+        )
 
     def rebuild_prompt_rows(self, app: App) -> None:
         for el in self._row_elements:
@@ -291,14 +293,14 @@ class BottomBar:
                 app.prompts.append(PromptRow("", 1.0))
                 self.rebuild_prompt_rows(app)
                 app._push_prompts()
-                app._request_checkpoint("add prompt")
+                app.history.request_checkpoint("add prompt")
             elif e in self._remove_buttons:
                 idx = self._remove_buttons[e]
                 if 0 <= idx < len(app.prompts):
                     app.prompts.pop(idx)
                     self.rebuild_prompt_rows(app)
                     app._push_prompts()
-                    app._request_checkpoint("remove prompt")
+                    app.history.request_checkpoint("remove prompt")
             elif e in self._mute_buttons:
                 idx = self._mute_buttons[e]
                 if 0 <= idx < len(app.prompts):
@@ -307,7 +309,9 @@ class BottomBar:
                     (e.select if prompt.muted else e.unselect)()
                     self.refresh_rows(app)
                     app._push_prompts()  # re-mix conditioning (muted excluded)
-                    app._request_checkpoint("mute prompt" if prompt.muted else "unmute prompt")
+                    app.history.request_checkpoint(
+                        "mute prompt" if prompt.muted else "unmute prompt"
+                    )
             elif e in self._brush_buttons:
                 app.brush.type = self._brush_buttons[e]
                 for button, name in self._brush_buttons.items():
@@ -318,11 +322,11 @@ class BottomBar:
             elif e == self.clear_paint_button:
                 app.canvas.paint.layer.clear()
             elif e == self.revert_button:
-                app._do_revert()
+                app.history.revert()
             elif e == self.cancel_button:
                 app._timeline.clear_preview()
-                self.park_history_thumb(float(app._live_index()))
-                app._refresh_preview_state()
+                self.park_history_thumb(float(app.history.live_index()))
+                app.history.refresh_preview_state()
             else:
                 return False
             return True
@@ -335,9 +339,9 @@ class BottomBar:
             elif e == self.history_slider:
                 # Step-space slider: snap the dragged value to the nearest checkpoint (or live)
                 # and park the thumb on that checkpoint's actual step position.
-                snapped = app._timeline.scrub(float(event.value), app._live_index())
+                snapped = app._timeline.scrub(float(event.value), app.history.live_index())
                 self.park_history_thumb(snapped)
-                app._refresh_preview_state()
+                app.history.refresh_preview_state()
             elif e in self._weight_sliders:
                 idx = self._weight_sliders[e]
                 if 0 <= idx < len(app.prompts):
@@ -401,7 +405,7 @@ class BottomBar:
         app.prompts[idx].text = entry.get_text()
         self.refresh_rows(app)
         app._push_prompts()
-        app._request_checkpoint("prompt")
+        app.history.request_checkpoint("prompt")
 
     def set_history_label(self, text: str) -> None:
         """Set the history readout (live / previewed checkpoint); skips a no-op re-render."""
@@ -421,8 +425,8 @@ class BottomBar:
         self.history_slider.kill()
         self.history_slider = pygame_gui.elements.UIHorizontalSlider(
             self._history_slider_rect,
-            start_value=app._timeline.slider_start(app._live_index()),
-            value_range=(0.0, float(max(app._history_total(), 1))),
+            start_value=app._timeline.slider_start(app.history.live_index()),
+            value_range=(0.0, float(max(app.history.total(), 1))),
             manager=app.manager,
         )
 
