@@ -36,7 +36,7 @@ def test_opens_on_default_preset(app):
 
 
 def test_editing_guidance_marks_custom_and_arms_checkpoint(app):
-    slider = next(iter(app._scale_sliders))
+    slider = next(iter(app.sidebar._scale_sliders))
     app._handle_event(
         pygame.event.Event(pygame_gui.UI_HORIZONTAL_SLIDER_MOVED, ui_element=slider, value=9999.0)
     )
@@ -69,7 +69,12 @@ def test_revert_restores_guidance_and_eta(app, fake_worker):
     img = np.zeros((4, 4, 3), np.uint8)
     app._timeline.entries = [
         HistoryEntry(
-            latent=None, step=0, index=5, total=100, preview=img, label="start",
+            latent=None,
+            step=0,
+            index=5,
+            total=100,
+            preview=img,
+            label="start",
             prompts=[PromptSpec(text="a prompt", weight=1.0, muted=False)],
             config=GuidanceSnapshot(clip_guidance_scale=5000, eta=0.8),
         )
@@ -79,7 +84,9 @@ def test_revert_restores_guidance_and_eta(app, fake_worker):
     app.worker = fake_worker()
     app.session.config.clip_guidance_scale = 20000  # diverge from the checkpoint
     app.session.config.eta = 0.2
-    revert = pygame.event.Event(pygame_gui.UI_BUTTON_PRESSED, ui_element=app.revert_button)
+    revert = pygame.event.Event(
+        pygame_gui.UI_BUTTON_PRESSED, ui_element=app.bottom_bar.revert_button
+    )
     app._handle_event(revert)
     assert app.session.config.clip_guidance_scale == 5000
     assert app.session.config.eta == 0.8  # eta restored, not just the live guidance scales
@@ -91,14 +98,14 @@ def test_modal_blocks_canvas_painting(app):
     app._handle_event(
         pygame.event.Event(pygame.MOUSEBUTTONDOWN, button=1, pos=app._image_region().center)
     )
-    assert app._paint.painting is False
-    assert app._paint.layer.empty()
+    assert app.canvas.paint.painting is False
+    assert app.canvas.paint.layer.empty()
 
 
 def test_picked_colour_is_remembered(app):
     before = len(app._palette.recent)
     app._apply_picked_colour((1, 2, 3))
-    assert app.brush_color == (1, 2, 3)
+    assert app.brush.color == (1, 2, 3)
     assert (1, 2, 3) in app._palette.recent and len(app._palette.recent) == before + 1
     # a palette colour is already shown, so it doesn't earn a recents slot
     after_custom = len(app._palette.recent)
@@ -109,7 +116,7 @@ def test_picked_colour_is_remembered(app):
 def test_mute_button_toggles_and_excludes_from_snapshot(app):
     app.prompts = [A.PromptRow("a", 1.0), A.PromptRow("b", 1.0)]
     app._rebuild_prompt_rows()
-    mute_btn = next(b for b, i in app._mute_buttons.items() if i == 1)
+    mute_btn = next(b for b, i in app.bottom_bar._mute_buttons.items() if i == 1)
     app._handle_event(pygame.event.Event(pygame_gui.UI_BUTTON_PRESSED, ui_element=mute_btn))
     assert app.prompts[1].muted is True
     # the snapshot carries the muted flag (so the worker excludes it but checkpoints keep it)
@@ -122,59 +129,61 @@ def test_mute_button_toggles_and_excludes_from_snapshot(app):
 
 
 def test_seed_for_run_random_fills_field(app):
-    app.seed_entry.set_text("")
+    app.sidebar.seed_entry.set_text("")
     seed = app._seed_for_run()
     assert 0 <= seed < 2**31
-    assert app.seed_entry.get_text() == str(seed)  # the used seed is shown (reproducible)
+    assert app.sidebar.seed_entry.get_text() == str(seed)  # the used seed is shown (reproducible)
 
 
 def test_seed_field_is_populated_on_startup(app):
-    assert app.seed_entry.get_text().isdigit()  # always shows a concrete seed, not empty
+    assert app.sidebar.seed_entry.get_text().isdigit()  # always shows a concrete seed, not empty
 
 
 def test_seed_for_run_uses_typed_value_and_is_stable_on_replay(app):
-    app.seed_entry.set_text("12345")
+    app.sidebar.seed_entry.set_text("12345")
     assert app._seed_for_run() == 12345
     assert app._seed_for_run() == 12345  # replaying reuses the same seed (continuity)
 
 
 def test_seed_for_run_invalid_is_randomised(app):
-    app.seed_entry.set_text("not-a-number")
+    app.sidebar.seed_entry.set_text("not-a-number")
     seed = app._seed_for_run()
-    assert app.seed_entry.get_text() == str(seed)  # replaced with a real (random) seed
+    assert app.sidebar.seed_entry.get_text() == str(seed)  # replaced with a real (random) seed
 
 
 def test_random_seed_button_rerolls_to_a_new_seed(app):
-    app.seed_entry.set_text("999")
+    app.sidebar.seed_entry.set_text("999")
     app._handle_event(
-        pygame.event.Event(pygame_gui.UI_BUTTON_PRESSED, ui_element=app.random_seed_button)
+        pygame.event.Event(pygame_gui.UI_BUTTON_PRESSED, ui_element=app.sidebar.random_seed_button)
     )
-    assert app.seed_entry.get_text().isdigit()
-    assert app.seed_entry.get_text() != "999"
+    assert app.sidebar.seed_entry.get_text().isdigit()
+    assert app.sidebar.seed_entry.get_text() != "999"
 
 
 def test_session_save_load_round_trip(app, tmp_path, stub_dialogs):
     archive = tmp_path / "sess.zip"
     stub_dialogs(save=archive, open=archive)
-    app._frame_surface = pygame.Surface((app.width, app.height))  # a rendered result to bundle
-    app._frame_surface.fill((20, 180, 90))
+    app.canvas.frame_surface = pygame.Surface(
+        (app.width, app.height)
+    )  # a rendered result to bundle
+    app.canvas.frame_surface.fill((20, 180, 90))
     app.prompts = [A.PromptRow("castle", 1.3, False), A.PromptRow("bg", 0.4, True)]
     app.steps = 137
-    app.seed_entry.set_text("424242")
+    app.sidebar.seed_entry.set_text("424242")
     app._init.denoise = 35
     app.session.config.clip_guidance_scale = 9999
     app._save_session()
     assert archive.exists()
     # mutate everything, then load the session back
     app.steps = 50
-    app.seed_entry.set_text("1")
+    app.sidebar.seed_entry.set_text("1")
     app._init.denoise = 90
     app.session.config.clip_guidance_scale = 100
     app.prompts = [A.PromptRow("x", 1.0)]
     app._init.image = None
     app._load_session()
     assert app.steps == 137
-    assert app.seed_entry.get_text() == "424242"
+    assert app.sidebar.seed_entry.get_text() == "424242"
     assert app._init.denoise == 35
     assert app.session.config.clip_guidance_scale == 9999
     restored = [(r.text, r.weight, r.muted) for r in app.prompts]
@@ -188,12 +197,26 @@ def test_session_restores_scrubbable_history(app, tmp_path, stub_dialogs):
     stub_dialogs(save=archive, open=archive)
     img = np.full((app.height, app.width, 3), 7, np.uint8)
     app._timeline.entries = [
-        HistoryEntry(latent=None, step=0, index=1, total=100, preview=img, label="start",
-                     prompts=[PromptSpec("a", 1.0, False)],
-                     config=GuidanceSnapshot(clip_guidance_scale=5000)),
-        HistoryEntry(latent=None, step=0, index=40, total=100, preview=img, label="paint soft 48px",
-                     prompts=[PromptSpec("a", 1.0, False)],
-                     config=GuidanceSnapshot(clip_guidance_scale=9000)),
+        HistoryEntry(
+            latent=None,
+            step=0,
+            index=1,
+            total=100,
+            preview=img,
+            label="start",
+            prompts=[PromptSpec("a", 1.0, False)],
+            config=GuidanceSnapshot(clip_guidance_scale=5000),
+        ),
+        HistoryEntry(
+            latent=None,
+            step=0,
+            index=40,
+            total=100,
+            preview=img,
+            label="paint soft 48px",
+            prompts=[PromptSpec("a", 1.0, False)],
+            config=GuidanceSnapshot(clip_guidance_scale=9000),
+        ),
     ]
     app._save_session()
     app._timeline.entries = []
@@ -207,22 +230,24 @@ def test_loaded_result_is_rightmost_scrubbable_endpoint(app, tmp_path, stub_dial
     archive = tmp_path / "s.zip"
     stub_dialogs(save=archive, open=archive)
     img = np.full((app.height, app.width, 3), 7, np.uint8)
-    app._frame_surface = pygame.Surface((app.width, app.height))  # a finished result on the canvas
-    app._frame_surface.fill((9, 9, 9))
+    app.canvas.frame_surface = pygame.Surface(
+        (app.width, app.height)
+    )  # a finished result on the canvas
+    app.canvas.frame_surface.fill((9, 9, 9))
     app._timeline.entries = [
         HistoryEntry(latent=None, step=0, index=1, total=100, preview=img, label="start"),
         HistoryEntry(latent=None, step=0, index=40, total=100, preview=img, label="paint"),
     ]
     app._save_session()
-    app._frame_surface, app._timeline.entries = None, []
+    app.canvas.frame_surface, app._timeline.entries = None, []
     app._load_session()
     # The result is painted back as a static final frame, and is the timeline's rightmost step.
-    assert app._frame_surface is not None
+    assert app.canvas.frame_surface is not None
     assert app._live_index() == 100  # the run's last step, past the index=40 checkpoint
     live = app._live_index()
     assert app._timeline.snap(100.0, live) is None  # rightmost snaps to the result (live), no tick
     assert app._timeline.snap(1.0, live) == 0  # earlier scrubbing still reaches the checkpoints
-    assert app._displayed_surface() is app._frame_surface  # at rest the crisp result shows
+    assert app._displayed_surface() is app.canvas.frame_surface  # at rest the crisp result shows
 
 
 def test_session_loaded_via_init_button_shows_error(app, tmp_path):
@@ -263,7 +288,12 @@ def test_loaded_revert_continues_via_img2img(app, monkeypatch):
     app.worker = None
     app._timeline.entries = [
         HistoryEntry(
-            latent=None, step=0, index=10, total=100, preview=img, label="prompt",
+            latent=None,
+            step=0,
+            index=10,
+            total=100,
+            preview=img,
+            label="prompt",
             prompts=[PromptSpec("castle", 1.0, False)],
             config=GuidanceSnapshot(clip_guidance_scale=3333),
         ),
@@ -281,15 +311,17 @@ def test_panel_height_clamps(app):
     app._set_panel_height(10**6)
     assert app._image_area_h() >= A.MIN_IMAGE_H
     app._set_panel_height(0)
-    assert app.panel_h == A.PANEL_MIN
+    assert app.layout.panel_h == A.PANEL_MIN
 
 
 def test_history_tick_colours_by_kind():
+    from disco_diffusion_studio.theme import MUTED_COLOR, PENDING_COLOR
+
     paint = Timeline.tick_colour("paint soft 48px")
     assert paint[1] > paint[0] and paint[1] > paint[2]  # green-dominant
-    assert Timeline.tick_colour("guidance") == A.PENDING_COLOR
-    assert Timeline.tick_colour("preset 2022 sauce") != A.MUTED_COLOR
-    assert Timeline.tick_colour("start") == A.MUTED_COLOR
+    assert Timeline.tick_colour("guidance") == PENDING_COLOR
+    assert Timeline.tick_colour("preset 2022 sauce") != MUTED_COLOR
+    assert Timeline.tick_colour("start") == MUTED_COLOR
 
 
 def test_loading_screen_returns_true_when_done(app):
@@ -310,7 +342,7 @@ def _key(key, mod=0):
 def test_ctrl_s_saves_via_native_dialog(app, tmp_path, stub_dialogs):
     out = tmp_path / "saved.png"
     stub_dialogs(save=out)
-    app._frame_surface = pygame.Surface((app.width, app.height))
+    app.canvas.frame_surface = pygame.Surface((app.width, app.height))
     app._handle_event(_key(pygame.K_s, pygame.KMOD_CTRL))
     assert out.exists()  # the frame was written to the path the native dialog returned
 
@@ -320,30 +352,35 @@ def test_save_image_reports_when_no_backend(app, monkeypatch):
         raise A.native_dialog.Unavailable("no backend")
 
     monkeypatch.setattr(A.native_dialog, "save_file", _unavailable)
-    app._frame_surface = pygame.Surface((app.width, app.height))
+    app.canvas.frame_surface = pygame.Surface((app.width, app.height))
     app._save_image()
-    assert "native dialog" in app.status_label.text.lower()
+    assert "native dialog" in app.bottom_bar.status_label.text.lower()
 
 
 def test_bracket_keys_change_brush_size(app):
-    app.brush_size = 48.0
+    app.brush.size = 48.0
     app._handle_event(_key(pygame.K_RIGHTBRACKET))
-    assert app.brush_size > 48.0
-    app.brush_size = 48.0
+    assert app.brush.size > 48.0
+    app.brush.size = 48.0
     app._handle_event(_key(pygame.K_LEFTBRACKET))
-    assert app.brush_size < 48.0
+    assert app.brush.size < 48.0
 
 
 def test_digit_selects_palette_colour(app):
     app._handle_event(_key(pygame.K_3))
-    assert app.brush_color == app._palette.swatches()[2]
+    assert app.brush.color == app._palette.swatches()[2]
 
 
 def test_ctrl_z_reverts_to_latest_checkpoint(app, fake_worker):
     img = np.zeros((4, 4, 3), np.uint8)
     app._timeline.entries = [
         HistoryEntry(
-            latent=None, step=0, index=5, total=100, preview=img, label="start",
+            latent=None,
+            step=0,
+            index=5,
+            total=100,
+            preview=img,
+            label="start",
             prompts=[PromptSpec(text="p", weight=1.0, muted=False)],
             config=GuidanceSnapshot(clip_guidance_scale=5000),
         )
@@ -361,19 +398,33 @@ def test_ctrl_z_reverts_to_latest_checkpoint(app, fake_worker):
 def test_ctrl_z_walks_back_through_history(app, fake_worker):
     img = np.zeros((4, 4, 3), np.uint8)
     app._timeline.entries = [
-        HistoryEntry(latent=None, step=0, index=2, total=100, preview=img, label="start",
-                     prompts=[PromptSpec(text="p", weight=1.0, muted=False)],
-                     config=GuidanceSnapshot()),
-        HistoryEntry(latent=None, step=0, index=20, total=100, preview=img, label="prompt",
-                     prompts=[PromptSpec(text="p", weight=1.0, muted=False)],
-                     config=GuidanceSnapshot()),
+        HistoryEntry(
+            latent=None,
+            step=0,
+            index=2,
+            total=100,
+            preview=img,
+            label="start",
+            prompts=[PromptSpec(text="p", weight=1.0, muted=False)],
+            config=GuidanceSnapshot(),
+        ),
+        HistoryEntry(
+            latent=None,
+            step=0,
+            index=20,
+            total=100,
+            preview=img,
+            label="prompt",
+            prompts=[PromptSpec(text="p", weight=1.0, muted=False)],
+            config=GuidanceSnapshot(),
+        ),
     ]
     app._timeline.hist_len = 2
     seeked = []
 
     def seek(i):
         seeked.append(i)
-        del app._timeline.entries[i + 1:]  # mimic the worker's branch-truncation on seek
+        del app._timeline.entries[i + 1 :]  # mimic the worker's branch-truncation on seek
 
     app.worker = fake_worker(finished=True, seek=seek)
     app.paused = True

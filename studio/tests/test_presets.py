@@ -52,9 +52,14 @@ def test_preset_config_fields_are_runconfig_fields():
 def _session(**overrides):
     default = P.load_presets()["Default"]
     base = dict(
-        width=1280, height=768, steps=120, seed=42, denoise=60,
+        width=1280,
+        height=768,
+        steps=120,
+        seed=42,
+        denoise=60,
         prompts=[("a vast landscape", 1.0, False), ("yellow", 0.5, True)],
-        config=default.config, clip_models=default.clip_models,
+        config=default.config,
+        clip_models=default.clip_models,
         use_secondary_model=default.use_secondary_model,
     )
     return P.Session(**{**base, **overrides})
@@ -77,8 +82,12 @@ def test_session_bundles_and_restores_result_image(tmp_path):
 
 def test_session_bundles_and_restores_history(tmp_path):
     item = P.HistoryItem(
-        label="paint soft", step=3, index=8, total=20,
-        prompts=[("a", 1.0, False)], config=P.GuidanceSnapshot(clip_guidance_scale=7000),
+        label="paint soft",
+        step=3,
+        index=8,
+        total=20,
+        prompts=[("a", 1.0, False)],
+        config=P.GuidanceSnapshot(clip_guidance_scale=7000),
     )
     history = [(item, Image.new("RGB", (16, 12), (200, 100, 50)))]
     out = P.save_session(str(tmp_path / "s.zip"), _session(), None, history)

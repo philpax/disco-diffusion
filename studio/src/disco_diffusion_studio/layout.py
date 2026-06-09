@@ -7,6 +7,8 @@ UI therefore re-flows for any window width.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import pygame
 
 # Layout tokens (sizes only — positions come from the flow layout).
@@ -46,6 +48,80 @@ def snap_side(value: int) -> int:
     """Snap a dimension to a multiple of 64, clamped to [MIN_SIDE, MAX_SIDE]."""
     snapped = round(value / 64) * 64
     return max(MIN_SIDE, min(MAX_SIDE, snapped))
+
+
+@dataclass
+class Layout:
+    """Window geometry: the split between the left column (image + bottom panel) and the right
+    sidebar, derived from the window size and the two user-draggable divider positions.
+
+    Pure rect maths over four numbers; the setters clamp and report whether anything changed, and
+    the App owns the side effects (queueing a relayout). The screen origin is the window top-left.
+    """
+
+    win_w: int
+    win_h: int
+    sidebar_w: int  # right sidebar width (draggable)
+    panel_h: int  # bottom-panel height (draggable)
+
+    def panel_w(self) -> int:
+        """Width of the left column (image + bottom panel) — everything left of the sidebar."""
+        return max(MIN_LEFT_PANEL_W, self.win_w - self.sidebar_w)
+
+    def divider_x(self) -> int:
+        """The x of the draggable divider between the left column and the sidebar."""
+        return self.panel_w()
+
+    def image_area_h(self) -> int:
+        """Height of the image area (the bottom panel sits below it)."""
+        return max(0, self.win_h - self.panel_h)
+
+    def sidebar_rect(self) -> pygame.Rect:
+        x = self.panel_w() + DIVIDER_W
+        return pygame.Rect(x, 0, max(0, self.win_w - x), self.win_h)
+
+    def bottom_panel_rect(self) -> pygame.Rect:
+        return pygame.Rect(0, self.image_area_h(), self.panel_w(), self.panel_h)
+
+    def image_region(self) -> pygame.Rect:
+        """The screen area the canvas viewport occupies (above the panel, left of the sidebar)."""
+        return pygame.Rect(0, 0, self.panel_w(), self.image_area_h())
+
+    def window_size(self) -> tuple[int, int]:
+        return (self.win_w, self.win_h)
+
+    def centered_rect(self, w: int, h: int) -> pygame.Rect:
+        """A ``w``x``h`` rect centred in the window (for modal dialogs)."""
+        rect = pygame.Rect(0, 0, w, h)
+        rect.center = (self.win_w // 2, self.win_h // 2)
+        return rect
+
+    def set_panel_height(self, height: int) -> bool:
+        """Set the bottom-panel height (clamped). Returns True if it changed."""
+        max_h = max(PANEL_MIN, self.win_h - MIN_IMAGE_H)
+        new_h = max(PANEL_MIN, min(max_h, int(height)))
+        changed = new_h != self.panel_h
+        self.panel_h = new_h
+        return changed
+
+    def set_sidebar_width(self, width: int) -> bool:
+        """Set the sidebar width (clamped). Returns True if it changed."""
+        max_w = max(SIDEBAR_W_MIN, min(SIDEBAR_W_MAX, self.win_w - MIN_LEFT_PANEL_W - DIVIDER_W))
+        new_w = max(SIDEBAR_W_MIN, min(max_w, int(width)))
+        changed = new_w != self.sidebar_w
+        self.sidebar_w = new_w
+        return changed
+
+    def resize(self, w: int, h: int) -> bool:
+        """Adopt a new window size, keeping the sidebar + panel within it. False if unchanged."""
+        if (w, h) == (self.win_w, self.win_h):
+            return False
+        self.win_w, self.win_h = w, h
+        self.sidebar_w = max(
+            SIDEBAR_W_MIN, min(self.sidebar_w, self.win_w - MIN_LEFT_PANEL_W - DIVIDER_W)
+        )
+        self.panel_h = max(PANEL_MIN, min(self.panel_h, self.win_h - MIN_IMAGE_H))
+        return True
 
 
 class Row:

@@ -11,10 +11,12 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, NamedTuple
+from typing import TYPE_CHECKING
 
 import numpy as np
 import pygame
+
+from .constants import BRUSH_SIZE_MAX, BRUSH_SIZE_MIN, BRUSH_STRENGTH_MAX, BRUSH_STRENGTH_MIN
 
 if TYPE_CHECKING:
     from .worker import GenerationWorker
@@ -28,14 +30,27 @@ NOISE_MAX_INJECT = 0.2
 NOISE_OPACITY_GAMMA = 2.0
 
 
-class Brush(NamedTuple):
-    """The parameters one stroke is painted with (a snapshot of the App's brush state)."""
+@dataclass
+class Brush:
+    """The mutable brush state: kind, size (radius px), opacity, colour, and noise mode.
 
-    type: str
-    size: float
-    strength: float
-    color: tuple[int, int, int]
-    noise: bool
+    Passed to :class:`PaintController` to paint a stroke; the size/opacity nudges clamp to the
+    slider bounds. ``color`` is shared with the palette (swatch / picker selections set it here).
+    """
+
+    type: str = "Soft"
+    size: float = 48.0
+    strength: float = 0.7
+    color: tuple[int, int, int] = (255, 255, 255)
+    noise: bool = False  # paint fresh tinted noise (new structure) vs plain colour
+
+    def nudge_size(self, factor: float) -> None:
+        """Scale the radius by ``factor``, clamped to the brush-size bounds."""
+        self.size = max(BRUSH_SIZE_MIN, min(BRUSH_SIZE_MAX, self.size * factor))
+
+    def nudge_strength(self, delta: float) -> None:
+        """Shift the opacity by ``delta``, clamped to the brush-strength bounds."""
+        self.strength = max(BRUSH_STRENGTH_MIN, min(BRUSH_STRENGTH_MAX, self.strength + delta))
 
 
 class PaintLayer:

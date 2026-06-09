@@ -49,6 +49,7 @@ class PromptSpec(NamedTuple):
     weight: float
     muted: bool
 
+
 # Seed palette, used only if config.toml is missing/empty (a friendly default spread).
 DEFAULT_PALETTE: list[str] = [
     "#000000",
@@ -257,9 +258,7 @@ class _SessionDoc(BaseModel):
                 width=s.width, height=s.height, steps=s.steps, seed=s.seed, denoise=s.denoise
             ),
             config=s.config,
-            models=_ModelsDoc(
-                clip_models=s.clip_models, use_secondary_model=s.use_secondary_model
-            ),
+            models=_ModelsDoc(clip_models=s.clip_models, use_secondary_model=s.use_secondary_model),
         )
 
     def to_session(self) -> Session:
@@ -311,7 +310,6 @@ class GuidanceSnapshot(BaseModel):
 _UNKNOWN_SNAPSHOT_FIELDS = sorted(set(GuidanceSnapshot.model_fields) - set(RunConfig.model_fields))
 if _UNKNOWN_SNAPSHOT_FIELDS:
     raise RuntimeError(f"GuidanceSnapshot fields not on RunConfig: {_UNKNOWN_SNAPSHOT_FIELDS}")
-
 
 
 class HistoryItem(BaseModel):

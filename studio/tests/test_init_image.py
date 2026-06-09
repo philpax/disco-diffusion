@@ -44,7 +44,7 @@ def test_no_init_means_zero_skip(app):
 def test_use_current_result_as_init(app):
     frame = pygame.Surface((app.width, app.height))
     frame.fill((10, 200, 50))
-    app._frame_surface = frame
+    app.canvas.frame_surface = frame
     app._use_current_as_init()
     assert app._init.image is not None
     assert app._init.label == "current result"
@@ -53,7 +53,9 @@ def test_use_current_result_as_init(app):
 def test_denoise_slider_updates_value(app):
     app._handle_event(
         pygame.event.Event(
-            pygame_gui.UI_HORIZONTAL_SLIDER_MOVED, ui_element=app._init_denoise_slider, value=25.0
+            pygame_gui.UI_HORIZONTAL_SLIDER_MOVED,
+            ui_element=app.sidebar._init_denoise_slider,
+            value=25.0,
         )
     )
     assert app._init.denoise == 25
@@ -87,11 +89,11 @@ def test_reset_with_nothing_to_clear_opens_no_dialog(app):
 
 def test_reset_confirm_is_modal_then_clears_frame(app, tmp_path):
     app._load_init_file(str(_png(tmp_path)))
-    app._frame_surface = pygame.Surface((app.width, app.height))  # a "rendered" frame
+    app.canvas.frame_surface = pygame.Surface((app.width, app.height))  # a "rendered" frame
     app._open_reset_confirm()
     assert app._modal_open()  # confirmation is up
     app._reset_canvas()  # confirm
-    assert app._frame_surface is None
+    assert app.canvas.frame_surface is None
     assert app._displayed_surface() is None  # so the init preview shows again
 
 
