@@ -101,3 +101,33 @@ def test_load_session_validates_malformed_toml(tmp_path):
         zf.writestr("session.toml", "[output]\nwidth = 64\nheight = 64\nsteps = 10\nseed = 1\n")
     with pytest.raises(ValidationError):
         P.load_session(str(bad))
+
+
+def test_preset_config_from_run_config_captures_and_coerces():
+    cfg = RunConfig()
+    pc = P.PresetConfig.from_run_config(cfg)
+    assert pc.clip_guidance_scale == cfg.clip_guidance_scale
+    assert isinstance(pc.clip_guidance_scale, int)
+    assert pc.eta == cfg.eta
+    assert pc.cut_overview == cfg.cut_overview  # schedule strings preserved
+
+
+def _recipe(clip=("ViT-B/32",), secondary=False) -> P.Preset:
+    return P.Preset(
+        config=P.PresetConfig.from_run_config(RunConfig()),
+        clip_models=list(clip),
+        use_secondary_model=secondary,
+    )
+
+
+def test_preset_matches_is_clip_order_insensitive():
+    base = _recipe(clip=("A", "B"))
+    assert base.matches(_recipe(clip=("B", "A")))  # CLIP set order doesn't matter
+    assert not base.matches(_recipe(clip=("A",)))  # different model set
+    assert not base.matches(_recipe(clip=("A", "B"), secondary=True))  # secondary differs
+
+
+def test_match_preset_finds_by_recipe_else_none():
+    presets = {"x": _recipe(clip=("A",)), "y": _recipe(clip=("B",))}
+    assert P.match_preset(presets, _recipe(clip=("B",))) == "y"
+    assert P.match_preset(presets, _recipe(clip=("C",))) is None

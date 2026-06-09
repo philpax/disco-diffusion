@@ -96,6 +96,11 @@ class PresetConfig(BaseModel):
         parse_schedule(value)  # raises on a malformed schedule string
         return value
 
+    @classmethod
+    def from_run_config(cls, config: RunConfig) -> PresetConfig:
+        """Capture the preset-controlled fields off a live RunConfig (pydantic coerces types)."""
+        return cls(**{f: getattr(config, f) for f in cls.model_fields})
+
 
 # A preset applies via setattr over model_dump(), so every PresetConfig field must name a real
 # RunConfig field — check at import so a typo fails fast instead of at apply time.
@@ -112,6 +117,19 @@ class Preset(BaseModel):
     config: PresetConfig
     clip_models: list[str]
     use_secondary_model: bool
+
+    def matches(self, other: Preset) -> bool:
+        """Whether two recipes are equivalent (the CLIP set compares order-insensitive)."""
+        return (
+            self.config == other.config
+            and set(self.clip_models) == set(other.clip_models)
+            and self.use_secondary_model == other.use_secondary_model
+        )
+
+
+def match_preset(presets: dict[str, Preset], target: Preset) -> str | None:
+    """The name of the saved preset whose recipe matches ``target``, else None."""
+    return next((name for name, p in presets.items() if p.matches(target)), None)
 
 
 class ColourConfig(BaseModel):

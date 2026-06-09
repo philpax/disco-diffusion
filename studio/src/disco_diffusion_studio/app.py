@@ -72,6 +72,7 @@ from .presets import (
     Session,
     load_presets,
     load_session,
+    match_preset,
     save_preset,
     save_session,
 )
@@ -1091,35 +1092,13 @@ class App:
 
     def _current_preset(self) -> Preset:
         """Capture the live settings (guidance + per-run + schedules + models) as a Preset."""
-        cfg = self.session.config
-        config = PresetConfig(
-            clip_guidance_scale=int(cfg.clip_guidance_scale),
-            tv_scale=float(cfg.tv_scale),
-            range_scale=float(cfg.range_scale),
-            sat_scale=float(cfg.sat_scale),
-            clamp_max=float(cfg.clamp_max),
-            cutn_batches=int(cfg.cutn_batches),
-            eta=float(cfg.eta),
-            perlin_init=bool(cfg.perlin_init),
-            cut_overview=str(cfg.cut_overview),
-            cut_innercut=str(cfg.cut_innercut),
-            cut_ic_pow=str(cfg.cut_ic_pow),
-            cut_icgray_p=str(cfg.cut_icgray_p),
-        )
+        config = PresetConfig.from_run_config(self.session.config)
         models = [m for m in AVAILABLE_CLIP_MODELS if m in self._clip_selected]
         return Preset(config=config, clip_models=models, use_secondary_model=self._secondary_on)
 
     def _detect_preset(self) -> str:
         """The saved preset whose recipe matches the live settings, else "Custom"."""
-        current = self._current_preset()
-        for name, preset in self._presets.items():
-            if (
-                preset.config.model_dump() == current.config.model_dump()
-                and set(preset.clip_models) == set(current.clip_models)
-                and preset.use_secondary_model == current.use_secondary_model
-            ):
-                return name
-        return CUSTOM_PRESET
+        return match_preset(self._presets, self._current_preset()) or CUSTOM_PRESET
 
     def _spawn_preset_dropdown(self) -> None:
         """(Re)create the preset dropdown in the settings panel at the stored rect/selection."""
