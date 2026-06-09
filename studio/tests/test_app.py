@@ -95,14 +95,14 @@ def test_modal_blocks_canvas_painting(app):
 
 
 def test_picked_colour_is_remembered(app):
-    before = len(app._recent)
+    before = len(app._palette.recent)
     app._apply_picked_colour((1, 2, 3))
     assert app.brush_color == (1, 2, 3)
-    assert (1, 2, 3) in app._recent and len(app._recent) == before + 1
+    assert (1, 2, 3) in app._palette.recent and len(app._palette.recent) == before + 1
     # a palette colour is already shown, so it doesn't earn a recents slot
-    after_custom = len(app._recent)
-    app._apply_picked_colour(app._palette[0])
-    assert len(app._recent) == after_custom
+    after_custom = len(app._palette.recent)
+    app._apply_picked_colour(app._palette.fixed[0])
+    assert len(app._palette.recent) == after_custom
 
 
 def test_mute_button_toggles_and_excludes_from_snapshot(app):
@@ -334,7 +334,7 @@ def test_bracket_keys_change_brush_size(app):
 
 def test_digit_selects_palette_colour(app):
     app._handle_event(_key(pygame.K_3))
-    assert app.brush_color == app._swatch_colours()[2]
+    assert app.brush_color == app._palette.swatches()[2]
 
 
 def test_ctrl_z_reverts_to_latest_checkpoint(app, fake_worker):

@@ -64,17 +64,14 @@ from .layout import (
     snap_side,
 )
 from .paint import BRUSHES, PaintLayer
+from .palette import Palette
 from .presets import (
-    MAX_RECENT,
-    ColourConfig,
     HistoryItem,
     Preset,
     PresetConfig,
     Session,
-    load_colours,
     load_presets,
     load_session,
-    save_colours,
     save_preset,
     save_session,
 )
@@ -374,18 +371,14 @@ class App:
 
         # Colours: the palette + recently-picked colours come from studio/config.toml. The RGB
         # picker prepends to the recents (capped, persisted), and swatches = palette + recents.
-        self._colour_cfg: ColourConfig = load_colours()
-        self._palette: list[tuple[int, int, int]] = list(self._colour_cfg.palette)
-        self._recent: list[tuple[int, int, int]] = list(self._colour_cfg.recent)
+        self._palette = Palette.load()
         self._colour_picker: UIColourPickerDialog | None = None
 
         # Painting state. The active paint layer holds the in-progress stroke; on mouse-up it's
         # flushed to the worker as one batch (its own checkpoint) and moved into _pending_overlays
         # — surfaces shown on the canvas until a baked frame incorporates that stroke. Each flush
         # bumps _paint_submitted; an overlay clears once frame.paint_applied reaches its target.
-        self.brush_color: tuple[int, int, int] = (
-            self._palette[3] if len(self._palette) > 3 else self._palette[0]
-        )
+        self.brush_color: tuple[int, int, int] = self._palette.default_brush()
         self._paint_layer = PaintLayer(self.width, self.height)
         self._pending_overlays: list[tuple[pygame.Surface, int]] = []
         self._paint_submitted = 0
@@ -524,21 +517,13 @@ class App:
             rect, html_message=message, manager=self.manager, window_title=title
         )
 
-    def _swatch_colours(self) -> list[tuple[int, int, int]]:
-        """The palette colours followed by any recently-picked ones not already in it."""
-        out = list(self._palette)
-        for c in self._recent:
-            if c not in out:
-                out.append(c)
-        return out
-
     def _build_palette(self, rect: pygame.Rect) -> None:
         """Lay out the current-colour preview + swatch rects within ``rect`` (drawn custom)."""
         self._palette_rect = rect
         self._swatch_rects = []
         self._color_preview_rect = pygame.Rect(rect.x, rect.y, CTRL_H, CTRL_H)
         x = rect.x + CTRL_H + 10
-        colours = self._swatch_colours()
+        colours = self._palette.swatches()
         n = max(len(colours), 1)
         gap = 4
         sw = max(8, min(CTRL_H, (rect.right - x - (n - 1) * gap) // n))
@@ -1876,7 +1861,7 @@ class App:
 
     def _select_palette_index(self, index: int) -> None:
         """Digit keys: pick the nth swatch (palette + recents) as the brush colour, if it exists."""
-        colours = self._swatch_colours()
+        colours = self._palette.swatches()
         if 0 <= index < len(colours):
             self.brush_color = colours[index]
 
@@ -2470,16 +2455,8 @@ class App:
     def _apply_picked_colour(self, rgb: tuple[int, int, int]) -> None:
         """Adopt a picked colour as the brush colour and remember it (capped, persisted)."""
         self.brush_color = rgb
-        # Remember it most-recent-first, de-duplicated and capped. Palette colours are already
-        # shown as fixed swatches, so they don't earn a recents slot.
-        if rgb not in self._palette:
-            self._recent = [rgb, *(c for c in self._recent if c != rgb)][:MAX_RECENT]
-            self._colour_cfg = ColourConfig(palette=self._palette, recent=self._recent)
-            try:
-                save_colours(self._colour_cfg)
-            except Exception:  # noqa: BLE001 - persistence is best-effort; don't crash the UI
-                log.exception("saving colour config failed")
-        self._build_palette(self._palette_rect)  # relayout swatches to include the new recent
+        self._palette.remember(rgb)  # records off-palette colours as recents (deduped, persisted)
+        self._build_palette(self._palette_rect)  # relayout swatches to include any new recent
 
     # -- painting --
     def _on_swatch(self, pos: tuple[int, int]) -> bool:
