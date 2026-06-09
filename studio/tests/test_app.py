@@ -15,16 +15,16 @@ from disco_diffusion_studio import app as A
 from disco_diffusion_studio.controls import CUSTOM_PRESET
 from disco_diffusion_studio.presets import GuidanceSnapshot
 from disco_diffusion_studio.timeline import Timeline
-from disco_diffusion_studio.ui import draw, events
+from disco_diffusion_studio.ui import events
 from disco_diffusion_studio.worker import HistoryEntry, PromptSpec
 
 
 def test_app_constructs_and_renders(app):
     app.manager.update(0.016)
-    draw.scene(app)
+    app._draw_frame()
+    app.canvas.draw(app)
     app.manager.draw_ui(app.screen)
-    draw.tools(app)
-    draw.history_ticks(app)  # no error with no history
+    app.bottom_bar.draw(app)  # palette + ticks; no error with no history
 
 
 def test_compute_window_size_respects_minimums():

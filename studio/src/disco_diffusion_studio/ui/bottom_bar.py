@@ -26,7 +26,7 @@ from ..constants import BRUSH_SIZE_MAX, BRUSH_SIZE_MIN, BRUSH_STRENGTH_MAX, BRUS
 from ..controls import PromptRow
 from ..layout import CTRL_H, LABEL_H, MARGIN, PAD, ROW_PITCH, Row, Stack
 from ..paint import BRUSHES
-from ..theme import MUTED_COLOR, PENDING_COLOR, READOUT_COLOR
+from ..theme import DIVIDER, MUTED_COLOR, PENDING_COLOR, READOUT_COLOR
 
 if TYPE_CHECKING:
     from ..app import App
@@ -416,6 +416,65 @@ class BottomBar:
             rgb
         )  # records off-palette colours as recents (deduped, persisted)
         self.build_palette(app, self._palette_rect)  # relayout to include any new recent
+
+    # -- rendering (custom-drawn bits, on top of the pygame_gui widgets) --
+    def draw(self, app: App) -> None:
+        """Draw the colour palette (preview + swatches) and the history-slider checkpoint ticks."""
+        self._draw_palette(app.screen)
+        self._draw_history_ticks(app)
+
+    def _draw_palette(self, screen: pygame.Surface) -> None:
+        """Current-colour preview + swatches (the selected one outlined)."""
+        colour = self.paint.brush.color
+        pygame.draw.rect(screen, colour, self._color_preview_rect, border_radius=5)
+        pygame.draw.rect(screen, DIVIDER, self._color_preview_rect, width=1, border_radius=5)
+        for sr, swatch in self._swatch_rects:
+            pygame.draw.rect(screen, swatch, sr, border_radius=4)
+            if swatch == colour:
+                pygame.draw.rect(screen, (255, 255, 255), sr, width=2, border_radius=4)
+
+    def _draw_history_ticks(self, app: App) -> None:
+        """Mark each checkpoint's position on the (step-space) history slider.
+
+        Drawn after the UI so the ticks sit on top of the track; hovering the slider shows the
+        nearest checkpoint's label so the otherwise-invisible snap points are discoverable.
+        """
+        tl = self.state.timeline
+        if not tl.entries or not self.history_slider.is_enabled:
+            return
+        total = app.history.total()
+        track = self.history_slider.rect
+        button = getattr(self.history_slider, "sliding_button", None)
+        button_w = button.rect.width if button is not None else 26
+        base_y = track.bottom - 3
+        for i, cp in enumerate(tl.entries):
+            x = tl.tick_x(float(cp.index), track, button_w, total)
+            active = tl.preview_index == i
+            kind = tl.tick_colour(cp.label)
+            colour = tl.brighten(kind) if active else kind
+            height = 9 if active else 5
+            width = 2 if active else 1
+            pygame.draw.line(app.screen, colour, (x, base_y - height), (x, base_y), width)
+        # Hover: surface the nearest checkpoint's label above the slider (and accent its tick).
+        if track.collidepoint(app._mouse_pos) and not app._modal_open():
+            span = max(1, track.width - button_w)
+            mval = (app._mouse_pos[0] - track.left - button_w / 2) / span * float(max(total, 1))
+            cp = min(tl.entries, key=lambda c: abs(c.index - mval))
+            x = tl.tick_x(float(cp.index), track, button_w, total)
+            accent = tl.brighten(tl.tick_colour(cp.label))
+            pygame.draw.line(app.screen, accent, (x, base_y - 9), (x, base_y), 2)
+            label = f"{cp.label}  {cp.index}/{cp.total}"
+            text = app._hud_font.render(label, True, (228, 232, 240))
+            pad = 5
+            chip = pygame.Surface(
+                (text.get_width() + 2 * pad, text.get_height() + 2 * pad), pygame.SRCALPHA
+            )
+            chip.fill((18, 20, 28, 235))
+            cx = x - chip.get_width() // 2
+            cx = max(track.left, min(cx, track.right - chip.get_width()))
+            cy = track.top - chip.get_height() - 3
+            app.screen.blit(chip, (cx, cy))
+            app.screen.blit(text, (cx + pad, cy + pad))
 
     def set_step_label(self, text: str) -> None:
         """Set the transport step counter (e.g. "step 12 / 100")."""

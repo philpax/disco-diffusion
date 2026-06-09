@@ -64,9 +64,13 @@ from .session_io import SessionIO
 from .signals import Signals
 from .state import PaintState, SharedState
 from .theme import (
+    DIVIDER,
+    IMAGE_BG,
+    PANEL_BG,
     THEME,
+    WINDOW_BG,
 )
-from .ui import draw, events
+from .ui import events
 from .ui.bottom_bar import BottomBar
 from .ui.canvas import Canvas
 from .ui.sidebar import Sidebar
@@ -481,6 +485,46 @@ class App:
             window_title="Pick a colour",
         )
 
+    # -- rendering --
+    def _draw_frame(self) -> None:
+        """The window chrome under everything: panel/sidebar backgrounds + the two dividers.
+
+        The overarching frame; the canvas and bottom bar then draw their own regions on top
+        (self.canvas.draw / self.bottom_bar.draw), and pygame_gui draws the widgets in between.
+        """
+        win_w, win_h = self.layout.window_size()
+        img_h = self.layout.image_area_h()
+        panel_w = self.layout.panel_w()
+        self.screen.fill(WINDOW_BG)
+        pygame.draw.rect(self.screen, IMAGE_BG, (0, 0, panel_w, img_h))
+        pygame.draw.rect(self.screen, PANEL_BG, (0, img_h, panel_w, win_h - img_h))
+        pygame.draw.rect(self.screen, PANEL_BG, self.layout.sidebar_rect())  # full-height sidebar
+        # Draggable divider band between the left column and the sidebar.
+        pygame.draw.rect(self.screen, DIVIDER, pygame.Rect(panel_w, 0, DIVIDER_W, win_h))
+        hot = self._dragging_divider or abs(self._mouse_pos[0] - panel_w) <= DIVIDER_W
+        grip_x = panel_w + DIVIDER_W // 2
+        pygame.draw.line(
+            self.screen,
+            (110, 120, 140) if hot else (70, 78, 92),
+            (grip_x, win_h // 2 - 14),
+            (grip_x, win_h // 2 + 14),
+            2,
+        )
+        # Draggable horizontal divider between the image area and the bottom panel, grip lights
+        # up on hover/drag (mirrors the sidebar divider).
+        pygame.draw.line(self.screen, DIVIDER, (0, img_h), (panel_w, img_h))
+        hot_h = self._dragging_panel or (
+            self._mouse_pos[0] < panel_w and abs(self._mouse_pos[1] - img_h) <= DIVIDER_W
+        )
+        grip_cx = panel_w // 2
+        pygame.draw.line(
+            self.screen,
+            (110, 120, 140) if hot_h else (70, 78, 92),
+            (grip_cx - 14, img_h),
+            (grip_cx + 14, img_h),
+            2,
+        )
+
     # -- main loop --
     def run(self) -> None:
         clock = pygame.time.Clock()
@@ -532,10 +576,10 @@ class App:
             self.history.sync()
             self.canvas.update_frame_surface()
             self.manager.update(dt)
-            draw.scene(self)
-            self.manager.draw_ui(self.screen)
-            draw.tools(self)
-            draw.history_ticks(self)
+            self._draw_frame()  # window chrome + dividers
+            self.canvas.draw(self)  # the image area (frame / init / overlays / cursor / HUD)
+            self.manager.draw_ui(self.screen)  # the pygame_gui widgets
+            self.bottom_bar.draw(self)  # palette + history-slider ticks, on top of the widgets
             pygame.display.flip()
         self.generation.stop()
 

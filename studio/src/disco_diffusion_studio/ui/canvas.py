@@ -12,10 +12,12 @@ from typing import TYPE_CHECKING
 
 import pygame
 
+from ..constants import CANVAS_BORDER, CANVAS_EMPTY_BG, DRAW_HELP, NAV_HELP
 from ..paint import PaintController
 from ..view import ViewTransform
 
 if TYPE_CHECKING:
+    from ..app import App
     from ..layout import Layout
     from ..state import PaintState, SharedState
     from .bottom_bar import BottomBar
@@ -112,3 +114,67 @@ class Canvas:
         gen = self.screen_to_canvas(pos)
         if gen is not None:
             self.paint.paint_to(gen, self.paint_state.brush)
+
+    # -- rendering --
+    def draw(self, app: App) -> None:
+        """Render the image area: the frame (or init/empty state) + paint overlays, then the
+        brush-ring cursor and the help HUD on top. Drawn into the image region (clipped)."""
+        brush = self.paint_state.brush
+        # Draw the canvas (and unbaked paint overlay) under the view transform, clipped to the
+        # viewport so a zoomed/panned canvas never spills into the panel.
+        self.screen.set_clip(self.layout.image_region())
+        crect = self.canvas_screen_rect()
+        surface = app.history.displayed_surface()
+        if surface is not None:
+            self.blit(surface)
+        elif self.state.init.surface is not None:
+            # No frame yet but an init image is set: preview it (dimmed) so it's clear the run
+            # will seed from it.
+            self.blit(self.state.init.surface)
+            scrim = pygame.Surface(crect.size, pygame.SRCALPHA)
+            scrim.fill((10, 12, 16, 120))
+            self.screen.blit(scrim, crect.topleft)
+            label = app._hud_font.render(
+                f"init: {self.state.init.label} — press Play to evolve", True, (224, 228, 236)
+            )
+            self.screen.blit(label, label.get_rect(center=crect.center))
+        else:
+            # No frame yet: show the canvas bounds so the size/aspect is clear before Play.
+            pygame.draw.rect(self.screen, CANVAS_EMPTY_BG, crect)
+            label = app._hud_font.render(
+                f"{self.state.width} × {self.state.height} — press Play", True, (140, 147, 160)
+            )
+            self.screen.blit(label, label.get_rect(center=crect.center))
+        # Paint overlays only on the live view (hidden while previewing history): the in-progress
+        # stroke plus any flushed strokes not yet baked into a published frame.
+        if self.state.timeline.preview_index is None:
+            for overlay, _ in self.paint.pending_overlays:
+                self.blit(overlay)
+            if not self.paint.layer.empty():
+                self.blit(self.paint.layer.to_surface())
+        pygame.draw.rect(self.screen, CANVAS_BORDER, crect, 1)  # canvas outline at any zoom
+        self.screen.set_clip(None)
+        # Brush ring (scaled by zoom) — only in draw mode (not navigating, not previewing, and
+        # not while a dialog window is up).
+        region = self.layout.image_region()
+        if (
+            not app._navigating
+            and self.state.timeline.preview_index is None
+            and not app._modal_open()
+            and region.collidepoint(app._mouse_pos)
+        ):
+            ring = max(2, int(brush.size * self.view.zoom))
+            pygame.draw.circle(self.screen, brush.color, app._mouse_pos, ring, 2)
+            pygame.draw.circle(self.screen, (255, 255, 255), app._mouse_pos, ring + 1, 1)
+        # Help HUD in the corner of the canvas (doesn't cost panel height), per mode.
+        text = app._hud_font.render(
+            NAV_HELP if app._navigating else DRAW_HELP, True, (210, 214, 222)
+        )
+        pad = 6
+        chip = pygame.Surface(
+            (text.get_width() + 2 * pad, text.get_height() + 2 * pad), pygame.SRCALPHA
+        )
+        chip.fill((0, 0, 0, 120))
+        pos = (10, region.bottom - chip.get_height() - 10)
+        self.screen.blit(chip, pos)
+        self.screen.blit(text, (pos[0] + pad, pos[1] + pad))
