@@ -58,6 +58,7 @@ from .layout import (
     Layout,
     snap_side,
 )
+from .loading import LoadingState, loading_screen
 from .paint import Brush
 from .palette import Palette
 from .presets import (
@@ -71,7 +72,6 @@ from .reload import ModelReloader
 from .session_io import SessionIO
 from .theme import (
     THEME,
-    WINDOW_BG,
 )
 from .timeline import Timeline
 from .ui import draw, events
@@ -1003,57 +1003,6 @@ class App:
         self._stop_run()
 
 
-@dataclass
-class _LoadingState:
-    """Shared between the loading thread and the loading screen."""
-
-    status: str = "starting"  # the component currently loading
-    session: DiscoSession | None = None
-    error: Exception | None = None
-    done: bool = False
-
-
-def _loading_screen(screen: pygame.Surface, state: _LoadingState) -> bool:
-    """Render a loading screen until the model load finishes; ``False`` if the user closes it."""
-    title_font = pygame.font.SysFont(None, 40)
-    status_font = pygame.font.SysFont(None, 24)
-    hint_font = pygame.font.SysFont(None, 18)
-    clock = pygame.time.Clock()
-    while True:
-        for event in pygame.event.get():
-            if event.type == pygame.QUIT:
-                return False
-        w, h = screen.get_size()
-        cx, cy = w // 2, h // 2
-        screen.fill(WINDOW_BG)
-        title = title_font.render(APP_TITLE, True, (231, 233, 240))
-        screen.blit(title, title.get_rect(center=(cx, cy - 38)))
-        if state.error is not None:
-            msg = status_font.render(f"Failed to load: {state.error}", True, (239, 107, 129))
-            screen.blit(msg, msg.get_rect(center=(cx, cy + 8)))
-            hint = hint_font.render("close the window to exit", True, (122, 130, 144))
-            screen.blit(hint, hint.get_rect(center=(cx, cy + 42)))
-        else:
-            dots = "." * (1 + (pygame.time.get_ticks() // 400) % 3)
-            msg = status_font.render(f"loading {state.status}{dots}", True, (150, 196, 255))
-            screen.blit(msg, msg.get_rect(center=(cx, cy + 8)))
-            # An indeterminate progress sweep so it's clearly alive during the long load.
-            bar = pygame.Rect(0, 0, min(420, w - 80), 4)
-            bar.center = (cx, cy + 46)
-            pygame.draw.rect(screen, (38, 44, 56), bar, border_radius=2)
-            frac = (pygame.time.get_ticks() % 1400) / 1400.0
-            seg_w = bar.width // 4
-            sx = max(bar.left, bar.left + int((bar.width + seg_w) * frac) - seg_w)
-            seg_w = min(seg_w, bar.right - sx)
-            if seg_w > 0:
-                rect = (sx, bar.top, seg_w, bar.height)
-                pygame.draw.rect(screen, (109, 124, 255), rect, border_radius=2)
-        pygame.display.flip()
-        clock.tick(30)
-        if state.done and state.error is None:
-            return True
-
-
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--steps", type=int, default=100, help="Initial total step count.")
@@ -1119,7 +1068,7 @@ def main() -> None:
     # Load the models on a background thread (the device/CPU work) while the loading screen
     # pumps events and shows what's loading. (DiscoSession off the main thread is already how
     # the in-app model reload works.)
-    state = _LoadingState()
+    state = LoadingState()
 
     def load() -> None:
         try:
@@ -1134,7 +1083,7 @@ def main() -> None:
 
     log.info("loading models (this can take a minute)…")
     threading.Thread(target=load, daemon=True).start()
-    if not _loading_screen(screen, state):  # window closed before the load succeeded
+    if not loading_screen(screen, state):  # window closed before the load succeeded
         pygame.quit()
         if state.error is not None:  # it failed (the screen showed the error); surface it
             raise state.error

@@ -1,5 +1,5 @@
 """App-level behaviour with a fake session: construction, history math, modal isolation,
-preset/colour wiring, panel resize, geometry, and the loading screen."""
+preset/colour wiring, panel resize, and geometry."""
 
 from __future__ import annotations
 
@@ -322,17 +322,6 @@ def test_history_tick_colours_by_kind():
     assert Timeline.tick_colour("guidance") == PENDING_COLOR
     assert Timeline.tick_colour("preset 2022 sauce") != MUTED_COLOR
     assert Timeline.tick_colour("start") == MUTED_COLOR
-
-
-def test_loading_screen_returns_true_when_done(app):
-    state = A._LoadingState(status="CLIP RN50", done=True)
-    assert A._loading_screen(app.screen, state) is True
-
-
-def test_loading_screen_returns_false_on_quit(app):
-    pygame.event.post(pygame.event.Event(pygame.QUIT))
-    state = A._LoadingState(status="diffusion model")
-    assert A._loading_screen(app.screen, state) is False
 
 
 def _key(key, mod=0):
