@@ -21,6 +21,7 @@ from .controls import CUSTOM_PRESET
 from .layout import CTRL_H, LABEL_H
 from .presets import Preset, PresetConfig, load_presets, match_preset, save_preset
 from .signals import Signals
+from .state import SharedState
 
 if TYPE_CHECKING:
     from .app import App
@@ -31,9 +32,10 @@ log = logging.getLogger("disco_diffusion_studio.recipe")
 class Recipe:
     """The loaded presets, the dropdown selection, recipe apply/detect, and the save-as modal."""
 
-    def __init__(self, app: App, signals: Signals) -> None:
+    def __init__(self, app: App, signals: Signals, state: SharedState) -> None:
         self.app = app
         self.signals = signals
+        self.state = state
         # Presets are loaded from studio/presets/*.toml and surfaced as a dropdown that flips to
         # "Custom" once any preset-controlled knob is edited. ``applying`` suppresses that flip
         # while a preset is being applied (so its own widget updates don't read as edits).
@@ -49,7 +51,7 @@ class Recipe:
     def current(self) -> Preset:
         """Capture the live settings (guidance + per-run + schedules + models) as a Preset."""
         app = self.app
-        config = PresetConfig.from_run_config(app.session.config)
+        config = PresetConfig.from_run_config(self.state.session.config)
         models = [m for m in AVAILABLE_CLIP_MODELS if m in app.models.clip_selected]
         return Preset(
             config=config, clip_models=models, use_secondary_model=app.models.secondary_on
@@ -83,7 +85,7 @@ class Recipe:
         app = self.app
         self.applying = True
         try:
-            cfg = app.session.config
+            cfg = self.state.session.config
             for attr, value in config.model_dump().items():
                 setattr(cfg, attr, value)
             app.sidebar.refresh_advanced_widgets(app)

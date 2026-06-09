@@ -19,6 +19,7 @@ import pygame
 
 from .layout import snap_side
 from .signals import Signals
+from .state import PaintState, SharedState
 from .util import clamp_steps
 from .worker import GenerationWorker
 
@@ -31,9 +32,11 @@ log = logging.getLogger("disco_diffusion_studio.generation")
 class Generation:
     """Starting, stopping, and reconfiguring the generation run (+ saving its output)."""
 
-    def __init__(self, app: App, signals: Signals) -> None:
+    def __init__(self, app: App, signals: Signals, state: SharedState, paint: PaintState) -> None:
         self.app = app
         self.signals = signals
+        self.state = state
+        self.paint = paint
         # Snapshot of the per-run settings the active run was started with, for the "Current"
         # sidebar tab to show while it runs (live knobs are read straight from session.config).
         self.run_snapshot: dict[str, str] = {}
@@ -50,8 +53,8 @@ class Generation:
                 raise ValueError
         except ValueError:
             seed = random.randrange(2**31)  # empty / invalid -> random, then surface it
-        app._seed_text = str(seed)
-        app.sidebar.set_seed_text(app._seed_text)
+        self.state.seed_text = str(seed)
+        app.sidebar.set_seed_text(self.state.seed_text)
         return seed
 
     def start(self) -> None:
@@ -62,62 +65,64 @@ class Generation:
         # run would silently use the previous value.
         self.commit_steps()
         self.stop()
-        app.worker = GenerationWorker(
-            app.session,
-            width=app.width,
-            height=app.height,
-            steps=app.steps,
-            encode_cache=app._encode_cache,
-            cache_lock=app._cache_lock,
-            perlin=app.session.config.perlin_init,
-            init_image=app._init.image,
-            skip_steps=app._init.skip_steps(app.steps),
+        self.state.worker = GenerationWorker(
+            self.state.session,
+            width=self.state.width,
+            height=self.state.height,
+            steps=self.state.steps,
+            encode_cache=self.state.encode_cache,
+            cache_lock=self.state.cache_lock,
+            perlin=self.state.session.config.perlin_init,
+            init_image=self.state.init.image,
+            skip_steps=self.state.init.skip_steps(self.state.steps),
             seed=self.seed_for_run(),
         )
-        app.worker.set_prompts(app._prompt_snapshot())
+        self.state.worker.set_prompts(app._prompt_snapshot())
         # A fresh worker starts with paint_applied_count == 0; reset the overlay tracking to match
         # and drop stale overlays from the previous run. Any stroke painted before Play (still on
         # the active layer) is flushed as the new run's first paint batch rather than discarded.
         app.canvas.paint.reset_overlays()
         if not app.canvas.paint.layer.empty():
-            app.canvas.paint.flush(app.worker, app.brush)
+            app.canvas.paint.flush(self.state.worker, self.paint.brush)
         # Freeze the per-run settings this run uses, for the "Current" tab to show while it runs.
         self.run_snapshot = app.sidebar.perrun_values(app)
-        app._timeline.reset()
-        app.paused = False
-        app.worker.start()
+        self.state.timeline.reset()
+        self.state.paused = False
+        self.state.worker.start()
         self.signals.status("Running")
         self.signals.invalidate()
 
     def stop(self) -> None:
         """Tear down the worker and clear the timeline (no-op if nothing's running)."""
-        app = self.app
-        if app.worker is not None:
-            app.worker.stop()
-            app.worker.join(timeout=5.0)
-        app.worker = None
-        app.paused = False
-        app._timeline.reset()
+        if self.state.worker is not None:
+            self.state.worker.stop()
+            self.state.worker.join(timeout=5.0)
+        self.state.worker = None
+        self.state.paused = False
+        self.state.timeline.reset()
         self.signals.invalidate()
 
     def toggle_play(self) -> None:
         """Play/Pause: start a fresh run, pause a running one, or resume a paused one."""
-        app = self.app
-        if app._timeline.preview_index is not None:
+        if self.state.timeline.preview_index is not None:
             self.signals.status("Previewing")
             return
-        if app.worker is None or not app.worker.is_alive() or app.worker.finished:
+        if (
+            self.state.worker is None
+            or not self.state.worker.is_alive()
+            or self.state.worker.finished
+        ):
             self.start()  # finished -> Play starts a fresh run (Revert continues a branch)
-        elif app.paused:
-            app.paused = False
-            app._timeline.clear_preview()  # resume from live, drop any history preview
-            app._timeline.end_undo()  # resuming ends the undo chain
-            app.worker.resume()
+        elif self.state.paused:
+            self.state.paused = False
+            self.state.timeline.clear_preview()  # resume from live, drop any history preview
+            self.state.timeline.end_undo()  # resuming ends the undo chain
+            self.state.worker.resume()
             self.signals.status("Running")
             self.signals.invalidate()
         else:
-            app.paused = True
-            app.worker.pause()
+            self.state.paused = True
+            self.state.worker.pause()
             self.signals.status("Paused")
             self.signals.invalidate()
 
@@ -127,13 +132,13 @@ class Generation:
         # Changing the output shape requires a fresh run. The window does NOT change — the
         # image is letterboxed into the image region — so orientation flips keep proportions.
         self.stop()
-        app.width = snap_side(width)
-        app.height = snap_side(height)
-        app.sidebar.set_size_text(app.width, app.height)
+        self.state.width = snap_side(width)
+        self.state.height = snap_side(height)
+        app.sidebar.set_size_text(self.state.width, self.state.height)
         # Generation size changed: rebuild the init preview (also generation-res), then have the
         # canvas adopt the new size (rebuild the paint layer, drop the stale frame, refit the view).
-        app._init.rebuild_surface(app.width, app.height)
-        app.canvas.apply_size(app.width, app.height)
+        self.state.init.rebuild_surface(self.state.width, self.state.height)
+        app.canvas.apply_size(self.state.width, self.state.height)
         self.signals.status("Size set")
 
     def commit_steps(self) -> None:
@@ -146,14 +151,14 @@ class Generation:
         try:
             value = clamp_steps(app.sidebar.steps_text())
         except ValueError:
-            app.sidebar.set_steps_text(str(app.steps))
+            app.sidebar.set_steps_text(str(self.state.steps))
             return
         app.sidebar.set_steps_text(str(value))
-        if value == app.steps:
+        if value == self.state.steps:
             return
-        app.steps = value
+        self.state.steps = value
         # If a run is paused, changing steps abandons it (respacing is fixed per run).
-        if app.worker is not None and app.worker.is_alive():
+        if self.state.worker is not None and self.state.worker.is_alive():
             self.stop()
             self.signals.status("Steps set")
 

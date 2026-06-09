@@ -26,12 +26,12 @@ import os
 import random
 import threading
 import zipfile
-from dataclasses import dataclass, field
+from dataclasses import InitVar, dataclass, field
 from pathlib import Path
 
 import pygame
 import pygame_gui
-from disco_diffusion import DiscoSession, EncodedPrompt, RunConfig
+from disco_diffusion import DiscoSession, RunConfig
 from PIL import Image
 from pygame_gui.windows import UIColourPickerDialog, UIConfirmationDialog, UIMessageWindow
 
@@ -42,7 +42,6 @@ from .constants import (
 from .controls import PromptRow
 from .generation import Generation
 from .history import History
-from .init_image import InitImage
 from .layout import (
     DEFAULT_H,
     DEFAULT_W,
@@ -63,16 +62,16 @@ from .palette import Palette
 from .recipe import Recipe
 from .session_io import SessionIO
 from .signals import Signals
+from .state import PaintState, SharedState
 from .theme import (
     THEME,
 )
-from .timeline import Timeline
 from .ui import draw, events
 from .ui.bottom_bar import BottomBar
 from .ui.canvas import Canvas
 from .ui.sidebar import Sidebar
 from .util import surface_to_pil
-from .worker import GenerationWorker, PromptSpec
+from .worker import PromptSpec
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger("disco_diffusion_studio")
@@ -111,23 +110,21 @@ def compute_window_size(width: int, height: int, sidebar_w: int, panel_h: int) -
 
 @dataclass
 class App:
-    session: DiscoSession
+    # Construction inputs (InitVar: passed to __post_init__ to seed SharedState, not kept on App).
+    session: InitVar[DiscoSession]
     out_dir: Path
+    width: InitVar[int] = DEFAULT_W
+    height: InitVar[int] = DEFAULT_H
+    steps: InitVar[int] = 100
+    prompts: InitVar[list[PromptRow] | None] = None
 
-    width: int = DEFAULT_W
-    height: int = DEFAULT_H
-    steps: int = 100
-    prompts: list[PromptRow] = field(default_factory=list)
-
-    worker: GenerationWorker | None = None
-    paused: bool = False
-    _frame_surface: pygame.Surface | None = None
-    _frame_key: tuple[int, int] | None = None  # (id(array), index) to detect new frames
     _pending_size: tuple[int, int] | None = None  # coalesced window resize, applied per frame
 
     # The App is a coordinator over its pieces. The screen areas (ui/) own their own widgets +
     # build + event handling; the rest are the value objects / services. field(init=False) keeps
     # the late-bound ones (built in __post_init__/_build_ui) out of the constructor.
+    state: SharedState = field(init=False)  # the working session model the pieces read + mutate
+    paint: PaintState = field(init=False)  # painting tools: live brush settings + colour palette
     manager: pygame_gui.UIManager = field(init=False)
     screen: pygame.Surface = field(init=False)
     layout: Layout = field(init=False)  # window geometry (split + divider positions)
@@ -140,13 +137,27 @@ class App:
     models: Models = field(init=False)  # staged CLIP/secondary set + debounced weight reload
     recipe: Recipe = field(init=False)  # presets: capture/apply/save + the dropdown selection
 
-    def __post_init__(self) -> None:
-        self.width = snap_side(self.width)
-        self.height = snap_side(self.height)
-        if not self.prompts:
-            self.prompts = [PromptRow("a vast alien landscape, oil painting", 1.0)]
-        self._encode_cache: dict[str, EncodedPrompt] = {}
-        self._cache_lock = threading.Lock()
+    def __post_init__(
+        self,
+        session: DiscoSession,
+        width: int,
+        height: int,
+        steps: int,
+        prompts: list[PromptRow] | None,
+    ) -> None:
+        # Painting tools (the live brush + colour palette; brush.color is seeded from the palette).
+        palette = Palette.load()
+        self.paint = PaintState(brush=Brush(color=palette.default_brush()), palette=palette)
+        # The working session model the pieces share (session / worker / geometry / prompts /
+        # timeline / init image / encode cache). Output size is snapped to a multiple of 64.
+        self.state = SharedState(
+            session=session,
+            width=snap_side(width),
+            height=snap_side(height),
+            steps=steps,
+            prompts=prompts or [PromptRow("a vast alien landscape, oil painting", 1.0)],
+            seed_text=str(random.randrange(2**31)),
+        )
         # The UI event bus: controllers announce status messages / enablement-invalidation through
         # it instead of reaching back into the bottom bar + sidebar. Listeners are wired below,
         # once those areas exist (see _resync_enabled / bottom_bar.set_status).
@@ -169,7 +180,9 @@ class App:
             self.screen = existing
             win_w, win_h = existing.get_size()
         else:
-            win_w, win_h = compute_window_size(self.width, self.height, sidebar_w, panel_h)
+            win_w, win_h = compute_window_size(
+                self.state.width, self.state.height, sidebar_w, panel_h
+            )
             self.screen = pygame.display.set_mode((win_w, win_h), pygame.RESIZABLE)
         self.layout = Layout(win_w, win_h, sidebar_w, panel_h)
         pygame.display.set_caption(APP_TITLE)
@@ -193,10 +206,6 @@ class App:
         # Whether the steps box held focus last frame, so we can commit it on blur (mirrors
         # the prompt boxes; without this, typing a value and clicking away wouldn't apply it).
         self._steps_focused = False
-        # Seed field contents, persisted across UI rebuilds. Always holds a concrete seed so the
-        # value in use is visible upfront and replaying (Play again) clearly reuses it; "Rnd"
-        # rolls a fresh one. Seeded random at startup.
-        self._seed_text = str(random.randrange(2**31))
 
         # Right-hand sidebar: owns its widgets (Settings/Current tabs + controls), built in
         # _build_ui. The coalesced "rebuild after a resize" flag is applied once per frame in
@@ -213,35 +222,25 @@ class App:
 
         # Model selection (staged CLIP set + secondary) and the debounced background weight
         # reload — changing the model set rebuilds the session off-thread (see models.py).
-        self.models = Models(self, self.signals)
-        self.session_io = SessionIO(self, self.signals)  # save/load the working state as a .zip
+        self.models = Models(self, self.signals, self.state)
+        self.session_io = SessionIO(
+            self, self.signals, self.state
+        )  # save/load the working state as a .zip
         # The run lifecycle: start/stop/pause, output size + steps, seed, save (see generation.py).
         # It also holds the "Current" tab's per-run snapshot (read straight from session.config for
         # live knobs).
-        self.generation = Generation(self, self.signals)
+        self.generation = Generation(self, self.signals, self.state, self.paint)
         # Presets / recipes (TOML on disk): capture/apply the full guidance recipe, the dropdown
         # selection, the "Custom" flip on edits, and the save-as modal (see recipe.py).
-        self.recipe = Recipe(self, self.signals)
+        self.recipe = Recipe(self, self.signals, self.state)
 
-        # img2img init image (per-run, applies on next Play): seed the run from an image instead
-        # of noise, set by Open…/drag-drop (a file) or "Use current" (the on-screen frame). The
-        # InitImage owns the source image, denoise %, and the canvas preview shown before Play.
-        self._init = InitImage()
         # "Reset canvas" confirmation (discards the rendered frame so the init preview shows).
         self._confirm_dialog: UIConfirmationDialog | None = None
         # Transient error/notice modal (e.g. loading a session via the init button, or vice versa).
         self._message_window: UIMessageWindow | None = None
-
-        # Colours: the palette + recently-picked colours come from studio/config.toml. The RGB
-        # picker prepends to the recents (capped, persisted), and swatches = palette + recents.
-        self._palette = Palette.load()
+        # The arbitrary-RGB colour picker dialog (None when closed).
         self._colour_picker: UIColourPickerDialog | None = None
 
-        # Painting. The Brush holds the live brush state (kind/size/opacity/colour/noise); the
-        # PaintController owns the active paint layer + stroke lifecycle: on mouse-up a stroke is
-        # flushed to the worker as one batch (its own checkpoint) and kept on-screen as a pending
-        # overlay until a baked frame incorporates it. brush.color is shared with the palette.
-        self.brush = Brush(color=self._palette.default_brush())
         # The Canvas owns the image area: the view transform (zoom/pan), the paint controller
         # (active stroke + overlays), and the latest rendered frame surface.
         self.canvas = Canvas(self)
@@ -250,12 +249,9 @@ class App:
         self._navigating = False  # right mouse held: canvas-navigation mode (pan + scroll-zoom)
         self._hud_font = pygame.font.SysFont(None, 19)
 
-        # Edit history / revert preview. The Timeline owns the checkpoint list, the preview cursor
-        # (None = live frame; an int = previewing that checkpoint non-destructively until Revert),
-        # the Ctrl+Z undo cursor, and the scrub maths. The History controller drives it: checkpoint
-        # requests, preview scrubbing, undo, revert, and the per-frame sync (see history.py).
-        self._timeline = Timeline()
-        self.history = History(self, self.signals)
+        # The History controller drives the edit timeline (state.timeline): checkpoint requests,
+        # preview scrubbing, undo, revert, and the per-frame sync (see history.py).
+        self.history = History(self, self.signals, self.state)
         self.bottom_bar._history_slider_rect = pygame.Rect(0, 0, 10, 10)
         # Fit the canvas to the available area once the real window size is settled. The window
         # manager may resize the window right after it opens (firing a VIDEORESIZE that only
@@ -314,10 +310,10 @@ class App:
     @property
     def running(self) -> bool:
         return (
-            self.worker is not None
-            and self.worker.is_alive()
-            and not self.paused
-            and not self.worker.finished
+            self.state.worker is not None
+            and self.state.worker.is_alive()
+            and not self.state.paused
+            and not self.state.worker.finished
         )
 
     # -- UI construction --
@@ -325,7 +321,7 @@ class App:
         """Rebuild every widget (the bottom panel + sidebar own their own build)."""
         # Preserve the seed field's contents across the rebuild (the widget is recreated).
         if hasattr(self.sidebar, "seed_entry"):
-            self._seed_text = self.sidebar.seed_text()
+            self.state.seed_text = self.sidebar.seed_text()
         self.manager.clear_and_reset()
         self.bottom_bar._remove_buttons.clear()
         self.bottom_bar._mute_buttons.clear()
@@ -361,11 +357,11 @@ class App:
 
     # -- prompt snapshot --
     def _prompt_snapshot(self) -> list[PromptSpec]:
-        return [PromptSpec(r.text, r.weight, r.muted) for r in self.prompts]
+        return [PromptSpec(r.text, r.weight, r.muted) for r in self.state.prompts]
 
     def _push_prompts(self) -> None:
-        if self.worker is not None and self.worker.is_alive():
-            self.worker.set_prompts(self._prompt_snapshot())
+        if self.state.worker is not None and self.state.worker.is_alive():
+            self.state.worker.set_prompts(self._prompt_snapshot())
 
     def _set_sidebar_width(self, width: int) -> None:
         """Set the sidebar width (clamped); the rebuild is coalesced to one per frame."""
@@ -388,7 +384,7 @@ class App:
 
     # -- init image (img2img) --
     def _set_init_image(self, image: Image.Image, label: str) -> None:
-        self._init.set(image, label, self.width, self.height)
+        self.state.init.set(image, label, self.state.width, self.state.height)
         self.sidebar.set_init_status(f"Init: {label}")
         self.signals.status(f"Init set ({label})")
 
@@ -417,7 +413,7 @@ class App:
         self._set_init_image(surface_to_pil(surface), "current result")
 
     def _clear_init(self) -> None:
-        self._init.clear()
+        self.state.init.clear()
         self.sidebar.set_init_status("Init: none")
         self.signals.status("Init cleared")
 
@@ -429,7 +425,7 @@ class App:
 
     def _open_reset_confirm(self) -> None:
         """Confirm before discarding the rendered frame (so the init / empty canvas shows again)."""
-        if self.canvas.frame_surface is None and self.worker is None:
+        if self.canvas.frame_surface is None and self.state.worker is None:
             self.signals.status("Nothing to clear")
             return
         if self._confirm_dialog is not None and self._confirm_dialog.alive():
@@ -480,7 +476,7 @@ class App:
         self._colour_picker = UIColourPickerDialog(
             rect,
             self.manager,
-            initial_colour=pygame.Color(*self.brush.color),
+            initial_colour=pygame.Color(*self.paint.brush.color),
             window_title="Pick a colour",
         )
 
@@ -516,9 +512,9 @@ class App:
             self.history.tick_guidance_checkpoint(pygame.time.get_ticks())
             # When the run finishes (worker idles) or exits unexpectedly, drop to a paused
             # state so controls/history are usable and the image can still be reverted.
-            wk = self.worker
-            if wk is not None and not self.paused and (wk.finished or not wk.is_alive()):
-                self.paused = True
+            wk = self.state.worker
+            if wk is not None and not self.state.paused and (wk.finished or not wk.is_alive()):
+                self.state.paused = True
                 if wk.is_alive():
                     wk.pause()
                 self.signals.status("Done")
@@ -531,7 +527,7 @@ class App:
             # Live "edited · Enter" badge while typing (cheap; only mutates on change).
             self.bottom_bar.refresh_rows(self)
             self.sidebar.refresh_current(self)  # keep the "Current" sidebar tab in sync
-            self.canvas.paint.sync(self.worker)
+            self.canvas.paint.sync(self.state.worker)
             self.history.sync()
             self.canvas.update_frame_surface()
             self.manager.update(dt)

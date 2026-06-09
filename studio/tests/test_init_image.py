@@ -20,37 +20,42 @@ def _png(tmp_path, size=(80, 50)):
 
 def test_load_init_file_sets_image_and_preview(app, tmp_path):
     app._load_init_file(str(_png(tmp_path)))
-    assert app._init.image is not None
-    assert app._init.label == "seed.png"
-    assert app._init.surface is not None
-    assert app._init.surface.get_size() == (app.width, app.height)  # resized to gen size
+    assert app.state.init.image is not None
+    assert app.state.init.label == "seed.png"
+    assert app.state.init.surface is not None
+    assert app.state.init.surface.get_size() == (
+        app.state.width,
+        app.state.height,
+    )  # resized to gen size
     assert app.sidebar._init_status_label.text == "Init: seed.png"  # status line updated
 
 
 def test_denoise_maps_to_skip_steps(app, tmp_path):
     app._load_init_file(str(_png(tmp_path)))
-    app.steps = 100
-    app._init.denoise = 100
-    assert app._init.skip_steps(app.steps) == 0  # full re-diffusion (ignore init structure)
-    app._init.denoise = 0
-    assert app._init.skip_steps(app.steps) == 99  # keep the init (steps - 1)
-    app._init.denoise = 60
-    assert app._init.skip_steps(app.steps) == 40
+    app.state.steps = 100
+    app.state.init.denoise = 100
+    assert (
+        app.state.init.skip_steps(app.state.steps) == 0
+    )  # full re-diffusion (ignore init structure)
+    app.state.init.denoise = 0
+    assert app.state.init.skip_steps(app.state.steps) == 99  # keep the init (steps - 1)
+    app.state.init.denoise = 60
+    assert app.state.init.skip_steps(app.state.steps) == 40
 
 
 def test_no_init_means_zero_skip(app):
-    app._init.image = None
-    app._init.denoise = 0
-    assert app._init.skip_steps(app.steps) == 0
+    app.state.init.image = None
+    app.state.init.denoise = 0
+    assert app.state.init.skip_steps(app.state.steps) == 0
 
 
 def test_use_current_result_as_init(app):
-    frame = pygame.Surface((app.width, app.height))
+    frame = pygame.Surface((app.state.width, app.state.height))
     frame.fill((10, 200, 50))
     app.canvas.frame_surface = frame
     app._use_current_as_init()
-    assert app._init.image is not None
-    assert app._init.label == "current result"
+    assert app.state.init.image is not None
+    assert app.state.init.label == "current result"
 
 
 def test_denoise_slider_updates_value(app):
@@ -62,35 +67,35 @@ def test_denoise_slider_updates_value(app):
             value=25.0,
         ),
     )
-    assert app._init.denoise == 25
+    assert app.state.init.denoise == 25
 
 
 def test_clear_init_updates_status(app, tmp_path):
     app._load_init_file(str(_png(tmp_path)))
     app._clear_init()
-    assert app._init.image is None
+    assert app.state.init.image is None
     assert app.sidebar._init_status_label.text == "Init: none"
 
 
 def test_clear_init(app, tmp_path):
     app._load_init_file(str(_png(tmp_path)))
     app._clear_init()
-    assert app._init.image is None
-    assert app._init.surface is None
+    assert app.state.init.image is None
+    assert app.state.init.surface is None
 
 
 def test_open_init_loads_via_native_dialog(app, tmp_path, stub_dialogs):
     path = _png(tmp_path)
     stub_dialogs(open=path)
     app._open_init()
-    assert app._init.image is not None
-    assert app._init.label == "seed.png"
+    assert app.state.init.image is not None
+    assert app.state.init.label == "seed.png"
 
 
 def test_dropfile_loads_init(app, tmp_path):
     events.handle(app, pygame.event.Event(pygame.DROPFILE, file=str(_png(tmp_path))))
-    assert app._init.image is not None
-    assert app._init.label == "seed.png"
+    assert app.state.init.image is not None
+    assert app.state.init.label == "seed.png"
 
 
 def test_reset_with_nothing_to_clear_opens_no_dialog(app):
@@ -100,7 +105,9 @@ def test_reset_with_nothing_to_clear_opens_no_dialog(app):
 
 def test_reset_confirm_is_modal_then_clears_frame(app, tmp_path):
     app._load_init_file(str(_png(tmp_path)))
-    app.canvas.frame_surface = pygame.Surface((app.width, app.height))  # a "rendered" frame
+    app.canvas.frame_surface = pygame.Surface(
+        (app.state.width, app.state.height)
+    )  # a "rendered" frame
     app._open_reset_confirm()
     assert app._modal_open()  # confirmation is up
     app._reset_canvas()  # confirm

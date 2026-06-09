@@ -46,27 +46,27 @@ def scene(app: App) -> None:
     surface = app.history.displayed_surface()
     if surface is not None:
         app.canvas.blit(surface)
-    elif app._init.surface is not None:
+    elif app.state.init.surface is not None:
         # No frame yet but an init image is set: preview it (dimmed) so it's clear the run
         # will seed from it.
-        app.canvas.blit(app._init.surface)
+        app.canvas.blit(app.state.init.surface)
         scrim = pygame.Surface(crect.size, pygame.SRCALPHA)
         scrim.fill((10, 12, 16, 120))
         app.screen.blit(scrim, crect.topleft)
         label = app._hud_font.render(
-            f"init: {app._init.label} — press Play to evolve", True, (224, 228, 236)
+            f"init: {app.state.init.label} — press Play to evolve", True, (224, 228, 236)
         )
         app.screen.blit(label, label.get_rect(center=crect.center))
     else:
         # No frame yet: show the canvas bounds so the size/aspect is clear before Play.
         pygame.draw.rect(app.screen, CANVAS_EMPTY_BG, crect)
         label = app._hud_font.render(
-            f"{app.width} × {app.height} — press Play", True, (140, 147, 160)
+            f"{app.state.width} × {app.state.height} — press Play", True, (140, 147, 160)
         )
         app.screen.blit(label, label.get_rect(center=crect.center))
     # Paint overlays only on the live view (hidden while previewing history): the in-progress
     # stroke plus any flushed strokes not yet baked into a published frame.
-    if app._timeline.preview_index is None:
+    if app.state.timeline.preview_index is None:
         for overlay, _ in app.canvas.paint.pending_overlays:
             app.canvas.blit(overlay)
         if not app.canvas.paint.layer.empty():
@@ -93,26 +93,26 @@ def tools(app: App) -> None:
     """Draw the colour palette, the brush-preview ring, and the canvas help HUD."""
     # Palette: current-colour preview + swatches (selected one outlined).
     pygame.draw.rect(
-        app.screen, app.brush.color, app.bottom_bar._color_preview_rect, border_radius=5
+        app.screen, app.paint.brush.color, app.bottom_bar._color_preview_rect, border_radius=5
     )
     pygame.draw.rect(
         app.screen, DIVIDER, app.bottom_bar._color_preview_rect, width=1, border_radius=5
     )
     for sr, color in app.bottom_bar._swatch_rects:
         pygame.draw.rect(app.screen, color, sr, border_radius=4)
-        if color == app.brush.color:
+        if color == app.paint.brush.color:
             pygame.draw.rect(app.screen, (255, 255, 255), sr, width=2, border_radius=4)
     region = app.layout.image_region()
     # Brush ring (scaled by zoom) — only in draw mode (not navigating, not previewing, and
     # not while a dialog window is up).
     if (
         not app._navigating
-        and app._timeline.preview_index is None
+        and app.state.timeline.preview_index is None
         and not app._modal_open()
         and region.collidepoint(app._mouse_pos)
     ):
-        ring = max(2, int(app.brush.size * app.canvas.view.zoom))
-        pygame.draw.circle(app.screen, app.brush.color, app._mouse_pos, ring, 2)
+        ring = max(2, int(app.paint.brush.size * app.canvas.view.zoom))
+        pygame.draw.circle(app.screen, app.paint.brush.color, app._mouse_pos, ring, 2)
         pygame.draw.circle(app.screen, (255, 255, 255), app._mouse_pos, ring + 1, 1)
     # Help HUD in the corner of the canvas (doesn't cost panel height), per mode.
     text = app._hud_font.render(NAV_HELP if app._navigating else DRAW_HELP, True, (210, 214, 222))
@@ -132,7 +132,7 @@ def history_ticks(app: App) -> None:
     Drawn after the UI so the ticks sit on top of the track; hovering the slider shows the
     nearest checkpoint's label so the otherwise-invisible snap points are discoverable.
     """
-    tl = app._timeline
+    tl = app.state.timeline
     if not tl.entries or not app.bottom_bar.history_slider.is_enabled:
         return
     total = app.history.total()

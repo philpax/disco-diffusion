@@ -25,12 +25,12 @@ class Canvas:
     def __init__(self, app: App) -> None:
         self.app = app
         self.view = ViewTransform()
-        self.paint = PaintController.for_canvas(app.width, app.height)
+        self.paint = PaintController.for_canvas(app.state.width, app.state.height)
         self.frame_surface: pygame.Surface | None = None
         self.frame_key: tuple[int, int] | None = None  # (id(array), index) to detect new frames
 
     def _size(self) -> tuple[int, int]:
-        return (self.app.width, self.app.height)
+        return (self.app.state.width, self.app.state.height)
 
     def _region(self) -> pygame.Rect:
         return self.app.layout.image_region()
@@ -79,9 +79,9 @@ class Canvas:
     def update_frame_surface(self) -> None:
         """Pull the worker's latest frame into ``frame_surface`` (+ refresh the step label)."""
         app = self.app
-        if app.worker is None:
+        if app.state.worker is None:
             return
-        frame = app.worker.latest_frame()
+        frame = app.state.worker.latest_frame()
         if frame is None:
             return
         # Refresh the step label every frame (cheap — pygame_gui no-ops if unchanged). A UI
@@ -99,4 +99,4 @@ class Canvas:
         """Paint into the layer at screen ``pos`` (no-op if outside the canvas)."""
         gen = self.screen_to_canvas(pos)
         if gen is not None:
-            self.paint.paint_to(gen, self.app.brush)
+            self.paint.paint_to(gen, self.app.paint.brush)

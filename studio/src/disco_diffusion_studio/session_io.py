@@ -20,6 +20,7 @@ from PIL import Image
 from .controls import PromptRow
 from .presets import HistoryItem, Session, load_session, save_session
 from .signals import Signals
+from .state import SharedState
 from .util import surface_to_pil
 from .worker import HistoryEntry, PromptSpec
 
@@ -32,9 +33,10 @@ log = logging.getLogger("disco_diffusion_studio.session_io")
 class SessionIO:
     """Captures / restores the whole working state as a session ``.zip``."""
 
-    def __init__(self, app: App, signals: Signals) -> None:
+    def __init__(self, app: App, signals: Signals, state: SharedState) -> None:
         self.app = app
         self.signals = signals
+        self.state = state
 
     def save(self) -> None:
         """Save the whole working state + result + history to a .zip via the native Save dialog."""
@@ -85,7 +87,7 @@ class SessionIO:
             app.canvas.frame_surface = None
         # Restore the scrubbable timeline (previews only, latent=None) — _sync_history keeps it
         # while there's no worker, and Revert continues from a checkpoint's preview via img2img.
-        app._timeline.load_entries(
+        self.state.timeline.load_entries(
             [
                 HistoryEntry(
                     latent=None,
@@ -107,12 +109,12 @@ class SessionIO:
         app = self.app
         recipe = app.recipe.current()
         return Session(
-            width=app.width,
-            height=app.height,
-            steps=app.steps,
+            width=self.state.width,
+            height=self.state.height,
+            steps=self.state.steps,
             seed=app.generation.seed_for_run(),  # also fills the field with the seed in use
-            denoise=app._init.denoise,
-            prompts=[PromptSpec(r.text, r.weight, r.muted) for r in app.prompts],
+            denoise=self.state.init.denoise,
+            prompts=[PromptSpec(r.text, r.weight, r.muted) for r in self.state.prompts],
             config=recipe.config,
             clip_models=recipe.clip_models,
             use_secondary_model=recipe.use_secondary_model,
@@ -137,7 +139,7 @@ class SessionIO:
                 ),
                 Image.fromarray(e.preview),
             )
-            for e in self.app._timeline.entries
+            for e in self.state.timeline.entries
         ]
 
     def _apply_session(self, session: Session) -> None:
@@ -146,13 +148,15 @@ class SessionIO:
         app.generation.apply_size(
             session.width, session.height
         )  # also stops the run + rebuilds the canvas
-        app.steps = session.steps
-        app.sidebar.set_steps_text(str(app.steps))
-        app._seed_text = str(session.seed)
-        app.sidebar.set_seed_text(app._seed_text)
-        app._init.denoise = session.denoise
-        app.sidebar.set_denoise(app._init.denoise)
-        app.prompts = [PromptRow(t, w, m) for t, w, m in session.prompts] or [PromptRow("", 1.0)]
+        self.state.steps = session.steps
+        app.sidebar.set_steps_text(str(self.state.steps))
+        self.state.seed_text = str(session.seed)
+        app.sidebar.set_seed_text(self.state.seed_text)
+        self.state.init.denoise = session.denoise
+        app.sidebar.set_denoise(self.state.init.denoise)
+        self.state.prompts = [PromptRow(t, w, m) for t, w, m in session.prompts] or [
+            PromptRow("", 1.0)
+        ]
         app.bottom_bar.rebuild_prompt_rows(app)
         app.recipe.apply_recipe(session.config, session.clip_models, session.use_secondary_model)
         app.recipe.selection = app.recipe.detect()

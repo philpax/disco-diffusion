@@ -103,7 +103,7 @@ class BottomBar:
         # thumb position matches its actual progress; drags snap to the nearest checkpoint.
         self.history_slider = ui.UIHorizontalSlider(
             self._history_slider_rect,
-            start_value=app._timeline.slider_start(app.history.live_index()),
+            start_value=app.state.timeline.slider_start(app.history.live_index()),
             value_range=(0.0, float(max(app.history.total(), 1))),
             manager=app.manager,
         )
@@ -114,17 +114,17 @@ class BottomBar:
         for name in BRUSHES:
             button = ui.UIButton(r.left(64), name, app.manager, object_id="#brush_button")
             self._brush_buttons[button] = name
-            if name == app.brush.type:
+            if name == app.paint.brush.type:
                 button.select()
         # Toggle: deposit fresh tinted noise (new structure) instead of plain colour.
         self.noise_button = ui.UIButton(r.left(74), "Noise", app.manager, object_id="#brush_button")
-        if app.brush.noise:
+        if app.paint.brush.noise:
             self.noise_button.select()
         # Right group (packed right-to-left, so it reads "Opacity [slider] Clear" left-to-right).
         self.clear_paint_button = ui.UIButton(r.right(64), "Clear", app.manager)
         self.strength_slider = ui.UIHorizontalSlider(
             r.right(104),
-            app.brush.strength,
+            app.paint.brush.strength,
             (BRUSH_STRENGTH_MIN, BRUSH_STRENGTH_MAX),
             app.manager,
         )
@@ -132,7 +132,7 @@ class BottomBar:
         # Size label + slider, the slider flexing into whatever's left between the two groups.
         ui.UILabel(r.left(36), "Size", app.manager)
         self.size_slider = ui.UIHorizontalSlider(
-            r.fill(), app.brush.size, (BRUSH_SIZE_MIN, BRUSH_SIZE_MAX), app.manager
+            r.fill(), app.paint.brush.size, (BRUSH_SIZE_MIN, BRUSH_SIZE_MAX), app.manager
         )
 
         # Row 4: colour palette — current-colour preview + swatches (custom-drawn), and an
@@ -174,7 +174,7 @@ class BottomBar:
         self._swatch_rects = []
         self._color_preview_rect = pygame.Rect(rect.x, rect.y, CTRL_H, CTRL_H)
         x = rect.x + CTRL_H + 10
-        colours = app._palette.swatches()
+        colours = app.paint.palette.swatches()
         n = max(len(colours), 1)
         gap = 4
         sw = max(8, min(CTRL_H, (rect.right - x - (n - 1) * gap) // n))
@@ -185,7 +185,9 @@ class BottomBar:
     def displayed_prompts(self, app: App) -> list[PromptRow]:
         """The prompts shown in the rows: a previewed checkpoint's, else the live set."""
         return (
-            app.history.preview_prompts if app.history.preview_prompts is not None else app.prompts
+            app.history.preview_prompts
+            if app.history.preview_prompts is not None
+            else app.state.prompts
         )
 
     def rebuild_prompt_rows(self, app: App) -> None:
@@ -290,21 +292,21 @@ class BottomBar:
             elif e == self.pick_color_button:
                 app._open_colour_picker()
             elif e == self.add_button:
-                app.prompts.append(PromptRow("", 1.0))
+                app.state.prompts.append(PromptRow("", 1.0))
                 self.rebuild_prompt_rows(app)
                 app._push_prompts()
                 app.history.request_checkpoint("add prompt")
             elif e in self._remove_buttons:
                 idx = self._remove_buttons[e]
-                if 0 <= idx < len(app.prompts):
-                    app.prompts.pop(idx)
+                if 0 <= idx < len(app.state.prompts):
+                    app.state.prompts.pop(idx)
                     self.rebuild_prompt_rows(app)
                     app._push_prompts()
                     app.history.request_checkpoint("remove prompt")
             elif e in self._mute_buttons:
                 idx = self._mute_buttons[e]
-                if 0 <= idx < len(app.prompts):
-                    prompt = app.prompts[idx]
+                if 0 <= idx < len(app.state.prompts):
+                    prompt = app.state.prompts[idx]
                     prompt.muted = not prompt.muted
                     (e.select if prompt.muted else e.unselect)()
                     self.refresh_rows(app)
@@ -313,18 +315,22 @@ class BottomBar:
                         "mute prompt" if prompt.muted else "unmute prompt"
                     )
             elif e in self._brush_buttons:
-                app.brush.type = self._brush_buttons[e]
+                app.paint.brush.type = self._brush_buttons[e]
                 for button, name in self._brush_buttons.items():
-                    (button.select if name == app.brush.type else button.unselect)()
+                    (button.select if name == app.paint.brush.type else button.unselect)()
             elif e == self.noise_button:
-                app.brush.noise = not app.brush.noise
-                (self.noise_button.select if app.brush.noise else self.noise_button.unselect)()
+                app.paint.brush.noise = not app.paint.brush.noise
+                (
+                    self.noise_button.select
+                    if app.paint.brush.noise
+                    else self.noise_button.unselect
+                )()
             elif e == self.clear_paint_button:
                 app.canvas.paint.layer.clear()
             elif e == self.revert_button:
                 app.history.revert()
             elif e == self.cancel_button:
-                app._timeline.clear_preview()
+                app.state.timeline.clear_preview()
                 self.park_history_thumb(float(app.history.live_index()))
                 app.history.refresh_preview_state()
             else:
@@ -333,19 +339,19 @@ class BottomBar:
         if event.type == pygame_gui.UI_HORIZONTAL_SLIDER_MOVED:
             e = event.ui_element
             if e == self.size_slider:
-                app.brush.size = float(event.value)
+                app.paint.brush.size = float(event.value)
             elif e == self.strength_slider:
-                app.brush.strength = float(event.value)
+                app.paint.brush.strength = float(event.value)
             elif e == self.history_slider:
                 # Step-space slider: snap the dragged value to the nearest checkpoint (or live)
                 # and park the thumb on that checkpoint's actual step position.
-                snapped = app._timeline.scrub(float(event.value), app.history.live_index())
+                snapped = app.state.timeline.scrub(float(event.value), app.history.live_index())
                 self.park_history_thumb(snapped)
                 app.history.refresh_preview_state()
             elif e in self._weight_sliders:
                 idx = self._weight_sliders[e]
-                if 0 <= idx < len(app.prompts):
-                    app.prompts[idx].weight = float(event.value)
+                if 0 <= idx < len(app.state.prompts):
+                    app.state.prompts[idx].weight = float(event.value)
                     self.refresh_rows(app)
                     app._push_prompts()
             else:
@@ -361,20 +367,22 @@ class BottomBar:
         """If ``pos`` hits a palette swatch, adopt it as the brush colour. True if it did."""
         for sr, color in self._swatch_rects:
             if sr.collidepoint(pos):
-                app.brush.color = color
+                app.paint.brush.color = color
                 return True
         return False
 
     def select_palette_index(self, app: App, index: int) -> None:
         """Digit keys: pick the nth swatch (palette + recents) as the brush colour, if it exists."""
-        colours = app._palette.swatches()
+        colours = app.paint.palette.swatches()
         if 0 <= index < len(colours):
-            app.brush.color = colours[index]
+            app.paint.brush.color = colours[index]
 
     def apply_picked_colour(self, app: App, rgb: tuple[int, int, int]) -> None:
         """Adopt a picked colour as the brush colour and remember it (capped, persisted)."""
-        app.brush.color = rgb
-        app._palette.remember(rgb)  # records off-palette colours as recents (deduped, persisted)
+        app.paint.brush.color = rgb
+        app.paint.palette.remember(
+            rgb
+        )  # records off-palette colours as recents (deduped, persisted)
         self.build_palette(app, self._palette_rect)  # relayout to include any new recent
 
     def set_step_label(self, text: str) -> None:
@@ -387,22 +395,22 @@ class BottomBar:
 
     def nudge_brush_size(self, app: App, factor: float) -> None:
         """Scale the brush size (clamped) and sync the slider — shared by [ / ] and the wheel."""
-        app.brush.nudge_size(factor)
-        self.size_slider.set_current_value(app.brush.size)
+        app.paint.brush.nudge_size(factor)
+        self.size_slider.set_current_value(app.paint.brush.size)
 
     def nudge_brush_strength(self, app: App, delta: float) -> None:
         """Shift the brush opacity (clamped) and sync the slider — shared by the wheel."""
-        app.brush.nudge_strength(delta)
-        self.strength_slider.set_current_value(app.brush.strength)
+        app.paint.brush.nudge_strength(delta)
+        self.strength_slider.set_current_value(app.paint.brush.strength)
 
     def commit_prompt_entry(self, app: App, entry: UITextEntryLine) -> None:
         """Apply a prompt text box's contents (on Enter or when focus moves away)."""
         idx = self._prompt_entries.get(entry)
-        if idx is None or not (0 <= idx < len(app.prompts)):
+        if idx is None or not (0 <= idx < len(app.state.prompts)):
             return
-        if entry.get_text() == app.prompts[idx].text:
+        if entry.get_text() == app.state.prompts[idx].text:
             return
-        app.prompts[idx].text = entry.get_text()
+        app.state.prompts[idx].text = entry.get_text()
         self.refresh_rows(app)
         app._push_prompts()
         app.history.request_checkpoint("prompt")
@@ -425,7 +433,7 @@ class BottomBar:
         self.history_slider.kill()
         self.history_slider = pygame_gui.elements.UIHorizontalSlider(
             self._history_slider_rect,
-            start_value=app._timeline.slider_start(app.history.live_index()),
+            start_value=app.state.timeline.slider_start(app.history.live_index()),
             value_range=(0.0, float(max(app.history.total(), 1))),
             manager=app.manager,
         )
@@ -434,15 +442,15 @@ class BottomBar:
         """History scrubbing, prompt editing, and the Play button reflect run / preview state."""
         editable = not app.running
         # History controls are usable only while paused/stopped and there's history to scrub.
-        hist_on = editable and len(app._timeline.entries) > 0
+        hist_on = editable and len(app.state.timeline.entries) > 0
         for hist_el in (self.history_slider, self.revert_button, self.cancel_button):
             (hist_el.enable if hist_on else hist_el.disable)()
         # Prompt rows are read-only while previewing a checkpoint (they show its prompts).
-        prompts_on = app._timeline.preview_index is None
+        prompts_on = app.state.timeline.preview_index is None
         prompt_widgets = [self.add_button, *self._prompt_entries, *self._weight_sliders]
         for pw in (*prompt_widgets, *self._remove_buttons, *self._mute_buttons):
             (pw.enable if prompts_on else pw.disable)()
         self.play_button.set_text("Pause" if app.running else "Play")
         # Can't resume mid-preview or mid-reload — Revert/Cancel, or wait for the reload.
-        play_off = app._timeline.preview_index is not None or app.models.reloader.reloading
+        play_off = app.state.timeline.preview_index is not None or app.models.reloader.reloading
         (self.play_button.disable if play_off else self.play_button.enable)()

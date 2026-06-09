@@ -79,7 +79,7 @@ def handle(app: App, event: pygame.event.Event) -> bool:
                 return True
             # No painting while previewing history — it would be invisible and unapplied.
             on_canvas = app.canvas.screen_to_canvas(event.pos) is not None
-            if app._timeline.preview_index is None and on_canvas:
+            if app.state.timeline.preview_index is None and on_canvas:
                 app.canvas.paint.begin()
                 app.canvas.paint_at(event.pos)
             return True
@@ -89,7 +89,7 @@ def handle(app: App, event: pygame.event.Event) -> bool:
             app._dragging_panel = False
             if app.canvas.paint.painting:  # a completed stroke becomes one batch / checkpoint
                 app.canvas.paint.end()
-                app.canvas.paint.flush(app.worker, app.brush)
+                app.canvas.paint.flush(app.state.worker, app.paint.brush)
             app.canvas.paint.last_gen = None
         elif event.button == 3:
             app._navigating = False
