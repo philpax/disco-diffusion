@@ -37,7 +37,7 @@ from disco_diffusion.config import AVAILABLE_CLIP_MODELS
 from PIL import Image
 from pygame_gui.windows import UIColourPickerDialog, UIConfirmationDialog, UIMessageWindow
 
-from . import _ui_build, _ui_draw, _ui_events, native_dialog
+from . import _ui_draw, _ui_events, native_dialog
 from .bottom_bar import BottomBar
 from .canvas import Canvas
 from .constants import (
@@ -333,7 +333,19 @@ class App:
 
     # -- UI construction --
     def _build_ui(self) -> None:
-        return _ui_build._build_ui(self)
+        """Rebuild every widget (the bottom panel + sidebar own their own build)."""
+        # Preserve the seed field's contents across the rebuild (the widget is recreated).
+        if hasattr(self.sidebar, "seed_entry"):
+            self._seed_text = self.sidebar.seed_entry.get_text()
+        self.manager.clear_and_reset()
+        self.bottom_bar._remove_buttons.clear()
+        self.bottom_bar._mute_buttons.clear()
+        self.bottom_bar._prompt_entries.clear()
+        self.bottom_bar._weight_sliders.clear()
+        self.bottom_bar._row_elements.clear()
+        self.bottom_bar.build(self)
+        self.sidebar.build(self)
+        self._sync_enabled()
 
     def _current_preset(self) -> Preset:
         """Capture the live settings (guidance + per-run + schedules + models) as a Preset."""
