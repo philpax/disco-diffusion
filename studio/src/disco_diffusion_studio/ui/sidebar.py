@@ -497,12 +497,12 @@ class Sidebar:
                 app._update_reload_queue()
                 app._mark_custom()
             elif e == self.apply_button:
-                app._apply_size(
+                app.generation.apply_size(
                     int_or(self.width_entry.get_text(), app.width),
                     int_or(self.height_entry.get_text(), app.height),
                 )
             elif e == self.swap_button:
-                app._apply_size(app.height, app.width)
+                app.generation.apply_size(app.height, app.width)
             elif e == self.random_seed_button:
                 app._seed_text = str(random.randrange(2**31))  # roll a fresh, visible seed
                 self.seed_entry.set_text(app._seed_text)
@@ -546,7 +546,7 @@ class Sidebar:
         if event.type == pygame_gui.UI_TEXT_ENTRY_FINISHED:
             e = event.ui_element
             if e == self.steps_entry:
-                app._commit_steps()
+                app.generation.commit_steps()
                 return True
             if e in (self.width_entry, self.height_entry):
                 return True  # applied via the Apply button
@@ -594,7 +594,7 @@ class Sidebar:
         # While a run exists (playing, paused, or done) these reflect that run's frozen snapshot —
         # what the image on screen was generated with; only once fully stopped do they show the
         # pending values the next run would use.
-        perrun = app._run_snapshot if app.worker is not None else self.perrun_values(app)
+        perrun = app.generation.run_snapshot if app.worker is not None else self.perrun_values(app)
         for key, _name in CURRENT_PERRUN:
             label = self._current_labels.get(key)
             text = perrun.get(key, "—")

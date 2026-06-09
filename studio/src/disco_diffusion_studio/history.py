@@ -154,7 +154,7 @@ class History:
         app._timeline.clear_preview()
         self.preview_prompts = None
         app.bottom_bar.rebuild_prompt_rows(app)
-        app._start_run()  # seeds the new run from the checkpoint preview (img2img)
+        app.generation.start()  # seeds the new run from the checkpoint preview (img2img)
 
     def keyboard_revert(self) -> None:
         """Ctrl+Z: step back through the checkpoints, reverting to each in turn (undo)."""

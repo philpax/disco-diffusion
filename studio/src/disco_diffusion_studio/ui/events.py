@@ -107,11 +107,11 @@ def _handle_event(app: App, event: pygame.event.Event) -> bool:
     if event.type == pygame.KEYDOWN and not app._typing() and not app._modal_open():
         if event.mod & pygame.KMOD_CTRL:  # ctrl combos: Save / Revert
             if event.key == pygame.K_s:
-                app._save_image()
+                app.generation.save_image()
             elif event.key == pygame.K_z:
                 app.history.keyboard_revert()
         elif event.key == pygame.K_SPACE:
-            app._toggle_play()
+            app.generation.toggle_play()
         elif event.key == pygame.K_f:
             app.canvas.fit()
         elif event.key == pygame.K_0:

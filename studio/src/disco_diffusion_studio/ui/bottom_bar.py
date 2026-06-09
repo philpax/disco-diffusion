@@ -279,14 +279,14 @@ class BottomBar:
         if event.type == pygame_gui.UI_BUTTON_PRESSED:
             e = event.ui_element
             if e == self.play_button:
-                app._toggle_play()
+                app.generation.toggle_play()
             elif e == self.stop_button:
-                app._stop_run()
+                app.generation.stop()
                 app._status("Stopped")
             elif e == self.reset_button:
                 app._open_reset_confirm()
             elif e == self.save_button:
-                app._save_image()
+                app.generation.save_image()
             elif e == self.pick_color_button:
                 app._open_colour_picker()
             elif e == self.add_button:

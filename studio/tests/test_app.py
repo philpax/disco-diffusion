@@ -130,7 +130,7 @@ def test_mute_button_toggles_and_excludes_from_snapshot(app):
 
 def test_seed_for_run_random_fills_field(app):
     app.sidebar.seed_entry.set_text("")
-    seed = app._seed_for_run()
+    seed = app.generation.seed_for_run()
     assert 0 <= seed < 2**31
     assert app.sidebar.seed_entry.get_text() == str(seed)  # the used seed is shown (reproducible)
 
@@ -141,13 +141,13 @@ def test_seed_field_is_populated_on_startup(app):
 
 def test_seed_for_run_uses_typed_value_and_is_stable_on_replay(app):
     app.sidebar.seed_entry.set_text("12345")
-    assert app._seed_for_run() == 12345
-    assert app._seed_for_run() == 12345  # replaying reuses the same seed (continuity)
+    assert app.generation.seed_for_run() == 12345
+    assert app.generation.seed_for_run() == 12345  # replaying reuses the same seed (continuity)
 
 
 def test_seed_for_run_invalid_is_randomised(app):
     app.sidebar.seed_entry.set_text("not-a-number")
-    seed = app._seed_for_run()
+    seed = app.generation.seed_for_run()
     assert app.sidebar.seed_entry.get_text() == str(seed)  # replaced with a real (random) seed
 
 
@@ -285,7 +285,7 @@ def test_guidance_snapshot_keeps_int_knobs_int(app):
 
 def test_loaded_revert_continues_via_img2img(app, monkeypatch):
     started = []
-    monkeypatch.setattr(app, "_start_run", lambda: started.append(True))
+    monkeypatch.setattr(app.generation, "start", lambda: started.append(True))
     img = np.full((app.height, app.width, 3), 5, np.uint8)
     app.worker = None
     app._timeline.entries = [
@@ -344,7 +344,7 @@ def test_save_image_reports_when_no_backend(app, monkeypatch):
 
     monkeypatch.setattr(A.native_dialog, "save_file", _unavailable)
     app.canvas.frame_surface = pygame.Surface((app.width, app.height))
-    app._save_image()
+    app.generation.save_image()
     assert "native dialog" in app.bottom_bar.status_label.text.lower()
 
 

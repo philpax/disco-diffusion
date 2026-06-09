@@ -42,6 +42,7 @@ from .constants import (
     RELOAD_DEBOUNCE_MS,
 )
 from .controls import CUSTOM_PRESET, PromptRow
+from .generation import Generation
 from .history import History
 from .init_image import InitImage
 from .layout import (
@@ -79,7 +80,7 @@ from .ui import draw, events
 from .ui.bottom_bar import BottomBar
 from .ui.canvas import Canvas
 from .ui.sidebar import Sidebar
-from .util import clamp_steps, surface_to_pil
+from .util import surface_to_pil
 from .worker import GenerationWorker, PromptSpec
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
@@ -144,6 +145,7 @@ class App:
     bottom_bar: BottomBar = field(init=False)  # transport / history / paint tools / prompts
     session_io: SessionIO = field(init=False)  # save/load the working state as a .zip
     history: History = field(init=False)  # checkpoints / preview scrubbing / undo / revert
+    generation: Generation = field(init=False)  # run lifecycle: start/stop/size/steps/seed/save
 
     def __post_init__(self) -> None:
         self.width = snap_side(self.width)
@@ -228,12 +230,12 @@ class App:
         self._secondary_on: bool = self.session.config.use_secondary_model
         self._reloader = ModelReloader()  # background weight reload + debounced trigger
         self.session_io = SessionIO(self)  # save/load the working state as a .zip
+        # The run lifecycle: start/stop/pause, output size + steps, seed, save (see generation.py).
+        # It also holds the "Current" tab's per-run snapshot (read straight from session.config for
+        # live knobs).
+        self.generation = Generation(self)
         # The preset matching the loaded session (or "Custom"); the dropdown's selected entry.
         self._preset_selection = self._detect_preset()
-
-        # "Current" sidebar tab: snapshot of the per-run settings the active run was started
-        # with (live knobs are read straight from session.config), plus the label cache.
-        self._run_snapshot: dict[str, str] = {}
 
         # img2img init image (per-run, applies on next Play): seed the run from an image instead
         # of noise, set by Open…/drag-drop (a file) or "Use current" (the on-screen frame). The
@@ -496,7 +498,7 @@ class App:
         if set(selected) == set(cfg.clip_models) and self._secondary_on == cfg.use_secondary_model:
             self._status("No change")
             return
-        self._stop_run()  # the worker holds the old session; tear it down first
+        self.generation.stop()  # the worker holds the old session; tear it down first
         new_cfg = cfg.model_copy(
             update={"clip_models": selected, "use_secondary_model": self._secondary_on}
         )
@@ -558,96 +560,6 @@ class App:
         if self.worker is not None and self.worker.is_alive():
             self.worker.set_prompts(self._prompt_snapshot())
 
-    # -- run lifecycle --
-    def _seed_for_run(self) -> int:
-        """Seed for the next run: the typed value, or a fresh random one (then shown in the field).
-
-        Filling the field with the seed actually used makes every run reproducible and visible.
-        """
-        try:
-            seed = int(self.sidebar.seed_text().strip())
-            if seed < 0:
-                raise ValueError
-        except ValueError:
-            seed = random.randrange(2**31)  # empty / invalid -> random, then surface it
-        self._seed_text = str(seed)
-        self.sidebar.set_seed_text(self._seed_text)
-        return seed
-
-    def _start_run(self) -> None:
-        # Adopt any step count typed into the box but not yet Enter-applied: clicking Play
-        # moves focus off the box without firing UI_TEXT_ENTRY_FINISHED, so without this the
-        # run would silently use the previous value.
-        self._commit_steps()
-        self._stop_run()
-        self.worker = GenerationWorker(
-            self.session,
-            width=self.width,
-            height=self.height,
-            steps=self.steps,
-            encode_cache=self._encode_cache,
-            cache_lock=self._cache_lock,
-            perlin=self.session.config.perlin_init,
-            init_image=self._init.image,
-            skip_steps=self._init.skip_steps(self.steps),
-            seed=self._seed_for_run(),
-        )
-        self.worker.set_prompts(self._prompt_snapshot())
-        # A fresh worker starts with paint_applied_count == 0; reset the overlay tracking to match
-        # and drop stale overlays from the previous run. Any stroke painted before Play (still on
-        # the active layer) is flushed as the new run's first paint batch rather than discarded.
-        self.canvas.paint.reset_overlays()
-        if not self.canvas.paint.layer.empty():
-            self.canvas.paint.flush(self.worker, self.brush)
-        # Freeze the per-run settings this run uses, for the "Current" tab to show while it runs.
-        self._run_snapshot = self.sidebar.perrun_values(self)
-        self._timeline.reset()
-        self.paused = False
-        self.worker.start()
-        self._status("Running")
-        self._sync_enabled()
-
-    def _stop_run(self) -> None:
-        if self.worker is not None:
-            self.worker.stop()
-            self.worker.join(timeout=5.0)
-        self.worker = None
-        self.paused = False
-        self._timeline.reset()
-        self._sync_enabled()
-
-    def _toggle_play(self) -> None:
-        if self._timeline.preview_index is not None:
-            self._status("Previewing")
-            return
-        if self.worker is None or not self.worker.is_alive() or self.worker.finished:
-            self._start_run()  # finished -> Play starts a fresh run (Revert continues a branch)
-        elif self.paused:
-            self.paused = False
-            self._timeline.clear_preview()  # resume from live, drop any history preview
-            self._timeline.end_undo()  # resuming ends the undo chain
-            self.worker.resume()
-            self._status("Running")
-            self._sync_enabled()
-        else:
-            self.paused = True
-            self.worker.pause()
-            self._status("Paused")
-            self._sync_enabled()
-
-    def _apply_size(self, width: int, height: int) -> None:
-        # Changing the output shape requires a fresh run. The window does NOT change — the
-        # image is letterboxed into the image region — so orientation flips keep proportions.
-        self._stop_run()
-        self.width = snap_side(width)
-        self.height = snap_side(height)
-        self.sidebar.set_size_text(self.width, self.height)
-        # Generation size changed: rebuild the init preview (also generation-res), then have the
-        # canvas adopt the new size (rebuild the paint layer, drop the stale frame, refit the view).
-        self._init.rebuild_surface(self.width, self.height)
-        self.canvas.apply_size(self.width, self.height)
-        self._status("Size set")
-
     def _set_sidebar_width(self, width: int) -> None:
         """Set the sidebar width (clamped); the rebuild is coalesced to one per frame."""
         if self.layout.set_sidebar_width(width):
@@ -666,43 +578,6 @@ class App:
         self.manager.set_window_resolution((w, h))
         self._build_ui()
         self.canvas.clamp_pan()  # keep the canvas in view after the viewport changed
-
-    def _commit_steps(self) -> None:
-        """Adopt the steps box value (clamped). Safe to call on Enter, on blur, or at Play.
-
-        Idempotent: re-committing the same value is a no-op, so calling it just before a run
-        starts (to pick up a number typed but not Enter-applied) never disturbs anything.
-        """
-        try:
-            value = clamp_steps(self.sidebar.steps_text())
-        except ValueError:
-            self.sidebar.set_steps_text(str(self.steps))
-            return
-        self.sidebar.set_steps_text(str(value))
-        if value == self.steps:
-            return
-        self.steps = value
-        # If a run is paused, changing steps abandons it (respacing is fixed per run).
-        if self.worker is not None and self.worker.is_alive():
-            self._stop_run()
-            self._status("Steps set")
-
-    def _save_image(self) -> None:
-        """Save the current frame via the native Save dialog (blocks while it's open)."""
-        surface = self.canvas.frame_for_save()  # freeze; the worker keeps generating
-        if surface is None:
-            self._status("No frame")
-            return
-        path_str = self._native_path("save", "Save image")
-        if not path_str:
-            return  # cancelled
-        path = Path(path_str)
-        if path.suffix.lower() not in (".png", ".jpg", ".jpeg", ".bmp", ".tga"):
-            path = path.with_suffix(".png")
-        path.parent.mkdir(parents=True, exist_ok=True)
-        pygame.image.save(surface, str(path))
-        self._status("Saved")
-        log.info("saved %s", path)
 
     # -- init image (img2img) --
     def _set_init_image(self, image: Image.Image, label: str) -> None:
@@ -760,7 +635,7 @@ class App:
 
     def _reset_canvas(self) -> None:
         """Stop the run and drop the rendered frame, revealing the init preview / empty canvas."""
-        self._stop_run()  # also clears history / preview index
+        self.generation.stop()  # also clears history / preview index
         self.canvas.clear_frame()
         self.bottom_bar.set_step_label("step 0 / 0")
         self._status("Canvas cleared")
@@ -784,7 +659,7 @@ class App:
                 self.bottom_bar.commit_prompt_entry(self, previous)
         steps_focused = self.sidebar.steps_entry in focus
         if self._steps_focused and not steps_focused:
-            self._commit_steps()
+            self.generation.commit_steps()
         self._steps_focused = steps_focused
         sched = next((e for e in self.sidebar._schedule_entries if e in focus), None)
         if sched is not self._focused_schedule:
@@ -872,7 +747,7 @@ class App:
             self._draw_tools()
             self._draw_history_ticks()
             pygame.display.flip()
-        self._stop_run()
+        self.generation.stop()
 
 
 def main() -> None:

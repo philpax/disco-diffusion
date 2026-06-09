@@ -108,7 +108,7 @@ class SessionIO:
             width=app.width,
             height=app.height,
             steps=app.steps,
-            seed=app._seed_for_run(),  # also fills the field with the seed in use
+            seed=app.generation.seed_for_run(),  # also fills the field with the seed in use
             denoise=app._init.denoise,
             prompts=[PromptSpec(r.text, r.weight, r.muted) for r in app.prompts],
             config=recipe.config,
@@ -141,7 +141,9 @@ class SessionIO:
     def _apply_session(self, session: Session) -> None:
         """Adopt a loaded session: stop the run, set output + prompts + the recipe for next Play."""
         app = self.app
-        app._apply_size(session.width, session.height)  # also stops the run + rebuilds the canvas
+        app.generation.apply_size(
+            session.width, session.height
+        )  # also stops the run + rebuilds the canvas
         app.steps = session.steps
         app.sidebar.set_steps_text(str(app.steps))
         app._seed_text = str(session.seed)
@@ -153,5 +155,5 @@ class SessionIO:
         app._apply_recipe(session.config, session.clip_models, session.use_secondary_model)
         app._preset_selection = app._detect_preset()
         app.sidebar.spawn_preset_dropdown(app)
-        app._run_snapshot = app.sidebar.perrun_values(app)
+        app.generation.run_snapshot = app.sidebar.perrun_values(app)
         app._status("Session loaded — press Play")
