@@ -157,6 +157,8 @@ class App:
             steps=steps,
             prompts=prompts or [PromptRow("a vast alien landscape, oil painting", 1.0)],
             seed_text=str(random.randrange(2**31)),
+            clip_selected=set(session.config.clip_models),
+            secondary_on=session.config.use_secondary_model,
         )
         # The UI event bus: controllers announce status messages / enablement-invalidation through
         # it instead of reaching back into the bottom bar + sidebar. Listeners are wired below,
@@ -264,6 +266,7 @@ class App:
         # bottom bar's status line, and an invalidation re-syncs both areas' widget enablement.
         self.signals.on_status(self.bottom_bar.set_status)
         self.signals.on_invalidate(self._resync_enabled)
+        self.signals.on_edited(self.recipe.mark_custom)  # editing a knob flips the preset to Custom
         self._build_ui()
 
     # -- geometry --

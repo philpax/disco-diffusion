@@ -50,11 +50,10 @@ class Recipe:
 
     def current(self) -> Preset:
         """Capture the live settings (guidance + per-run + schedules + models) as a Preset."""
-        app = self.app
         config = PresetConfig.from_run_config(self.state.session.config)
-        models = [m for m in AVAILABLE_CLIP_MODELS if m in app.models.clip_selected]
+        models = [m for m in AVAILABLE_CLIP_MODELS if m in self.state.clip_selected]
         return Preset(
-            config=config, clip_models=models, use_secondary_model=app.models.secondary_on
+            config=config, clip_models=models, use_secondary_model=self.state.secondary_on
         )
 
     def detect(self) -> str:
@@ -89,10 +88,10 @@ class Recipe:
             for attr, value in config.model_dump().items():
                 setattr(cfg, attr, value)
             app.sidebar.refresh_advanced_widgets(app)
-            app.models.clip_selected = set(clip_models)
-            app.models.secondary_on = use_secondary
-            app.sidebar.sync_model_buttons(app.models.clip_selected, app.models.secondary_on)
-            app.models.update_queue()
+            self.state.clip_selected = set(clip_models)
+            self.state.secondary_on = use_secondary
+            app.sidebar.sync_model_buttons(self.state.clip_selected, self.state.secondary_on)
+            app.models.update_queue()  # one-way: re-evaluate the debounced reload for the new set
         finally:
             self.applying = False
 

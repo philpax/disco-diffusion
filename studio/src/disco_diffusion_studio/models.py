@@ -32,10 +32,8 @@ class Models:
         self.app = app
         self.signals = signals
         self.state = state
-        # Staged selection (what the toggles show). Changing it queues an auto-reload (debounced);
-        # it fires after the user stops, and un-queues if they revert to the loaded set.
-        self.clip_selected: set[str] = set(self.state.session.config.clip_models)
-        self.secondary_on: bool = self.state.session.config.use_secondary_model
+        # The staged selection (state.clip_selected / secondary_on) is shared session state;
+        # changing it queues a debounced auto-reload that un-queues if it returns to the loaded set.
         self.reloader = ModelReloader()  # background weight reload + debounced trigger
 
     @property
@@ -45,26 +43,24 @@ class Models:
 
     def toggle_clip(self, button: pygame_gui.elements.UIButton) -> None:
         """Stage a CLIP model in/out of the pending selection (queues the auto-reload)."""
-        app = self.app
-        name = app.sidebar.model_name(button)
-        self.clip_selected.symmetric_difference_update({name})  # toggle in/out
-        app.sidebar.sync_model_buttons(self.clip_selected, self.secondary_on)
+        name = self.app.sidebar.model_name(button)
+        self.state.clip_selected.symmetric_difference_update({name})  # toggle in/out
+        self.app.sidebar.sync_model_buttons(self.state.clip_selected, self.state.secondary_on)
         self.update_queue()
-        app.recipe.mark_custom()
+        self.signals.edited()
 
     def toggle_secondary(self) -> None:
         """Stage the secondary model in/out of the pending selection (queues the auto-reload)."""
-        app = self.app
-        self.secondary_on = not self.secondary_on
-        app.sidebar.sync_model_buttons(self.clip_selected, self.secondary_on)
+        self.state.secondary_on = not self.state.secondary_on
+        self.app.sidebar.sync_model_buttons(self.state.clip_selected, self.state.secondary_on)
         self.update_queue()
-        app.recipe.mark_custom()
+        self.signals.edited()
 
     def matches_session(self) -> bool:
         """True when the staged CLIP set + secondary toggle equal the loaded session's."""
         cfg = self.state.session.config
-        return set(self.clip_selected) == set(cfg.clip_models) and (
-            self.secondary_on == cfg.use_secondary_model
+        return set(self.state.clip_selected) == set(cfg.clip_models) and (
+            self.state.secondary_on == cfg.use_secondary_model
         )
 
     def update_queue(self) -> None:
@@ -98,19 +94,22 @@ class Models:
         app = self.app
         if self.reloader.reloading:
             return
-        selected = [m for m in AVAILABLE_CLIP_MODELS if m in self.clip_selected]
+        selected = [m for m in AVAILABLE_CLIP_MODELS if m in self.state.clip_selected]
         if not selected:
             self.signals.status("Pick a model")
             return
         cfg = self.state.session.config
         # Order is irrelevant for the CLIP set (guidance sums over all models), so compare as
         # sets — otherwise a reselection in a different order would look like a change.
-        if set(selected) == set(cfg.clip_models) and self.secondary_on == cfg.use_secondary_model:
+        if (
+            set(selected) == set(cfg.clip_models)
+            and self.state.secondary_on == cfg.use_secondary_model
+        ):
             self.signals.status("No change")
             return
         app.generation.stop()  # the worker holds the old session; tear it down first
         new_cfg = cfg.model_copy(
-            update={"clip_models": selected, "use_secondary_model": self.secondary_on}
+            update={"clip_models": selected, "use_secondary_model": self.state.secondary_on}
         )
         self.reloader.start(new_cfg, self.state.session.device)
         self.signals.status("Reloading…")
@@ -125,8 +124,8 @@ class Models:
         if result and "session" in result:
             self.state.session = result["session"]  # type: ignore[assignment]
             self.state.encode_cache.clear()  # embeds came from the old CLIP set — now stale
-            self.clip_selected = set(self.state.session.config.clip_models)
-            self.secondary_on = self.state.session.config.use_secondary_model
+            self.state.clip_selected = set(self.state.session.config.clip_models)
+            self.state.secondary_on = self.state.session.config.use_secondary_model
             self.signals.status("Reloaded")
         else:
             self.signals.status("Reload failed")  # the traceback was logged by the reload thread

@@ -328,7 +328,7 @@ class Sidebar:
                 r.left(bw), name, self.manager, container=container, object_id="#brush_button"
             )
             self._clip_buttons[button] = name
-            if name in app.models.clip_selected:
+            if name in self.state.clip_selected:
                 button.select()
             if i % per_row == per_row - 1:
                 y += pitch
@@ -342,7 +342,7 @@ class Sidebar:
             container=container,
             object_id="#brush_button",
         )
-        if app.models.secondary_on:
+        if self.state.secondary_on:
             self.secondary_button.select()
         return y + pitch
 
@@ -495,7 +495,7 @@ class Sidebar:
                 on = self.state.session.config.perlin_init
                 (self.perlin_button.select if on else self.perlin_button.unselect)()
                 self.signals.status(f"Perlin {'on' if on else 'off'}")
-                app.recipe.mark_custom()
+                self.signals.edited()
             elif e in self._clip_buttons:
                 app.models.toggle_clip(e)
             elif e == self.secondary_button:
@@ -520,7 +520,7 @@ class Sidebar:
                 # eta is read when the loop's generator is built, so this lands on the next run.
                 self.state.session.config.eta = float(event.value)
                 self._eta_label.set_text(f"{event.value:.2f}")
-                app.recipe.mark_custom()
+                self.signals.edited()
             elif e == self._init_denoise_slider:
                 # img2img strength — converted to skip_steps at the next Play.
                 self.state.init.denoise = int(round(event.value))
@@ -532,7 +532,7 @@ class Sidebar:
                 # retunes guidance on the next step (and seeds the next run when stopped).
                 setattr(self.state.session.config, attr, value)
                 vlabel.set_text(fmt.format(value))
-                app.recipe.mark_custom()
+                self.signals.edited()
                 # Drop a revert point once the drag settles (debounced in run()).
                 app.history.arm_guidance_checkpoint(
                     pygame.time.get_ticks() + GUIDANCE_CHECKPOINT_MS
@@ -635,7 +635,7 @@ class Sidebar:
             return
         setattr(self.state.session.config, attr, text)
         self.signals.status("Schedule set")
-        app.recipe.mark_custom()
+        self.signals.edited()
 
     def sync_enabled(self, app: App) -> None:
         """The output boxes (steps / seed / size) are editable only when not generating."""

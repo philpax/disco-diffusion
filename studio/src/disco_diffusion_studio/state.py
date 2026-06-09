@@ -34,6 +34,10 @@ class SharedState:
     # Seed field contents, persisted across UI rebuilds. Always a concrete seed so the value in
     # use is visible upfront and replaying reuses it; "Rnd" rolls a fresh one (random at startup).
     seed_text: str
+    # Staged model selection (what the toggles show, pending a weight reload). Seeded from the
+    # loaded session; Models drives the reload, Recipe reads it as part of the live recipe.
+    clip_selected: set[str]
+    secondary_on: bool
     worker: GenerationWorker | None = None
     paused: bool = False
     timeline: Timeline = field(default_factory=Timeline)

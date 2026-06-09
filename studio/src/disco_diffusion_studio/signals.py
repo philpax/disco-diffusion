@@ -19,6 +19,7 @@ class Signals:
     def __init__(self) -> None:
         self._status: list[Callable[[str], None]] = []
         self._invalidate: list[Callable[[], None]] = []
+        self._edited: list[Callable[[], None]] = []
 
     def on_status(self, handler: Callable[[str], None]) -> None:
         """Subscribe to status-line messages (e.g. the bottom bar's status label)."""
@@ -28,6 +29,10 @@ class Signals:
         """Subscribe to enablement-invalidation (e.g. an area re-syncing its widgets)."""
         self._invalidate.append(handler)
 
+    def on_edited(self, handler: Callable[[], None]) -> None:
+        """Subscribe to "a preset-controlled knob was edited" (e.g. the recipe flips to Custom)."""
+        self._edited.append(handler)
+
     def status(self, text: str) -> None:
         """Announce a status-line message to every subscriber."""
         for handler in self._status:
@@ -36,4 +41,9 @@ class Signals:
     def invalidate(self) -> None:
         """Announce that widget enable/disable state needs re-syncing to every subscriber."""
         for handler in self._invalidate:
+            handler()
+
+    def edited(self) -> None:
+        """Announce a preset-controlled knob was edited (a guidance slider, a model toggle, …)."""
+        for handler in self._edited:
             handler()
