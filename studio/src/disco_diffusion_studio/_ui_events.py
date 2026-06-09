@@ -141,7 +141,7 @@ def _handle_event(app: App, event: pygame.event.Event) -> bool:
             app.sidebar._sidebar_tab = (
                 "settings" if event.ui_element == app.sidebar.tab_settings else "current"
             )
-            app._sync_sidebar_tabs()
+            app.sidebar.sync_tabs(app)
         elif event.ui_element == app.sidebar.save_preset_button:
             app._open_save_preset_dialog()
         elif event.ui_element == app.sidebar.save_session_button:

@@ -35,9 +35,6 @@ import pygame_gui
 from disco_diffusion import DiscoSession, EncodedPrompt, RunConfig
 from disco_diffusion.config import AVAILABLE_CLIP_MODELS, parse_schedule
 from PIL import Image
-from pygame_gui.elements import (
-    UIScrollingContainer,
-)
 from pygame_gui.windows import UIColourPickerDialog, UIConfirmationDialog, UIMessageWindow
 
 from . import _ui_build, _ui_draw, _ui_events, native_dialog
@@ -388,9 +385,6 @@ class App:
     def _build_bottom_panel(self) -> None:
         return _ui_build._build_bottom_panel(self)
 
-    def _build_sidebar(self) -> None:
-        return _ui_build._build_sidebar(self)
-
     def _displayed_prompts(self) -> list[PromptRow]:
         return _ui_build._displayed_prompts(self)
 
@@ -399,47 +393,6 @@ class App:
 
     def _refresh_rows(self) -> None:
         return _ui_build._refresh_rows(self)
-
-    def _section_label(
-        self, container: UIScrollingContainer, inner_w: int, y: int, text: str
-    ) -> int:
-        return _ui_build._section_label(self, container, inner_w, y, text)
-
-    def _build_settings_rows(self) -> None:
-        return _ui_build._build_settings_rows(self)
-
-    def _build_output_section(
-        self, container: UIScrollingContainer, inner_w: int, pitch: int, y: int
-    ) -> int:
-        return _ui_build._build_output_section(self, container, inner_w, pitch, y)
-
-    def _build_init_section(
-        self, container: UIScrollingContainer, inner_w: int, pitch: int, y: int
-    ) -> int:
-        return _ui_build._build_init_section(self, container, inner_w, pitch, y)
-
-    def _build_preset_section(
-        self, container: UIScrollingContainer, inner_w: int, pitch: int, y: int
-    ) -> int:
-        return _ui_build._build_preset_section(self, container, inner_w, pitch, y)
-
-    def _build_guidance_section(
-        self, container: UIScrollingContainer, inner_w: int, pitch: int, y: int
-    ) -> int:
-        return _ui_build._build_guidance_section(self, container, inner_w, pitch, y)
-
-    def _build_perrun_section(
-        self, container: UIScrollingContainer, inner_w: int, pitch: int, y: int
-    ) -> int:
-        return _ui_build._build_perrun_section(self, container, inner_w, pitch, y)
-
-    def _build_models_section(
-        self, container: UIScrollingContainer, inner_w: int, pitch: int, y: int
-    ) -> int:
-        return _ui_build._build_models_section(self, container, inner_w, pitch, y)
-
-    def _build_current_rows(self) -> None:
-        return _ui_build._build_current_rows(self)
 
     def _perrun_values(self) -> dict[str, str]:
         """Display strings for every CURRENT_PERRUN key from the current (pending) state.
@@ -487,9 +440,6 @@ class App:
             if label is not None and label.text != text:
                 label.set_text(text)
 
-    def _sync_sidebar_tabs(self) -> None:
-        return _ui_build._sync_sidebar_tabs(self)
-
     def _commit_schedule_entry(self, entry: pygame_gui.elements.UITextEntryLine) -> None:
         """Validate a cut-schedule box and store it on the config (applies on next Play).
 
@@ -518,9 +468,6 @@ class App:
         self._status("Schedule set")
         self._mark_custom()
 
-    def _refresh_advanced_widgets(self) -> None:
-        return _ui_build._refresh_advanced_widgets(self)
-
     def _current_preset(self) -> Preset:
         """Capture the live settings (guidance + per-run + schedules + models) as a Preset."""
         config = PresetConfig.from_run_config(self.session.config)
@@ -531,15 +478,12 @@ class App:
         """The saved preset whose recipe matches the live settings, else "Custom"."""
         return match_preset(self._presets, self._current_preset()) or CUSTOM_PRESET
 
-    def _spawn_preset_dropdown(self) -> None:
-        return _ui_build._spawn_preset_dropdown(self)
-
     def _set_preset_selection(self, name: str) -> None:
         """Set the dropdown's selected entry (rebuilding it, since it has no set-selected API)."""
         if self._preset_selection == name and self.sidebar.preset_dropdown is not None:
             return
         self._preset_selection = name
-        self._spawn_preset_dropdown()
+        self.sidebar.spawn_preset_dropdown(self)
 
     def _mark_custom(self) -> None:
         """Flip the preset dropdown to "Custom" after the user edits a preset-controlled knob."""
@@ -560,7 +504,7 @@ class App:
             cfg = self.session.config
             for attr, value in config.model_dump().items():
                 setattr(cfg, attr, value)
-            self._refresh_advanced_widgets()
+            self.sidebar.refresh_advanced_widgets(self)
             self._clip_selected = set(clip_models)
             self._secondary_on = use_secondary
             for button, mname in self.sidebar._clip_buttons.items():
@@ -715,7 +659,7 @@ class App:
         self._rebuild_prompt_rows()
         self._apply_recipe(session.config, session.clip_models, session.use_secondary_model)
         self._preset_selection = self._detect_preset()
-        self._spawn_preset_dropdown()
+        self.sidebar.spawn_preset_dropdown(self)
         self._run_snapshot = self._perrun_values()
         self._status("Session loaded — press Play")
 
@@ -1150,7 +1094,7 @@ class App:
         # syncing the sliders; cancel any pending guidance checkpoint.
         entry.config.apply_to(self.session.config)
         self._guidance_checkpoint_at = None
-        self._refresh_advanced_widgets()
+        self.sidebar.refresh_advanced_widgets(self)
         self.worker.seek(self._timeline.preview_index)
         self._timeline.preview_index = None
         self._preview_prompts = None
@@ -1169,7 +1113,7 @@ class App:
         """Revert into a loaded checkpoint (no latent): continue from its preview via img2img."""
         self.prompts = [PromptRow(t, w, m) for t, w, m in entry.prompts]
         entry.config.apply_to(self.session.config)
-        self._refresh_advanced_widgets()
+        self.sidebar.refresh_advanced_widgets(self)
         self._set_init_image(Image.fromarray(entry.preview), f"history: {entry.label}")
         self._timeline.preview_index = None
         self._preview_prompts = None

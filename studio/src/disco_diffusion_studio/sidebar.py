@@ -1,15 +1,18 @@
 """The right sidebar: the Settings tab + the read-only Current tab + session save/load.
 
-:class:`Sidebar` owns the sidebar's widgets as one named group, so the rest of the app reaches
-them via ``app.sidebar.*`` rather than as ~30 fields on the god-class. It's built by the
-``_ui_build`` helpers and driven by the App's event router (which will fold into this class next).
+:class:`Sidebar` owns the sidebar's widgets *and* builds them (``build`` + the per-section
+helpers), keeping the right column out of the god-class. It takes the App for shared state /
+actions; the App's event router still drives it (folding the event slice in is the next step).
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 import pygame
+import pygame_gui
+from disco_diffusion.config import AVAILABLE_CLIP_MODELS
 from pygame_gui.elements import (
     UIButton,
     UIDropDownMenu,
@@ -18,6 +21,12 @@ from pygame_gui.elements import (
     UIScrollingContainer,
     UITextEntryLine,
 )
+
+from .controls import CURRENT_PERRUN, CUSTOM_PRESET, LIVE_SCALES, SCHEDULES
+from .layout import CTRL_H, LABEL_H, MARGIN, PAD, Row
+
+if TYPE_CHECKING:
+    from .app import App
 
 
 @dataclass
@@ -67,3 +76,343 @@ class Sidebar:
     _schedule_entries: dict[UITextEntryLine, str] = field(default_factory=dict)
     _clip_buttons: dict[UIButton, str] = field(default_factory=dict)
     _current_labels: dict[str, UILabel] = field(default_factory=dict)
+
+    def build(self, app: App) -> None:
+        """The full-height right sidebar: a Settings / Current tab pair over a scroll area."""
+        ui = pygame_gui.elements
+        sb = app._sidebar_rect()
+        x = sb.x + PAD
+        inner = max(40, sb.width - 2 * PAD)
+        half = (inner - PAD) // 2
+
+        # Session save/load sits at the very top — a global action (works on either tab), so it's
+        # not buried in Settings; what it saves/loads is clear from context (the whole session).
+        r = Row(x, MARGIN, inner, CTRL_H)
+        self.save_session_button = ui.UIButton(
+            r.left(half), "Save…", app.manager, object_id="#add_button"
+        )
+        self.load_session_button = ui.UIButton(
+            r.fill(), "Load…", app.manager, object_id="#add_button"
+        )
+
+        tabs_y = MARGIN + CTRL_H + PAD
+        r = Row(x, tabs_y, inner, CTRL_H)
+        self.tab_settings = ui.UIButton(
+            r.left(half), "Settings", app.manager, object_id="#tab_button"
+        )
+        self.tab_current = ui.UIButton(r.fill(), "Current", app.manager, object_id="#tab_button")
+
+        cont_y = tabs_y + CTRL_H + PAD
+        cont_rect = pygame.Rect(x, cont_y, inner, max(60, app.layout.win_h - cont_y - MARGIN))
+        self.settings_panel = ui.UIScrollingContainer(cont_rect, app.manager)
+        self.current_panel = ui.UIScrollingContainer(cont_rect, app.manager)
+        self._sb_inner_w = inner - 24  # leave room for the vertical scrollbar
+        self._build_settings_rows(app)
+        self._build_current_rows(app)
+        self.sync_tabs(app)
+
+    def _section_label(
+        self, app: App, container: UIScrollingContainer, inner_w: int, y: int, text: str
+    ) -> int:
+        """Draw a section heading in the settings panel; return the y below it."""
+        pygame_gui.elements.UILabel(
+            Row(0, y, inner_w, LABEL_H).fill(),
+            text,
+            app.manager,
+            container=container,
+            object_id="#section_label",
+        )
+        return y + LABEL_H + 6
+
+    def _build_settings_rows(self, app: App) -> None:
+        """Build the sidebar Settings tab, one section at a time, threading the y cursor.
+
+        Layout order: output (steps / seed / size) · init image · preset (dropdown + Save) ·
+        guidance sliders (retune live) · per-run eta/perlin + cut schedules · model set. Sliders
+        write straight to ``session.config`` (read live by the worker each step); schedule boxes
+        are validated and applied next Play; toggling a model queues a (debounced) auto-reload.
+        """
+        self._scale_sliders = {}
+        self._schedule_entries = {}
+        self._clip_buttons = {}
+        self.preset_dropdown = None  # cleared by clear_and_reset; respawned below
+        container = self.settings_panel
+        inner_w = self._sb_inner_w
+        pitch = CTRL_H + 8
+        y = 2
+        y = self._build_output_section(app, container, inner_w, pitch, y)
+        y = self._build_init_section(app, container, inner_w, pitch, y)
+        y = self._build_preset_section(app, container, inner_w, pitch, y)
+        y = self._build_guidance_section(app, container, inner_w, pitch, y)
+        y = self._build_perrun_section(app, container, inner_w, pitch, y)
+        y = self._build_models_section(app, container, inner_w, pitch, y)
+        container.set_scrollable_area_dimensions((inner_w, y + 8))
+
+    def _build_output_section(
+        self, app: App, container: UIScrollingContainer, inner_w: int, pitch: int, y: int
+    ) -> int:
+        """Steps, seed (+ Rnd), width/height, apply / flip — all per-run (apply on next Play)."""
+        ui = pygame_gui.elements
+        y = self._section_label(app, container, inner_w, y, "Output — apply on next Play")
+        r = Row(0, y, inner_w, CTRL_H)
+        ui.UILabel(r.left(54), "Steps", app.manager, container=container)
+        self.steps_entry = ui.UITextEntryLine(r.fill(), app.manager, container=container)
+        self.steps_entry.set_text(str(app.steps))
+        y += pitch
+        # Seed: always shows the concrete seed in use (so it's reproducible and visible); Play
+        # uses whatever's here, and "Rnd" rolls a fresh one.
+        r = Row(0, y, inner_w, CTRL_H)
+        ui.UILabel(r.left(54), "Seed", app.manager, container=container)
+        self.random_seed_button = ui.UIButton(r.right(46), "Rnd", app.manager, container=container)
+        self.seed_entry = ui.UITextEntryLine(r.fill(), app.manager, container=container)
+        self.seed_entry.set_text(app._seed_text)
+        y += pitch
+        r = Row(0, y, inner_w, CTRL_H)
+        ui.UILabel(r.left(20), "W", app.manager, container=container)
+        self.width_entry = ui.UITextEntryLine(
+            r.left((inner_w - 56) // 2), app.manager, container=container
+        )
+        self.width_entry.set_text(str(app.width))
+        ui.UILabel(r.left(20), "H", app.manager, container=container)
+        self.height_entry = ui.UITextEntryLine(r.fill(), app.manager, container=container)
+        self.height_entry.set_text(str(app.height))
+        y += pitch
+        r = Row(0, y, inner_w, CTRL_H)
+        self.apply_button = ui.UIButton(
+            r.left((inner_w - PAD) // 2), "Apply size", app.manager, container=container
+        )
+        self.swap_button = ui.UIButton(r.fill(), "Flip W/H", app.manager, container=container)
+        return y + pitch
+
+    def _build_init_section(
+        self, app: App, container: UIScrollingContainer, inner_w: int, pitch: int, y: int
+    ) -> int:
+        """Init image (img2img): Open… / Use current / Clear + the denoise slider (per-run)."""
+        ui = pygame_gui.elements
+        y = self._section_label(app, container, inner_w, y + 6, "Init image — applies on next Play")
+        self._init_status_label = ui.UILabel(
+            Row(0, y, inner_w, CTRL_H).fill(),
+            f"Init: {app._init.label}",
+            app.manager,
+            container=container,
+        )
+        y += pitch
+        r = Row(0, y, inner_w, CTRL_H)
+        third = (inner_w - 2 * PAD) // 3
+        self.open_init_button = ui.UIButton(
+            r.left(third), "Open…", app.manager, container=container
+        )
+        self.use_current_init_button = ui.UIButton(
+            r.left(third), "Use current", app.manager, container=container
+        )
+        self.clear_init_button = ui.UIButton(r.fill(), "Clear", app.manager, container=container)
+        y += pitch
+        r = Row(0, y, inner_w, CTRL_H)
+        ui.UILabel(r.left(80), "Denoise", app.manager, container=container)
+        self._init_denoise_label = ui.UILabel(r.right(48), "", app.manager, container=container)
+        self._init_denoise_slider = ui.UIHorizontalSlider(
+            r.fill(),
+            start_value=float(app._init.denoise),
+            value_range=(0.0, 100.0),
+            manager=app.manager,
+            container=container,
+        )
+        self._init_denoise_label.set_text(f"{app._init.denoise}%")
+        return y + pitch
+
+    def _build_preset_section(
+        self, app: App, container: UIScrollingContainer, inner_w: int, pitch: int, y: int
+    ) -> int:
+        """A dropdown of saved recipes + Save; selecting one applies the whole recipe."""
+        ui = pygame_gui.elements
+        y = self._section_label(app, container, inner_w, y + 6, "Preset")
+        r = Row(0, y, inner_w, CTRL_H)
+        self.save_preset_button = ui.UIButton(
+            r.right(72), "Save…", app.manager, container=container, object_id="#add_button"
+        )
+        self._preset_dd_rect = r.fill()
+        self.spawn_preset_dropdown(app)
+        return y + pitch
+
+    def _build_guidance_section(
+        self, app: App, container: UIScrollingContainer, inner_w: int, pitch: int, y: int
+    ) -> int:
+        """The live-guidance sliders — each retunes the running step immediately."""
+        ui = pygame_gui.elements
+        cfg = app.session.config
+        y = self._section_label(app, container, inner_w, y + 6, "Guidance — retunes live")
+        for sc in LIVE_SCALES:
+            r = Row(0, y, inner_w, CTRL_H)
+            ui.UILabel(r.left(108), sc.label, app.manager, container=container)
+            vlabel = ui.UILabel(r.right(66), "", app.manager, container=container)
+            cur = float(getattr(cfg, sc.attr))
+            slider = ui.UIHorizontalSlider(
+                r.fill(),
+                start_value=min(max(cur, sc.lo), sc.hi),
+                value_range=(sc.lo, sc.hi),
+                manager=app.manager,
+                container=container,
+            )
+            vlabel.set_text(sc.fmt.format(cur))
+            self._scale_sliders[slider] = (sc.attr, sc.is_int, vlabel, sc.fmt)
+            y += pitch
+        return y
+
+    def _build_perrun_section(
+        self, app: App, container: UIScrollingContainer, inner_w: int, pitch: int, y: int
+    ) -> int:
+        """eta + Perlin init, then the raw cut-schedule text boxes (applied on next Play)."""
+        ui = pygame_gui.elements
+        cfg = app.session.config
+        y = self._section_label(app, container, inner_w, y + 6, "Per-run — apply on next Play")
+        r = Row(0, y, inner_w, CTRL_H)
+        ui.UILabel(r.left(40), "eta", app.manager, container=container)
+        self.perlin_button = ui.UIButton(
+            r.right(96), "Perlin init", app.manager, container=container
+        )
+        self._eta_label = ui.UILabel(r.right(48), "", app.manager, container=container)
+        self._eta_slider = ui.UIHorizontalSlider(
+            r.fill(),
+            start_value=min(max(float(cfg.eta), 0.0), 1.0),
+            value_range=(0.0, 1.0),
+            manager=app.manager,
+            container=container,
+        )
+        self._eta_label.set_text(f"{cfg.eta:.2f}")
+        if cfg.perlin_init:
+            self.perlin_button.select()
+        y += pitch
+        for sch in SCHEDULES:
+            ui.UILabel(
+                Row(0, y, inner_w, LABEL_H).left(inner_w),
+                sch.label,
+                app.manager,
+                container=container,
+            )
+            y += LABEL_H + 2
+            entry = ui.UITextEntryLine(
+                Row(0, y, inner_w, CTRL_H).fill(), app.manager, container=container
+            )
+            entry.set_text(str(getattr(cfg, sch.attr)))
+            self._schedule_entries[entry] = sch.attr
+            y += pitch
+        return y
+
+    def _build_models_section(
+        self, app: App, container: UIScrollingContainer, inner_w: int, pitch: int, y: int
+    ) -> int:
+        """CLIP model toggles + the secondary-model toggle (changing these auto-reloads)."""
+        ui = pygame_gui.elements
+        y = self._section_label(app, container, inner_w, y + 6, "Models — auto-reloads on change")
+        per_row = 2
+        bw = (inner_w - (per_row - 1) * PAD) // per_row
+        r = Row(0, y, inner_w, CTRL_H)
+        for i, name in enumerate(AVAILABLE_CLIP_MODELS):
+            if i % per_row == 0:
+                r = Row(0, y, inner_w, CTRL_H)
+            button = ui.UIButton(
+                r.left(bw), name, app.manager, container=container, object_id="#brush_button"
+            )
+            self._clip_buttons[button] = name
+            if name in app._clip_selected:
+                button.select()
+            if i % per_row == per_row - 1:
+                y += pitch
+        if len(AVAILABLE_CLIP_MODELS) % per_row != 0:
+            y += pitch
+        r = Row(0, y, inner_w, CTRL_H)
+        self.secondary_button = ui.UIButton(
+            r.fill(),
+            "Secondary model",
+            app.manager,
+            container=container,
+            object_id="#brush_button",
+        )
+        if app._secondary_on:
+            self.secondary_button.select()
+        return y + pitch
+
+    def _build_current_rows(self, app: App) -> None:
+        """Build the read-only "Current" tab: name + value label per setting."""
+        ui = pygame_gui.elements
+        container = self.current_panel
+        inner_w = self._sb_inner_w
+        pitch = CTRL_H + 4
+        self._current_labels = {}
+        name_w = 116
+
+        def row(y: int, key: str, name: str) -> int:
+            ui.UILabel(
+                Row(0, y, inner_w, CTRL_H).left(name_w), name, app.manager, container=container
+            )
+            value = ui.UILabel(
+                Row(name_w + PAD, y, inner_w - name_w - PAD, CTRL_H).fill(),
+                "",
+                app.manager,
+                container=container,
+            )
+            self._current_labels[key] = value
+            return y + pitch
+
+        # Headings are plain — the Current tab reflects what the image is generating with, so the
+        # values speak for themselves without a "this run / next run" qualifier.
+        y = 2
+        ui.UILabel(
+            Row(0, y, inner_w, LABEL_H).fill(),
+            "Guidance",
+            app.manager,
+            container=container,
+            object_id="#section_label",
+        )
+        y += LABEL_H + 6
+        for sc in LIVE_SCALES:
+            y = row(y, sc.attr, sc.label)
+        y += 6
+        ui.UILabel(
+            Row(0, y, inner_w, LABEL_H).fill(),
+            "Per-run",
+            app.manager,
+            container=container,
+            object_id="#section_label",
+        )
+        y += LABEL_H + 6
+        for key, name in CURRENT_PERRUN:
+            y = row(y, key, name)
+        container.set_scrollable_area_dimensions((inner_w, y + 8))
+        app._refresh_current()
+
+    def sync_tabs(self, app: App) -> None:
+        """Show exactly one of the Settings / Current panels for the active sidebar tab."""
+        settings = self._sidebar_tab == "settings"
+        (self.settings_panel.show if settings else self.settings_panel.hide)()
+        (self.current_panel.show if not settings else self.current_panel.hide)()
+        (self.tab_settings.select if settings else self.tab_settings.unselect)()
+        (self.tab_current.select if not settings else self.tab_current.unselect)()
+
+    def refresh_advanced_widgets(self, app: App) -> None:
+        """Re-sync every Advanced widget from the current config (after a preset load)."""
+        cfg = app.session.config
+        for slider, (attr, _is_int, vlabel, fmt) in self._scale_sliders.items():
+            value = float(getattr(cfg, attr))
+            slider.set_current_value(value)
+            vlabel.set_text(fmt.format(value))
+        self._eta_slider.set_current_value(min(max(float(cfg.eta), 0.0), 1.0))
+        self._eta_label.set_text(f"{cfg.eta:.2f}")
+        (self.perlin_button.select if cfg.perlin_init else self.perlin_button.unselect)()
+        for entry, attr in self._schedule_entries.items():
+            entry.set_text(str(getattr(cfg, attr)))
+
+    def spawn_preset_dropdown(self, app: App) -> None:
+        """(Re)create the preset dropdown in the settings panel at the stored rect/selection."""
+        if self.preset_dropdown is not None:
+            self.preset_dropdown.kill()
+        options: list[str | tuple[str, str]] = [*app._presets.keys(), CUSTOM_PRESET]
+        selected = app._preset_selection if app._preset_selection in options else CUSTOM_PRESET
+        app._preset_selection = selected
+        self.preset_dropdown = UIDropDownMenu(
+            options,
+            selected,
+            self._preset_dd_rect,
+            app.manager,
+            container=self.settings_panel,
+        )
