@@ -1,10 +1,16 @@
-"""PaintLayer compositing: brush dabs, alpha-over blending, snapshots, and the overlay surface."""
+"""PaintLayer compositing + the PaintController stroke lifecycle (flush to worker, overlay sync)."""
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import numpy as np
 
-from disco_diffusion_studio.paint import BRUSHES, PaintLayer
+from disco_diffusion_studio.paint import BRUSHES, Brush, PaintController, PaintLayer
+
+
+def _brush(color=(255, 0, 0), noise=False) -> Brush:
+    return Brush(type="Hard", size=8.0, strength=1.0, color=color, noise=noise)
 
 
 def test_layer_starts_empty_and_clears():
@@ -76,3 +82,53 @@ def test_all_brushes_stamp_without_error():
 def test_to_surface_matches_layer_size():
     layer = PaintLayer(24, 12)
     assert layer.to_surface().get_size() == (24, 12)
+
+
+# -- PaintController --
+
+
+def test_controller_paint_to_marks_the_layer():
+    pc = PaintController.for_canvas(16, 16)
+    assert pc.layer.empty()
+    pc.begin()
+    pc.paint_to((8, 8), _brush())
+    assert not pc.layer.empty()
+    assert pc.last_gen == (8, 8)
+
+
+def test_flush_is_a_noop_without_a_live_worker(fake_worker):
+    pc = PaintController.for_canvas(16, 16)
+    pc.flush(None, _brush())  # empty layer + no worker
+    assert pc.pending_overlays == []
+    pc.paint_to((8, 8), _brush())
+    pc.flush(fake_worker(is_alive=lambda: False), _brush())  # painted, but the worker is dead
+    assert pc.pending_overlays == [] and not pc.layer.empty()  # stroke kept on the active layer
+
+
+def test_flush_hands_the_stroke_to_the_worker_and_clears_the_layer(fake_worker):
+    calls: list[tuple] = []
+    pc = PaintController.for_canvas(16, 16)
+    pc.paint_to((8, 8), _brush())
+    pc.flush(fake_worker(paint_applied_count=0, set_paint=lambda *a: calls.append(a)), _brush())
+    assert len(calls) == 1  # one batch handed off
+    assert len(pc.pending_overlays) == 1 and pc.submitted == 1
+    assert pc.layer.empty()  # layer cleared; the overlay copy keeps the stroke visible
+
+
+def test_sync_drops_overlays_once_a_frame_has_applied_them(fake_worker):
+    pc = PaintController.for_canvas(16, 16)
+    pc.paint_to((8, 8), _brush())
+    pc.flush(fake_worker(set_paint=lambda *a: None), _brush())  # submitted == 1
+    pc.sync(fake_worker(latest_frame=lambda: SimpleNamespace(paint_applied=0)))
+    assert len(pc.pending_overlays) == 1  # not yet applied (0 < 1)
+    pc.sync(fake_worker(latest_frame=lambda: SimpleNamespace(paint_applied=1)))
+    assert pc.pending_overlays == []  # applied -> dropped
+
+
+def test_resize_rebuilds_the_layer_and_clears_overlays(fake_worker):
+    pc = PaintController.for_canvas(16, 16)
+    pc.paint_to((8, 8), _brush())
+    pc.flush(fake_worker(set_paint=lambda *a: None), _brush())
+    pc.resize(8, 8)
+    assert (pc.layer.w, pc.layer.h) == (8, 8)
+    assert pc.pending_overlays == [] and pc.submitted == 0

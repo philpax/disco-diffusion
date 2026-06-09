@@ -90,8 +90,8 @@ def test_modal_blocks_canvas_painting(app):
     app._handle_event(
         pygame.event.Event(pygame.MOUSEBUTTONDOWN, button=1, pos=app._image_region().center)
     )
-    assert app._painting is False
-    assert app._paint_layer.empty()
+    assert app._paint.painting is False
+    assert app._paint.layer.empty()
 
 
 def test_picked_colour_is_remembered(app):

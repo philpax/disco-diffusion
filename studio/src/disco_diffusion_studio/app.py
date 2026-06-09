@@ -63,7 +63,7 @@ from .layout import (
     Stack,
     snap_side,
 )
-from .paint import BRUSHES, PaintLayer
+from .paint import BRUSHES, Brush, PaintController
 from .palette import Palette
 from .presets import (
     HistoryItem,
@@ -103,12 +103,6 @@ DRAW_HELP = (
 NAV_HELP = "right-drag: pan · scroll: zoom · release right: draw · F: fit · space: play/pause"
 CANVAS_EMPTY_BG = (18, 20, 26)  # placeholder canvas fill shown before the first frame
 CANVAS_BORDER = (70, 78, 92)
-# Noise-mode re-rolls the patch from fresh noise, which is potent, so its opacity is mapped
-# through a gamma curve into a capped injection range: gentle at the low end, and bounded at
-# the top so even a full-opacity stroke re-rolls a controlled fraction rather than wiping the
-# region. injection = NOISE_MAX_INJECT * opacity**gamma. Overlay stays at the raw opacity.
-NOISE_MAX_INJECT = 0.2
-NOISE_OPACITY_GAMMA = 2.0
 # Debounce for the model auto-reload: changing the CLIP set / secondary toggle queues a reload
 # that fires this long after the *last* change, so rapid toggling doesn't reload repeatedly.
 RELOAD_DEBOUNCE_MS = 1200
@@ -374,17 +368,13 @@ class App:
         self._palette = Palette.load()
         self._colour_picker: UIColourPickerDialog | None = None
 
-        # Painting state. The active paint layer holds the in-progress stroke; on mouse-up it's
-        # flushed to the worker as one batch (its own checkpoint) and moved into _pending_overlays
-        # — surfaces shown on the canvas until a baked frame incorporates that stroke. Each flush
-        # bumps _paint_submitted; an overlay clears once frame.paint_applied reaches its target.
+        # Painting. The PaintController owns the active paint layer + stroke lifecycle: on mouse-up
+        # a stroke is flushed to the worker as one batch (its own checkpoint) and kept on-screen as
+        # a pending overlay until a baked frame incorporates it. brush_color is shared with the
+        # palette; the other brush params live on App and are snapshotted into a Brush per stroke.
         self.brush_color: tuple[int, int, int] = self._palette.default_brush()
-        self._paint_layer = PaintLayer(self.width, self.height)
-        self._pending_overlays: list[tuple[pygame.Surface, int]] = []
-        self._paint_submitted = 0
+        self._paint = PaintController.for_canvas(self.width, self.height)
         self._mouse_pos: tuple[int, int] = (0, 0)
-        self._painting = False
-        self._last_gen: tuple[float, float] | None = None
         self._brush_buttons: dict[pygame_gui.elements.UIButton, str] = {}
         self._swatch_rects: list[tuple[pygame.Rect, tuple[int, int, int]]] = []
         self._color_preview_rect = pygame.Rect(0, 0, 0, 0)
@@ -1549,10 +1539,9 @@ class App:
         # A fresh worker starts with paint_applied_count == 0; reset the overlay tracking to match
         # and drop stale overlays from the previous run. Any stroke painted before Play (still on
         # the active layer) is flushed as the new run's first paint batch rather than discarded.
-        self._pending_overlays = []
-        self._paint_submitted = 0
-        if not self._paint_layer.empty():
-            self._flush_stroke()
+        self._paint.reset_overlays()
+        if not self._paint.layer.empty():
+            self._paint.flush(self.worker, self._brush())
         # Freeze the per-run settings this run uses, for the "Current" tab to show while it runs.
         self._run_snapshot = self._perrun_values()
         self._history = []
@@ -1602,11 +1591,9 @@ class App:
         self.height = snap_side(height)
         self.width_entry.set_text(str(self.width))
         self.height_entry.set_text(str(self.height))
-        # The paint layer is generation-resolution, so rebuild it for the new size; the stale
-        # overlays (old resolution) are dropped too.
-        self._paint_layer = PaintLayer(self.width, self.height)
-        self._pending_overlays = []
-        self._paint_submitted = 0
+        # The paint layer is generation-resolution, so rebuild it for the new size (this also
+        # drops the stale old-resolution overlays).
+        self._paint.resize(self.width, self.height)
         self._init.rebuild_surface(self.width, self.height)  # the preview is generation-res too
         # The canvas changed shape: drop the stale frame and refit the view.
         self._frame_surface = None
@@ -1806,8 +1793,7 @@ class App:
         self._preview_prompts = None
         # Branching drops any in-flight strokes (the worker clears its queue on seek), so reset
         # the overlay tracking to stay aligned with the worker's apply count.
-        self._pending_overlays = []
-        self._paint_submitted = self.worker.paint_applied_count
+        self._paint.reset_overlays(self.worker.paint_applied_count)
         # Park the thumb on the checkpoint's actual step now — the worker processes the seek
         # asynchronously, so _live_index() would still read the stale (forward) live frame here.
         self.history_slider.set_current_value(float(entry.index))
@@ -1973,8 +1959,8 @@ class App:
             elif self._panning:
                 self._view.pan += pygame.Vector2(event.rel)
                 self._clamp_pan()
-            elif self._painting:
-                self._paint_to(event.pos)
+            elif self._paint.painting:
+                self._paint_at(event.pos)
             return True
         if event.type == pygame.MOUSEBUTTONDOWN:
             # The draggable divider sits between the left column and the sidebar (full height).
@@ -2002,18 +1988,17 @@ class App:
                     return True
                 # No painting while previewing history — it would be invisible and unapplied.
                 if self._preview_index is None and self._screen_to_canvas(event.pos) is not None:
-                    self._painting = True
-                    self._last_gen = None
-                    self._paint_to(event.pos)
+                    self._paint.begin()
+                    self._paint_at(event.pos)
                 return True
         if event.type == pygame.MOUSEBUTTONUP:
             if event.button == 1:
                 self._dragging_divider = False
                 self._dragging_panel = False
-                if self._painting:  # a completed stroke becomes one paint batch / checkpoint
-                    self._painting = False
-                    self._flush_stroke()
-                self._last_gen = None
+                if self._paint.painting:  # a completed stroke becomes one batch / checkpoint
+                    self._paint.end()
+                    self._paint.flush(self.worker, self._brush())
+                self._paint.last_gen = None
             elif event.button == 3:
                 self._navigating = False
                 self._panning = False
@@ -2136,7 +2121,7 @@ class App:
                 self.noise_mode = not self.noise_mode
                 (self.noise_button.select if self.noise_mode else self.noise_button.unselect)()
             elif event.ui_element == self.clear_paint_button:
-                self._paint_layer.clear()
+                self._paint.layer.clear()
             elif event.ui_element == self.revert_button:
                 self._do_revert()
             elif event.ui_element == self.cancel_button:
@@ -2317,10 +2302,10 @@ class App:
         # Paint overlays only on the live view (hidden while previewing history): the in-progress
         # stroke plus any flushed strokes not yet baked into a published frame.
         if self._preview_index is None:
-            for overlay, _ in self._pending_overlays:
+            for overlay, _ in self._paint.pending_overlays:
                 self._blit_canvas(overlay)
-            if not self._paint_layer.empty():
-                self._blit_canvas(self._paint_layer.to_surface())
+            if not self._paint.layer.empty():
+                self._blit_canvas(self._paint.layer.to_surface())
         pygame.draw.rect(self.screen, CANVAS_BORDER, crect, 1)  # canvas outline at any zoom
         self.screen.set_clip(None)
         # Draggable horizontal divider between the image area and the bottom panel, with a grip
@@ -2459,6 +2444,12 @@ class App:
         self._build_palette(self._palette_rect)  # relayout swatches to include any new recent
 
     # -- painting --
+    def _brush(self) -> Brush:
+        """Snapshot the current brush params for the PaintController to paint a stroke with."""
+        return Brush(
+            self.brush_type, self.brush_size, self.brush_strength, self.brush_color, self.noise_mode
+        )
+
     def _on_swatch(self, pos: tuple[int, int]) -> bool:
         for sr, color in self._swatch_rects:
             if sr.collidepoint(pos):
@@ -2466,64 +2457,11 @@ class App:
                 return True
         return False
 
-    def _paint_to(self, pos: tuple[int, int]) -> None:
+    def _paint_at(self, pos: tuple[int, int]) -> None:
+        """Paint into the layer at screen ``pos`` (no-op if outside the canvas)."""
         gen = self._screen_to_canvas(pos)
-        if gen is None:
-            return
-        c = self.brush_color
-        color01 = (c[0] / 255.0, c[1] / 255.0, c[2] / 255.0)
-        tint = 1.0 if self.noise_mode else 0.0
-        if self._last_gen is None:
-            self._paint_layer.stamp(
-                gen[0], gen[1], self.brush_size, color01, self.brush_strength, self.brush_type, tint
-            )
-        else:
-            self._paint_layer.stroke(
-                self._last_gen,
-                gen,
-                self.brush_size,
-                color01,
-                self.brush_strength,
-                self.brush_type,
-                tint,
-            )
-        self._last_gen = gen
-
-    def _flush_stroke(self) -> None:
-        """Hand the just-finished stroke to the worker as one batch (its own checkpoint).
-
-        The stroke stays on screen as a pending overlay until a baked frame incorporates it
-        (the injecting step takes seconds), then clears. Each stroke gets its own paint batch,
-        so painting with different settings yields separate history entries rather than merging.
-        """
-        layer = self._paint_layer
-        if layer.empty():
-            return
-        if self.worker is None or not self.worker.is_alive():
-            return  # no run yet: keep the stroke on the active overlay; _start_run flushes it
-        rgb, alpha, tint = layer.snapshot()
-        # Gamma-shape the *injected* mask for noise-mode pixels (tint/alpha = how much of the
-        # pixel is noise-mode), keeping the on-screen overlay at the raw opacity.
-        frac_noise = np.divide(tint, alpha, out=np.zeros_like(tint), where=alpha > 1e-6)
-        shaped = NOISE_MAX_INJECT * alpha**NOISE_OPACITY_GAMMA
-        alpha = alpha * (1.0 - frac_noise) + shaped * frac_noise
-        label = f"paint {self.brush_type.lower()} {int(self.brush_size)}px"
-        # _paint_submitted mirrors the worker's apply count: max(..)+1 keeps it monotonic even
-        # if a frame's count has overtaken our last target (e.g. after a revert reset it).
-        self._paint_submitted = max(self._paint_submitted, self.worker.paint_applied_count) + 1
-        self.worker.set_paint(rgb, alpha, tint, label)
-        self._pending_overlays.append((layer.to_surface().copy(), self._paint_submitted))
-        layer.clear()  # next stroke starts fresh; the overlay copy keeps this one visible
-
-    def _sync_paint(self) -> None:
-        """Drop pending stroke overlays once a baked frame has incorporated them."""
-        if self.worker is None or not self._pending_overlays:
-            return
-        frame = self.worker.latest_frame()
-        if frame is not None:
-            self._pending_overlays = [
-                item for item in self._pending_overlays if item[1] > frame.paint_applied
-            ]
+        if gen is not None:
+            self._paint.paint_to(gen, self._brush())
 
     # -- main loop --
     def run(self) -> None:
@@ -2579,7 +2517,7 @@ class App:
             # Live "edited · Enter" badge while typing (cheap; only mutates on change).
             self._refresh_rows()
             self._refresh_current()  # keep the "Current" sidebar tab in sync
-            self._sync_paint()
+            self._paint.sync(self.worker)
             self._sync_history()
             self._update_frame_surface()
             self.manager.update(dt)
