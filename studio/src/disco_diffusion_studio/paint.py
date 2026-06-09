@@ -15,16 +15,12 @@ import pygame
 # Brush kinds (in display order). Selected by name.
 BRUSHES = ["Soft", "Hard", "Spray"]
 
-# The colour palette now lives in studio/config.toml (loaded via presets.load_colours), so it can
-# be edited and extended with recently-picked colours rather than hard-coded here.
-
 
 class PaintLayer:
     """A generation-resolution RGBA buffer with brush stamping.
 
     ``rgb`` is ``(H, W, 3)`` in ``[0, 1]`` and ``alpha`` is ``(H, W)`` in ``[0, 1]``.
-    ``dirty`` marks strokes not yet handed to the worker; ``_surf_dirty`` caches the
-    overlay surface.
+    ``_surf_dirty`` caches the overlay surface.
     """
 
     def __init__(self, width: int, height: int) -> None:
@@ -33,7 +29,6 @@ class PaintLayer:
         self.rgb = np.zeros((height, width, 3), dtype=np.float32)
         self.alpha = np.zeros((height, width), dtype=np.float32)
         self.tint = np.zeros((height, width), dtype=np.float32)  # per-pixel tinted-noise amount
-        self.dirty = False  # new strokes awaiting hand-off to the worker
         self._nonempty = False
         self._surf_dirty = True
         self._surface: pygame.Surface | None = None
@@ -48,7 +43,6 @@ class PaintLayer:
         self.alpha.fill(0.0)
         self.tint.fill(0.0)
         self._nonempty = False
-        self.dirty = False
         self._surf_dirty = True
 
     def stamp(
@@ -94,7 +88,6 @@ class PaintLayer:
         sub_t = self.tint[y0:y1, x0:x1]
         self.tint[y0:y1, x0:x1] = float(tint) * a + sub_t * (1.0 - a)
         self._nonempty = True
-        self.dirty = True
         self._surf_dirty = True
 
     def stroke(

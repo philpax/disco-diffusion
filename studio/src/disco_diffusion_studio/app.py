@@ -95,6 +95,8 @@ log = logging.getLogger("disco_diffusion_studio")
 
 APP_TITLE = "Disco Diffusion Studio"  # window caption + loading-screen heading
 MIN_ZOOM, MAX_ZOOM = 0.1, 16.0  # view zoom bounds
+BRUSH_SIZE_MIN, BRUSH_SIZE_MAX = 4.0, 160.0  # brush radius bounds (slider + scroll/[])
+BRUSH_STRENGTH_MIN, BRUSH_STRENGTH_MAX = 0.05, 1.0  # brush opacity bounds (slider + shift-scroll)
 # Help HUD text per interaction mode (hold right mouse = navigate, release = draw).
 DRAW_HELP = (
     "left-drag: paint · scroll/[]: size · shift+scroll: opacity · 1-9: colour"
@@ -426,10 +428,10 @@ class App:
         self._history_slider_rect = pygame.Rect(0, 0, 10, 10)
         # Fit the canvas to the available area once the real window size is settled. The window
         # manager may resize the window right after it opens (firing a VIDEORESIZE that only
-        # re-clamps), so we (re)fit on the first run-loop frame, not just here.
+        # re-clamps), so the fit happens on the first run-loop frame, not here — by then any
+        # startup resize has landed. (_zoom/_pan keep their defaults above until then.)
         self._did_initial_fit = False
         self._build_ui()
-        self._fit_view()
 
     # -- geometry --
     # The window is a left column (image on top, bottom control panel below) plus a full-height
@@ -461,6 +463,12 @@ class App:
 
     def _window_size(self) -> tuple[int, int]:
         return (self.win_w, self.win_h)
+
+    def _centered_rect(self, w: int, h: int) -> pygame.Rect:
+        """A ``w``x``h`` rect centred in the window (for modal dialogs)."""
+        rect = pygame.Rect(0, 0, w, h)
+        rect.center = (self.win_w // 2, self.win_h // 2)
+        return rect
 
     def _image_region(self) -> pygame.Rect:
         """The screen area the canvas viewport occupies (above the panel, left of the sidebar)."""
@@ -559,9 +567,7 @@ class App:
         """Pop a small OK-dismissable modal to surface a user error (e.g. wrong load button)."""
         if self._message_window is not None and self._message_window.alive():
             self._message_window.kill()
-        win_w, win_h = self._window_size()
-        rect = pygame.Rect(0, 0, 420, 200)
-        rect.center = (win_w // 2, win_h // 2)
+        rect = self._centered_rect(420, 200)
         self._message_window = UIMessageWindow(
             rect, html_message=message, manager=self.manager, window_title=title
         )
@@ -661,13 +667,16 @@ class App:
         # Right group (packed right-to-left, so it reads "Opacity [slider] Clear" left-to-right).
         self.clear_paint_button = ui.UIButton(r.right(64), "Clear", self.manager)
         self.strength_slider = ui.UIHorizontalSlider(
-            r.right(104), self.brush_strength, (0.05, 1.0), self.manager
+            r.right(104),
+            self.brush_strength,
+            (BRUSH_STRENGTH_MIN, BRUSH_STRENGTH_MAX),
+            self.manager,
         )
         ui.UILabel(r.right(56), "Opacity", self.manager)
         # Size label + slider, the slider flexing into whatever's left between the two groups.
         ui.UILabel(r.left(36), "Size", self.manager)
         self.size_slider = ui.UIHorizontalSlider(
-            r.fill(), self.brush_size, (4.0, 160.0), self.manager
+            r.fill(), self.brush_size, (BRUSH_SIZE_MIN, BRUSH_SIZE_MAX), self.manager
         )
 
         # Row 4: colour palette — current-colour preview + swatches (custom-drawn), and an
@@ -920,8 +929,8 @@ class App:
         self._spawn_preset_dropdown()
         y += pitch
 
-        # Session: save/load the whole working state (prompts + output + recipe) to a .toml of
-        # your choosing (via the native dialog) — a superset of a preset.
+        # Session: save/load the whole working state (prompts + output + recipe + result + history)
+        # to a .zip of your choosing (via the native dialog) — a superset of a preset.
         y = section(y + 6, "Session — save/load everything")
         r = Row(0, y, inner_w, CTRL_H)
         half = (inner_w - PAD) // 2
@@ -1274,8 +1283,7 @@ class App:
         surface = self._displayed_surface()
         if surface is None:
             return None
-        arr = pygame.surfarray.array3d(surface).swapaxes(0, 1).astype("uint8")  # (H, W, 3)
-        return Image.fromarray(arr)
+        return surface_to_pil(surface)
 
     def _history_for_save(self) -> list[tuple[HistoryItem, Image.Image]]:
         """The current edit history as (metadata, preview image) pairs for the session zip."""
@@ -1294,13 +1302,23 @@ class App:
             for e in self._history
         ]
 
-    def _save_session(self) -> None:
-        """Save the whole working state + result + history to a .zip via the native Save dialog."""
+    def _native_path(self, kind: str, title: str) -> str | None:
+        """Open a native file dialog (``kind`` ``"save"``/``"open"``) rooted at ``out_dir``.
+
+        Returns the chosen path, or ``None`` if cancelled or no backend is installed (reported
+        via the status line). Ensures ``out_dir`` exists so the dialog opens there.
+        """
+        self.out_dir.mkdir(parents=True, exist_ok=True)
+        pick = native_dialog.save_file if kind == "save" else native_dialog.open_file
         try:
-            path = native_dialog.save_file(title="Save session", start_dir=str(self.out_dir))
+            return pick(title=title, start_dir=str(self.out_dir))
         except native_dialog.Unavailable:
             self._status("No native dialog (install zenity)")
-            return
+            return None
+
+    def _save_session(self) -> None:
+        """Save the whole working state + result + history to a .zip via the native Save dialog."""
+        path = self._native_path("save", "Save session")
         if not path:
             return
         try:
@@ -1315,11 +1333,7 @@ class App:
 
     def _load_session(self) -> None:
         """Load a session .zip via the native Open dialog and apply it (result -> init image)."""
-        try:
-            path = native_dialog.open_file(title="Open session", start_dir=str(self.out_dir))
-        except native_dialog.Unavailable:
-            self._status("No native dialog (install zenity)")
-            return
+        path = self._native_path("open", "Open session")
         if not path:
             return
         if not zipfile.is_zipfile(path):  # an image (or other file) picked via the session button
@@ -1387,9 +1401,7 @@ class App:
         """Open a small modal asking for a filename to save the current settings as a preset."""
         if self._save_preset_window is not None and self._save_preset_window.alive():
             return
-        win_w, win_h = self._window_size()
-        rect = pygame.Rect(0, 0, 420, 168)
-        rect.center = (win_w // 2, win_h // 2)
+        rect = self._centered_rect(420, 168)
         ui = pygame_gui.elements
         self._save_preset_window = ui.UIWindow(
             rect, self.manager, window_display_title="Save preset"
@@ -1738,12 +1750,7 @@ class App:
             self._status("No frame")
             return
         surface = self._frame_surface.copy()  # freeze; the worker keeps generating
-        self.out_dir.mkdir(parents=True, exist_ok=True)
-        try:
-            path_str = native_dialog.save_file(title="Save image", start_dir=str(self.out_dir))
-        except native_dialog.Unavailable:
-            self._status("No native dialog (install zenity)")
-            return
+        path_str = self._native_path("save", "Save image")
         if not path_str:
             return  # cancelled
         path = Path(path_str)
@@ -1806,8 +1813,7 @@ class App:
         if surface is None:
             self._status("No frame")
             return
-        arr = pygame.surfarray.array3d(surface).swapaxes(0, 1).astype("uint8")  # (H, W, 3)
-        self._set_init_image(Image.fromarray(arr), "current result")
+        self._set_init_image(surface_to_pil(surface), "current result")
 
     def _clear_init(self) -> None:
         self._init_image = None
@@ -1820,12 +1826,7 @@ class App:
 
     def _open_init(self) -> None:
         """Pick an init image via the native Open dialog (blocks while it's open)."""
-        self.out_dir.mkdir(parents=True, exist_ok=True)
-        try:
-            path_str = native_dialog.open_file(title="Open init image", start_dir=str(self.out_dir))
-        except native_dialog.Unavailable:
-            self._status("No native dialog (install zenity)")
-            return
+        path_str = self._native_path("open", "Open init image")
         if path_str:
             self._load_init_file(path_str)
 
@@ -1836,9 +1837,7 @@ class App:
             return
         if self._confirm_dialog is not None and self._confirm_dialog.alive():
             return
-        win_w, win_h = self._window_size()
-        rect = pygame.Rect(0, 0, 360, 200)
-        rect.center = (win_w // 2, win_h // 2)
+        rect = self._centered_rect(360, 200)
         desc = "Discard the current image and stop the run? The init image (if set) is shown again."
         self._confirm_dialog = UIConfirmationDialog(
             rect, desc, self.manager, window_title="Reset canvas", action_short_name="Reset"
@@ -1955,9 +1954,16 @@ class App:
         self._do_revert()
 
     def _nudge_brush_size(self, factor: float) -> None:
-        """[ / ]: scale the brush size (matching the scroll-wheel bounds) and sync the slider."""
-        self.brush_size = max(4.0, min(160.0, self.brush_size * factor))
+        """Scale the brush size (clamped) and sync the slider — shared by [ / ] and the wheel."""
+        self.brush_size = max(BRUSH_SIZE_MIN, min(BRUSH_SIZE_MAX, self.brush_size * factor))
         self.size_slider.set_current_value(self.brush_size)
+
+    def _nudge_brush_strength(self, delta: float) -> None:
+        """Shift the brush opacity (clamped) and sync the slider — shared by the wheel."""
+        self.brush_strength = max(
+            BRUSH_STRENGTH_MIN, min(BRUSH_STRENGTH_MAX, self.brush_strength + delta)
+        )
+        self.strength_slider.set_current_value(self.brush_strength)
 
     def _select_palette_index(self, index: int) -> None:
         """Digit keys: pick the nth swatch (palette + recents) as the brush colour, if it exists."""
@@ -2123,11 +2129,9 @@ class App:
             if self._navigating:  # canvas mode: wheel zooms toward the cursor
                 self._zoom_at(self._mouse_pos, 1.15**event.y)
             elif pygame.key.get_mods() & pygame.KMOD_SHIFT:
-                self.brush_strength = max(0.05, min(1.0, self.brush_strength + event.y * 0.05))
-                self.strength_slider.set_current_value(self.brush_strength)
+                self._nudge_brush_strength(event.y * 0.05)
             else:
-                self.brush_size = max(4.0, min(160.0, self.brush_size * (1.1**event.y)))
-                self.size_slider.set_current_value(self.brush_size)
+                self._nudge_brush_size(1.1**event.y)
             return True
         if event.type == pygame.KEYDOWN and not self._typing() and not self._modal_open():
             if event.mod & pygame.KMOD_CTRL:  # ctrl combos: Save / Revert
@@ -2546,9 +2550,7 @@ class App:
         """Open the arbitrary-RGB picker, seeded with the current brush colour."""
         if self._colour_picker is not None and self._colour_picker.alive():
             return
-        win_w, win_h = self._window_size()
-        rect = pygame.Rect(0, 0, 420, 400)
-        rect.center = (win_w // 2, win_h // 2)
+        rect = self._centered_rect(420, 400)
         self._colour_picker = UIColourPickerDialog(
             rect,
             self.manager,
@@ -2723,6 +2725,12 @@ def int_or(text: str, fallback: int) -> int:
         return int(text)
     except ValueError:
         return fallback
+
+
+def surface_to_pil(surface: pygame.Surface) -> Image.Image:
+    """Copy a pygame surface to a PIL image (transposing pygame's column-major (W, H) layout)."""
+    arr = pygame.surfarray.array3d(surface).swapaxes(0, 1).astype("uint8")  # (H, W, 3)
+    return Image.fromarray(arr)
 
 
 @dataclass

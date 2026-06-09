@@ -21,15 +21,6 @@ def _cfd():
     return crossfiledialog
 
 
-def is_available() -> bool:
-    """Whether a native dialog backend is present (cheap to call)."""
-    try:
-        _cfd()
-    except Unavailable:
-        return False
-    return True
-
-
 def save_file(title: str = "Save image", start_dir: str | None = None) -> str | None:
     """Open a native Save dialog; return the chosen path, or ``None`` if cancelled."""
     return _cfd().save_file(title=title, start_dir=start_dir) or None
