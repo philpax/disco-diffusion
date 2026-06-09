@@ -15,15 +15,16 @@ from disco_diffusion_studio import app as A
 from disco_diffusion_studio.controls import CUSTOM_PRESET
 from disco_diffusion_studio.presets import GuidanceSnapshot
 from disco_diffusion_studio.timeline import Timeline
+from disco_diffusion_studio.ui import draw, events
 from disco_diffusion_studio.worker import HistoryEntry, PromptSpec
 
 
 def test_app_constructs_and_renders(app):
     app.manager.update(0.016)
-    app._draw()
+    draw.scene(app)
     app.manager.draw_ui(app.screen)
-    app._draw_tools()
-    app._draw_history_ticks()  # no error with no history
+    draw.tools(app)
+    draw.history_ticks(app)  # no error with no history
 
 
 def test_compute_window_size_respects_minimums():
@@ -38,8 +39,9 @@ def test_opens_on_default_preset(app):
 
 def test_editing_guidance_marks_custom_and_arms_checkpoint(app):
     slider = next(iter(app.sidebar._scale_sliders))
-    app._handle_event(
-        pygame.event.Event(pygame_gui.UI_HORIZONTAL_SLIDER_MOVED, ui_element=slider, value=9999.0)
+    events.handle(
+        app,
+        pygame.event.Event(pygame_gui.UI_HORIZONTAL_SLIDER_MOVED, ui_element=slider, value=9999.0),
     )
     assert app.recipe.selection == CUSTOM_PRESET
     assert app.history.guidance_checkpoint_at is not None
@@ -88,7 +90,7 @@ def test_revert_restores_guidance_and_eta(app, fake_worker):
     revert = pygame.event.Event(
         pygame_gui.UI_BUTTON_PRESSED, ui_element=app.bottom_bar.revert_button
     )
-    app._handle_event(revert)
+    events.handle(app, revert)
     assert app.session.config.clip_guidance_scale == 5000
     assert app.session.config.eta == 0.8  # eta restored, not just the live guidance scales
 
@@ -96,8 +98,9 @@ def test_revert_restores_guidance_and_eta(app, fake_worker):
 def test_modal_blocks_canvas_painting(app):
     app._open_colour_picker()
     assert app._modal_open()
-    app._handle_event(
-        pygame.event.Event(pygame.MOUSEBUTTONDOWN, button=1, pos=app.layout.image_region().center)
+    events.handle(
+        app,
+        pygame.event.Event(pygame.MOUSEBUTTONDOWN, button=1, pos=app.layout.image_region().center),
     )
     assert app.canvas.paint.painting is False
     assert app.canvas.paint.layer.empty()
@@ -118,14 +121,14 @@ def test_mute_button_toggles_and_excludes_from_snapshot(app):
     app.prompts = [A.PromptRow("a", 1.0), A.PromptRow("b", 1.0)]
     app.bottom_bar.rebuild_prompt_rows(app)
     mute_btn = next(b for b, i in app.bottom_bar._mute_buttons.items() if i == 1)
-    app._handle_event(pygame.event.Event(pygame_gui.UI_BUTTON_PRESSED, ui_element=mute_btn))
+    events.handle(app, pygame.event.Event(pygame_gui.UI_BUTTON_PRESSED, ui_element=mute_btn))
     assert app.prompts[1].muted is True
     # the snapshot carries the muted flag (so the worker excludes it but checkpoints keep it)
     assert app._prompt_snapshot() == [
         PromptSpec(text="a", weight=1.0, muted=False),
         PromptSpec(text="b", weight=1.0, muted=True),
     ]
-    app._handle_event(pygame.event.Event(pygame_gui.UI_BUTTON_PRESSED, ui_element=mute_btn))
+    events.handle(app, pygame.event.Event(pygame_gui.UI_BUTTON_PRESSED, ui_element=mute_btn))
     assert app.prompts[1].muted is False
 
 
@@ -154,8 +157,9 @@ def test_seed_for_run_invalid_is_randomised(app):
 
 def test_random_seed_button_rerolls_to_a_new_seed(app):
     app.sidebar.seed_entry.set_text("999")
-    app._handle_event(
-        pygame.event.Event(pygame_gui.UI_BUTTON_PRESSED, ui_element=app.sidebar.random_seed_button)
+    events.handle(
+        app,
+        pygame.event.Event(pygame_gui.UI_BUTTON_PRESSED, ui_element=app.sidebar.random_seed_button),
     )
     assert app.sidebar.seed_entry.get_text().isdigit()
     assert app.sidebar.seed_entry.get_text() != "999"
@@ -335,7 +339,7 @@ def test_ctrl_s_saves_via_native_dialog(app, tmp_path, stub_dialogs):
     out = tmp_path / "saved.png"
     stub_dialogs(save=out)
     app.canvas.frame_surface = pygame.Surface((app.width, app.height))
-    app._handle_event(_key(pygame.K_s, pygame.KMOD_CTRL))
+    events.handle(app, _key(pygame.K_s, pygame.KMOD_CTRL))
     assert out.exists()  # the frame was written to the path the native dialog returned
 
 
@@ -351,15 +355,15 @@ def test_save_image_reports_when_no_backend(app, monkeypatch):
 
 def test_bracket_keys_change_brush_size(app):
     app.brush.size = 48.0
-    app._handle_event(_key(pygame.K_RIGHTBRACKET))
+    events.handle(app, _key(pygame.K_RIGHTBRACKET))
     assert app.brush.size > 48.0
     app.brush.size = 48.0
-    app._handle_event(_key(pygame.K_LEFTBRACKET))
+    events.handle(app, _key(pygame.K_LEFTBRACKET))
     assert app.brush.size < 48.0
 
 
 def test_digit_selects_palette_colour(app):
-    app._handle_event(_key(pygame.K_3))
+    events.handle(app, _key(pygame.K_3))
     assert app.brush.color == app._palette.swatches()[2]
 
 
@@ -382,7 +386,7 @@ def test_ctrl_z_reverts_to_latest_checkpoint(app, fake_worker):
     app.worker = fake_worker(finished=True, seek=seeked.append)
     app.paused = True  # not running -> revert is allowed
     app.session.config.clip_guidance_scale = 20000
-    app._handle_event(_key(pygame.K_z, pygame.KMOD_CTRL))
+    events.handle(app, _key(pygame.K_z, pygame.KMOD_CTRL))
     assert seeked == [0]  # reverted to the latest checkpoint (undo last edit)
     assert app.session.config.clip_guidance_scale == 5000
 
@@ -421,5 +425,5 @@ def test_ctrl_z_walks_back_through_history(app, fake_worker):
     app.worker = fake_worker(finished=True, seek=seek)
     app.paused = True
     for _ in range(3):
-        app._handle_event(_key(pygame.K_z, pygame.KMOD_CTRL))
+        events.handle(app, _key(pygame.K_z, pygame.KMOD_CTRL))
     assert seeked == [1, 0, 0]  # latest -> earlier -> clamped at the first checkpoint

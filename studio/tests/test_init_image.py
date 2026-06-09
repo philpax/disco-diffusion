@@ -9,6 +9,8 @@ import pygame_gui
 from disco_diffusion import RunConfig
 from PIL import Image
 
+from disco_diffusion_studio.ui import events
+
 
 def _png(tmp_path, size=(80, 50)):
     path = tmp_path / "seed.png"
@@ -52,12 +54,13 @@ def test_use_current_result_as_init(app):
 
 
 def test_denoise_slider_updates_value(app):
-    app._handle_event(
+    events.handle(
+        app,
         pygame.event.Event(
             pygame_gui.UI_HORIZONTAL_SLIDER_MOVED,
             ui_element=app.sidebar._init_denoise_slider,
             value=25.0,
-        )
+        ),
     )
     assert app._init.denoise == 25
 
@@ -85,7 +88,7 @@ def test_open_init_loads_via_native_dialog(app, tmp_path, stub_dialogs):
 
 
 def test_dropfile_loads_init(app, tmp_path):
-    app._handle_event(pygame.event.Event(pygame.DROPFILE, file=str(_png(tmp_path))))
+    events.handle(app, pygame.event.Event(pygame.DROPFILE, file=str(_png(tmp_path))))
     assert app._init.image is not None
     assert app._init.label == "seed.png"
 

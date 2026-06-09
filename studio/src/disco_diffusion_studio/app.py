@@ -439,9 +439,6 @@ class App:
         self._status("Canvas cleared")
 
     # -- events --
-    def _handle_event(self, event: pygame.event.Event) -> bool:
-        return events._handle_event(self, event)
-
     def _auto_apply_on_blur(self) -> None:
         """Apply a text box when keyboard focus leaves it (no Enter needed).
 
@@ -466,15 +463,6 @@ class App:
             if previous is not None and previous.alive():
                 self.sidebar.commit_schedule_entry(self, previous)
 
-    def _draw(self) -> None:
-        return draw._draw(self)
-
-    def _draw_tools(self) -> None:
-        return draw._draw_tools(self)
-
-    def _draw_history_ticks(self) -> None:
-        return draw._draw_history_ticks(self)
-
     def _open_colour_picker(self) -> None:
         """Open the arbitrary-RGB picker, seeded with the current brush colour."""
         if self._colour_picker is not None and self._colour_picker.alive():
@@ -495,7 +483,7 @@ class App:
             dt = clock.tick(60) / 1000.0
             for event in pygame.event.get():
                 self.manager.process_events(event)
-                if not self._handle_event(event):
+                if not events.handle(self, event):
                     alive = False
             # Apply at most one window relayout per frame (resize events are coalesced).
             if self._pending_size is not None:
@@ -538,10 +526,10 @@ class App:
             self.history.sync()
             self.canvas.update_frame_surface()
             self.manager.update(dt)
-            self._draw()
+            draw.scene(self)
             self.manager.draw_ui(self.screen)
-            self._draw_tools()
-            self._draw_history_ticks()
+            draw.tools(self)
+            draw.history_ticks(self)
             pygame.display.flip()
         self.generation.stop()
 

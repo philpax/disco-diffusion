@@ -18,7 +18,7 @@ if TYPE_CHECKING:
     from ..app import App
 
 
-def _handle_event(app: App, event: pygame.event.Event) -> bool:
+def handle(app: App, event: pygame.event.Event) -> bool:
     if event.type == pygame.QUIT:
         return False
 

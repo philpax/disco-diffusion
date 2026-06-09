@@ -19,7 +19,7 @@ if TYPE_CHECKING:
     from ..app import App
 
 
-def _draw(app: App) -> None:
+def scene(app: App) -> None:
     win_w, win_h = app.layout.window_size()
     img_h = app.layout.image_area_h()
     panel_w = app.layout.panel_w()
@@ -89,7 +89,7 @@ def _draw(app: App) -> None:
     )
 
 
-def _draw_tools(app: App) -> None:
+def tools(app: App) -> None:
     """Draw the colour palette, the brush-preview ring, and the canvas help HUD."""
     # Palette: current-colour preview + swatches (selected one outlined).
     pygame.draw.rect(
@@ -126,7 +126,7 @@ def _draw_tools(app: App) -> None:
     app.screen.blit(text, (pos[0] + pad, pos[1] + pad))
 
 
-def _draw_history_ticks(app: App) -> None:
+def history_ticks(app: App) -> None:
     """Mark each checkpoint's position on the (step-space) history slider.
 
     Drawn after the UI so the ticks sit on top of the track; hovering the slider shows the
