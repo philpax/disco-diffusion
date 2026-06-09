@@ -23,13 +23,13 @@ from pygame_gui.elements import (
     UITextEntryLine,
 )
 
-from .constants import GUIDANCE_CHECKPOINT_MS
-from .controls import CURRENT_PERRUN, CUSTOM_PRESET, LIVE_SCALES, SCHEDULES
-from .layout import CTRL_H, LABEL_H, MARGIN, PAD, Row
-from .util import int_or
+from ..constants import GUIDANCE_CHECKPOINT_MS
+from ..controls import CURRENT_PERRUN, CUSTOM_PRESET, LIVE_SCALES, SCHEDULES
+from ..layout import CTRL_H, LABEL_H, MARGIN, PAD, Row
+from ..util import int_or
 
 if TYPE_CHECKING:
-    from .app import App
+    from ..app import App
 
 
 @dataclass

@@ -12,11 +12,11 @@ from typing import TYPE_CHECKING
 
 import pygame
 
-from .paint import PaintController
-from .view import ViewTransform
+from ..paint import PaintController
+from ..view import ViewTransform
 
 if TYPE_CHECKING:
-    from .app import App
+    from ..app import App
 
 
 class Canvas:

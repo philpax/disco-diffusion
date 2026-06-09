@@ -37,9 +37,7 @@ from disco_diffusion.config import AVAILABLE_CLIP_MODELS
 from PIL import Image
 from pygame_gui.windows import UIColourPickerDialog, UIConfirmationDialog, UIMessageWindow
 
-from . import _ui_draw, _ui_events, native_dialog
-from .bottom_bar import BottomBar
-from .canvas import Canvas
+from . import native_dialog
 from .constants import (
     APP_TITLE,
     RELOAD_DEBOUNCE_MS,
@@ -75,12 +73,15 @@ from .presets import (
     save_session,
 )
 from .reload import ModelReloader
-from .sidebar import Sidebar
 from .theme import (
     THEME,
     WINDOW_BG,
 )
 from .timeline import Timeline
+from .ui import draw, events
+from .ui.bottom_bar import BottomBar
+from .ui.canvas import Canvas
+from .ui.sidebar import Sidebar
 from .util import clamp_steps
 from .worker import GenerationWorker, HistoryEntry, PromptSpec
 
@@ -135,9 +136,9 @@ class App:
     _frame_key: tuple[int, int] | None = None  # (id(array), index) to detect new frames
     _pending_size: tuple[int, int] | None = None  # coalesced window resize, applied per frame
 
-    # Late-bound runtime objects + widgets, built in __post_init__/_build_ui (so the UI builders,
-    # event router, and renderer can live in the _ui_*.py modules and still see typed attributes).
-    # field(init=False) keeps them out of the constructor; they're unset until the build runs.
+    # The App is a coordinator over its pieces. The screen areas (ui/) own their own widgets +
+    # build + event handling; the rest are the value objects / services. field(init=False) keeps
+    # the late-bound ones (built in __post_init__/_build_ui) out of the constructor.
     manager: pygame_gui.UIManager = field(init=False)
     screen: pygame.Surface = field(init=False)
     layout: Layout = field(init=False)  # window geometry (split + divider positions)
@@ -1088,7 +1089,7 @@ class App:
 
     # -- events --
     def _handle_event(self, event: pygame.event.Event) -> bool:
-        return _ui_events._handle_event(self, event)
+        return events._handle_event(self, event)
 
     def _auto_apply_on_blur(self) -> None:
         """Apply a text box when keyboard focus leaves it (no Enter needed).
@@ -1115,13 +1116,13 @@ class App:
                 self.sidebar.commit_schedule_entry(self, previous)
 
     def _draw(self) -> None:
-        return _ui_draw._draw(self)
+        return draw._draw(self)
 
     def _draw_tools(self) -> None:
-        return _ui_draw._draw_tools(self)
+        return draw._draw_tools(self)
 
     def _draw_history_ticks(self) -> None:
-        return _ui_draw._draw_history_ticks(self)
+        return draw._draw_history_ticks(self)
 
     def _open_colour_picker(self) -> None:
         """Open the arbitrary-RGB picker, seeded with the current brush colour."""

@@ -12,10 +12,10 @@ from typing import TYPE_CHECKING
 import pygame
 import pygame_gui
 
-from .layout import DIVIDER_W
+from ..layout import DIVIDER_W
 
 if TYPE_CHECKING:
-    from .app import App
+    from ..app import App
 
 
 def _handle_event(app: App, event: pygame.event.Event) -> bool:

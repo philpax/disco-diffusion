@@ -11,12 +11,12 @@ from typing import TYPE_CHECKING
 
 import pygame
 
-from .constants import CANVAS_BORDER, CANVAS_EMPTY_BG, DRAW_HELP, NAV_HELP
-from .layout import DIVIDER_W
-from .theme import DIVIDER, IMAGE_BG, PANEL_BG, WINDOW_BG
+from ..constants import CANVAS_BORDER, CANVAS_EMPTY_BG, DRAW_HELP, NAV_HELP
+from ..layout import DIVIDER_W
+from ..theme import DIVIDER, IMAGE_BG, PANEL_BG, WINDOW_BG
 
 if TYPE_CHECKING:
-    from .app import App
+    from ..app import App
 
 
 def _draw(app: App) -> None:
