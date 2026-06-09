@@ -3,13 +3,16 @@ preset/colour wiring, panel resize, geometry, and the loading screen."""
 
 from __future__ import annotations
 
+import zipfile
 from types import SimpleNamespace
 
 import numpy as np
 import pygame
 import pygame_gui
+from PIL import Image
 
 from disco_diffusion_studio import app as A
+from disco_diffusion_studio.presets import GuidanceSnapshot
 from disco_diffusion_studio.worker import HistoryEntry, PromptSpec
 
 
@@ -67,7 +70,7 @@ def test_revert_restores_guidance_and_eta(app):
         HistoryEntry(
             latent=None, step=0, index=5, total=100, preview=img, label="start",
             prompts=[PromptSpec(text="a prompt", weight=1.0, muted=False)],
-            config={"clip_guidance_scale": 5000, "eta": 0.8},
+            config=GuidanceSnapshot(clip_guidance_scale=5000, eta=0.8),
         )
     ]
     app._hist_len = 1
@@ -152,6 +155,132 @@ def test_random_seed_button_rerolls_to_a_new_seed(app):
     assert app.seed_entry.get_text() != "999"
 
 
+def test_session_save_load_round_trip(app, tmp_path, monkeypatch):
+    archive = tmp_path / "sess.zip"
+    monkeypatch.setattr(A.native_dialog, "save_file", lambda **k: str(archive))
+    monkeypatch.setattr(A.native_dialog, "open_file", lambda **k: str(archive))
+    app._frame_surface = pygame.Surface((app.width, app.height))  # a rendered result to bundle
+    app._frame_surface.fill((20, 180, 90))
+    app.prompts = [A.PromptRow("castle", 1.3, False), A.PromptRow("bg", 0.4, True)]
+    app.steps = 137
+    app.seed_entry.set_text("424242")
+    app._init_denoise = 35
+    app.session.config.clip_guidance_scale = 9999
+    app._save_session()
+    assert archive.exists()
+    # mutate everything, then load the session back
+    app.steps = 50
+    app.seed_entry.set_text("1")
+    app._init_denoise = 90
+    app.session.config.clip_guidance_scale = 100
+    app.prompts = [A.PromptRow("x", 1.0)]
+    app._init_image = None
+    app._load_session()
+    assert app.steps == 137
+    assert app.seed_entry.get_text() == "424242"
+    assert app._init_denoise == 35
+    assert app.session.config.clip_guidance_scale == 9999
+    restored = [(r.text, r.weight, r.muted) for r in app.prompts]
+    assert restored == [("castle", 1.3, False), ("bg", 0.4, True)]
+    assert app._init_image is not None  # the bundled result became the init image
+    assert app._init_label == "session result"
+
+
+def test_session_restores_scrubbable_history(app, tmp_path, monkeypatch):
+    archive = tmp_path / "s.zip"
+    monkeypatch.setattr(A.native_dialog, "save_file", lambda **k: str(archive))
+    monkeypatch.setattr(A.native_dialog, "open_file", lambda **k: str(archive))
+    img = np.full((app.height, app.width, 3), 7, np.uint8)
+    app._history = [
+        HistoryEntry(latent=None, step=0, index=1, total=100, preview=img, label="start",
+                     prompts=[PromptSpec("a", 1.0, False)],
+                     config=GuidanceSnapshot(clip_guidance_scale=5000)),
+        HistoryEntry(latent=None, step=0, index=40, total=100, preview=img, label="paint soft 48px",
+                     prompts=[PromptSpec("a", 1.0, False)],
+                     config=GuidanceSnapshot(clip_guidance_scale=9000)),
+    ]
+    app._save_session()
+    app._history = []
+    app._load_session()
+    assert [e.label for e in app._history] == ["start", "paint soft 48px"]
+    assert app._history[1].index == 40
+    assert app._history[0].latent is None  # previews only, no latent
+
+
+def test_loaded_result_is_rightmost_scrubbable_endpoint(app, tmp_path, monkeypatch):
+    archive = tmp_path / "s.zip"
+    monkeypatch.setattr(A.native_dialog, "save_file", lambda **k: str(archive))
+    monkeypatch.setattr(A.native_dialog, "open_file", lambda **k: str(archive))
+    img = np.full((app.height, app.width, 3), 7, np.uint8)
+    app._frame_surface = pygame.Surface((app.width, app.height))  # a finished result on the canvas
+    app._frame_surface.fill((9, 9, 9))
+    app._history = [
+        HistoryEntry(latent=None, step=0, index=1, total=100, preview=img, label="start"),
+        HistoryEntry(latent=None, step=0, index=40, total=100, preview=img, label="paint"),
+    ]
+    app._save_session()
+    app._frame_surface, app._history = None, []
+    app._load_session()
+    # The result is painted back as a static final frame, and is the timeline's rightmost step.
+    assert app._frame_surface is not None
+    assert app._live_index() == 100  # the run's last step, past the index=40 checkpoint
+    assert app._history_snap(100.0) is None  # rightmost snaps to the result (live), not a tick
+    assert app._history_snap(1.0) == 0  # earlier scrubbing still reaches the checkpoints
+    assert app._displayed_surface() is app._frame_surface  # at rest the crisp result shows
+
+
+def test_session_loaded_via_init_button_shows_error(app, tmp_path):
+    bundle = tmp_path / "looks_like.zip"
+    with zipfile.ZipFile(bundle, "w") as zf:
+        zf.writestr("session.toml", "x = 1")
+    app._load_init_file(str(bundle))
+    assert app._message_window is not None and app._message_window.alive()
+    assert app._init_image is None  # not mistaken for an image
+
+
+def test_image_loaded_via_session_button_shows_error(app, tmp_path, monkeypatch):
+    image_file = tmp_path / "pic.png"
+    Image.new("RGB", (8, 8)).save(image_file)
+    monkeypatch.setattr(A.native_dialog, "open_file", lambda **k: str(image_file))
+    before = app.steps
+    app._load_session()
+    assert app._message_window is not None and app._message_window.alive()
+    assert app.steps == before  # the session wasn't applied
+
+
+def test_guidance_snapshot_keeps_int_knobs_int(app):
+    # The typed snapshot coerces int knobs back to int even if loaded from floats in JSON;
+    # cutn_batches is used as range(cutn_batches), which a float breaks.
+    snap = GuidanceSnapshot(cutn_batches=4.0, clip_guidance_scale=5000.0, tv_scale=1.5)
+    snap.apply_to(app.session.config)
+    cfg = app.session.config
+    assert cfg.cutn_batches == 4 and isinstance(cfg.cutn_batches, int)
+    assert isinstance(cfg.clip_guidance_scale, int)
+    assert cfg.tv_scale == 1.5  # genuine float knobs stay floats
+    assert list(range(cfg.cutn_batches)) == [0, 1, 2, 3]
+
+
+def test_loaded_revert_continues_via_img2img(app, monkeypatch):
+    started = []
+    monkeypatch.setattr(app, "_start_run", lambda: started.append(True))
+    img = np.full((app.height, app.width, 3), 5, np.uint8)
+    app.worker = None
+    app._history = [
+        HistoryEntry(
+            latent=None, step=0, index=10, total=100, preview=img, label="prompt",
+            prompts=[PromptSpec("castle", 1.0, False)],
+            config=GuidanceSnapshot(clip_guidance_scale=3333),
+        ),
+    ]
+    app._preview_index = 0
+    app._do_revert()  # worker is None -> img2img from the checkpoint preview
+    assert started == [True]
+    assert app._init_image is not None
+    assert app._init_label == "history: prompt"
+    assert app.session.config.clip_guidance_scale == 3333
+    assert [(r.text, r.weight, r.muted) for r in app.prompts] == [("castle", 1.0, False)]
+
+
 def test_panel_height_clamps(app):
     app._set_panel_height(10**6)
     assert app._image_area_h() >= A.MIN_IMAGE_H
@@ -220,7 +349,7 @@ def test_ctrl_z_reverts_to_latest_checkpoint(app):
         HistoryEntry(
             latent=None, step=0, index=5, total=100, preview=img, label="start",
             prompts=[PromptSpec(text="p", weight=1.0, muted=False)],
-            config={"clip_guidance_scale": 5000},
+            config=GuidanceSnapshot(clip_guidance_scale=5000),
         )
     ]
     app._hist_len = 1
@@ -240,9 +369,11 @@ def test_ctrl_z_walks_back_through_history(app):
     img = np.zeros((4, 4, 3), np.uint8)
     app._history = [
         HistoryEntry(latent=None, step=0, index=2, total=100, preview=img, label="start",
-                     prompts=[PromptSpec(text="p", weight=1.0, muted=False)], config={}),
+                     prompts=[PromptSpec(text="p", weight=1.0, muted=False)],
+                     config=GuidanceSnapshot()),
         HistoryEntry(latent=None, step=0, index=20, total=100, preview=img, label="prompt",
-                     prompts=[PromptSpec(text="p", weight=1.0, muted=False)], config={}),
+                     prompts=[PromptSpec(text="p", weight=1.0, muted=False)],
+                     config=GuidanceSnapshot()),
     ]
     app._hist_len = 2
     seeked = []

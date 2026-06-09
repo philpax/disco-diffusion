@@ -62,7 +62,7 @@ class StubSampler:
         pass
 
 
-def _make_worker(cfg=None, revert_attrs=None) -> GenerationWorker:
+def _make_worker(cfg=None) -> GenerationWorker:
     cfg = cfg or SimpleNamespace(clip_guidance_scale=5000, tv_scale=0.0)
     session = SimpleNamespace(
         config=cfg,
@@ -70,13 +70,7 @@ def _make_worker(cfg=None, revert_attrs=None) -> GenerationWorker:
         sampler=lambda **kw: StubSampler(),
     )
     return GenerationWorker(
-        session,
-        width=64,
-        height=64,
-        steps=20,
-        encode_cache={},
-        cache_lock=threading.Lock(),
-        revert_attrs=revert_attrs or [],
+        session, width=64, height=64, steps=20, encode_cache={}, cache_lock=threading.Lock()
     )
 
 
@@ -104,7 +98,7 @@ def test_each_stroke_is_its_own_checkpoint():
 
 def test_checkpoints_snapshot_guidance_and_eta():
     cfg = SimpleNamespace(clip_guidance_scale=5000, tv_scale=0.0, eta=0.8)
-    worker = _make_worker(cfg, revert_attrs=["clip_guidance_scale", "eta"])
+    worker = _make_worker(cfg)
     worker.start()
     time.sleep(0.05)
     cfg.clip_guidance_scale = 12345  # "change guidance"
@@ -116,10 +110,10 @@ def test_checkpoints_snapshot_guidance_and_eta():
     history = worker.get_history()
     start = next(e for e in history if e.label == "start")
     guidance = next(e for e in history if e.label == "guidance")
-    assert start.config["clip_guidance_scale"] == 5000
-    assert start.config["eta"] == 0.8
-    assert guidance.config["clip_guidance_scale"] == 12345
-    assert guidance.config["eta"] == 0.3  # eta is captured, so Revert can restore it
+    assert start.config.clip_guidance_scale == 5000
+    assert start.config.eta == 0.8
+    assert guidance.config.clip_guidance_scale == 12345
+    assert guidance.config.eta == 0.3  # eta is captured, so Revert can restore it
 
 
 def test_muted_and_empty_prompts_excluded_from_conditioning():

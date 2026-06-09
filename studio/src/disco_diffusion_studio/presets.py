@@ -9,16 +9,19 @@ and saved from the UI. Reading uses the stdlib ``tomllib``; writing uses a tiny 
 
 from __future__ import annotations
 
+import io
 import logging
 import re
 import tomllib
+import zipfile
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
 from disco_diffusion import RunConfig
 from disco_diffusion.config import parse_schedule
-from pydantic import BaseModel, ConfigDict, field_validator
+from PIL import Image
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 log = logging.getLogger("disco_diffusion_studio.presets")
 
@@ -123,6 +126,8 @@ def _fmt_value(v: object) -> str:
         return repr(v)  # repr round-trips floats (e.g. 150.0, 0.05)
     if isinstance(v, str):
         return _fmt_str(v)
+    if isinstance(v, dict):  # inline table, e.g. a prompt {text = "...", weight = 1.0, ...}
+        return "{" + ", ".join(f"{k} = {_fmt_value(val)}" for k, val in v.items()) + "}"
     if isinstance(v, (list, tuple)):
         return "[" + ", ".join(_fmt_value(x) for x in v) + "]"
     raise TypeError(f"unsupported TOML value: {v!r}")
@@ -195,6 +200,221 @@ def save_preset(filename: str, preset: Preset) -> tuple[str, Path]:
     path.write_text(_dumps_toml(data))
     log.info("saved preset %s", path)
     return stem, path
+
+
+# --- sessions: a full working state (superset of a preset) -------------------
+
+
+class Session(BaseModel):
+    """A whole working state, saved/loaded as a ``.zip`` via the native dialog.
+
+    A superset of a :class:`Preset` (config + model set) plus the prompts and the output
+    settings (size / steps / seed / denoise) — enough to reproduce or *resume* a piece of work.
+    The zip also bundles the rendered result (``result.png``); loading sets it as the init image
+    (with ``denoise``) so pressing Play continues from where you left off.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    width: int
+    height: int
+    steps: int
+    seed: int
+    denoise: int  # init-image denoise % to continue the bundled result with
+    prompts: list[tuple[str, float, bool]]  # (text, weight, muted)
+    config: PresetConfig
+    clip_models: list[str]
+    use_secondary_model: bool
+
+
+_SESSION_TOML = "session.toml"
+_SESSION_IMAGE = "result.png"
+
+
+# The on-disk TOML schema, as pydantic models mirroring the [output]/[config]/[models] tables and
+# the prompts array. Reading goes through ``model_validate``, so a malformed/old file raises a
+# clear ValidationError instead of a KeyError/TypeError deep in manual dict access.
+class _PromptDoc(BaseModel):
+    text: str
+    weight: float
+    muted: bool = False
+
+
+class _OutputDoc(BaseModel):
+    width: int
+    height: int
+    steps: int
+    seed: int
+    denoise: int = 60
+
+
+class _ModelsDoc(BaseModel):
+    clip_models: list[str]
+    use_secondary_model: bool
+
+
+class _SessionDoc(BaseModel):
+    prompts: list[_PromptDoc] = Field(default_factory=list)
+    output: _OutputDoc
+    config: PresetConfig
+    models: _ModelsDoc
+
+    @classmethod
+    def from_session(cls, s: Session) -> _SessionDoc:
+        return cls(
+            prompts=[_PromptDoc(text=t, weight=w, muted=m) for t, w, m in s.prompts],
+            output=_OutputDoc(
+                width=s.width, height=s.height, steps=s.steps, seed=s.seed, denoise=s.denoise
+            ),
+            config=s.config,
+            models=_ModelsDoc(
+                clip_models=s.clip_models, use_secondary_model=s.use_secondary_model
+            ),
+        )
+
+    def to_session(self) -> Session:
+        return Session(
+            width=self.output.width,
+            height=self.output.height,
+            steps=self.output.steps,
+            seed=self.output.seed,
+            denoise=self.output.denoise,
+            prompts=[(p.text, p.weight, p.muted) for p in self.prompts],
+            config=self.config,
+            clip_models=self.models.clip_models,
+            use_secondary_model=self.models.use_secondary_model,
+        )
+
+
+class GuidanceSnapshot(BaseModel):
+    """The live-guidance values captured at a checkpoint, so Revert restores them exactly.
+
+    Fully typed (not a loose ``dict[str, float]``) so int knobs — ``clip_guidance_scale`` and
+    ``cutn_batches``, the latter used as ``range(cutn_batches)`` — stay ints through save/load.
+    Fields mirror the RunConfig live-guidance knobs + eta; the import-time check below guards
+    against drift, and the defaults match RunConfig's.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    clip_guidance_scale: int = 5000
+    tv_scale: float = 0.0
+    range_scale: float = 150.0
+    sat_scale: float = 0.0
+    cutn_batches: int = 4
+    clamp_max: float = 0.05
+    eta: float = 0.8
+
+    @classmethod
+    def capture(cls, config: RunConfig) -> GuidanceSnapshot:
+        """Snapshot the guidance fields off a RunConfig (a field absent on ``config`` defaults)."""
+        return cls(**{f: getattr(config, f) for f in cls.model_fields if hasattr(config, f)})
+
+    def apply_to(self, config: RunConfig) -> None:
+        """Write the snapshot back onto a RunConfig — types preserved, no float/int surprises."""
+        for field_name, value in self.model_dump().items():
+            setattr(config, field_name, value)
+
+
+# Like PresetConfig, every GuidanceSnapshot field must name a real RunConfig field — checked at
+# import so a rename/typo fails fast.
+_UNKNOWN_SNAPSHOT_FIELDS = sorted(set(GuidanceSnapshot.model_fields) - set(RunConfig.model_fields))
+if _UNKNOWN_SNAPSHOT_FIELDS:
+    raise RuntimeError(f"GuidanceSnapshot fields not on RunConfig: {_UNKNOWN_SNAPSHOT_FIELDS}")
+
+
+
+class HistoryItem(BaseModel):
+    """One saved checkpoint's metadata; its preview image is stored alongside in the zip.
+
+    Latents aren't saved (huge and, given DD's nondeterminism, not worth it) — so reloading
+    restores the scrubbable timeline and lets you continue from a checkpoint via img2img on its
+    preview, rather than a bit-exact resume.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    label: str
+    step: int
+    index: int
+    total: int
+    prompts: list[tuple[str, float, bool]] = Field(default_factory=list)
+    config: GuidanceSnapshot = Field(default_factory=GuidanceSnapshot)
+
+
+class _HistoryDoc(BaseModel):
+    entries: list[HistoryItem] = Field(default_factory=list)
+
+
+_SESSION_HISTORY_JSON = "history.json"
+
+
+def _png_bytes(image: Image.Image) -> bytes:
+    buf = io.BytesIO()
+    image.convert("RGB").save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _jpeg_bytes(image: Image.Image) -> bytes:
+    buf = io.BytesIO()
+    image.convert("RGB").save(buf, format="JPEG", quality=85)
+    return buf.getvalue()
+
+
+def _read_image(zf: zipfile.ZipFile, name: str) -> Image.Image:
+    image = Image.open(io.BytesIO(zf.read(name))).convert("RGB")
+    image.load()  # fully read before the zip closes
+    return image
+
+
+def save_session(
+    path: str,
+    session: Session,
+    image: Image.Image | None = None,
+    history: list[tuple[HistoryItem, Image.Image]] | None = None,
+) -> Path:
+    """Write a session ``.zip``: settings TOML + the rendered result + the checkpoint history.
+
+    ``history`` is the edit-history checkpoints (metadata + preview); their previews are JPEGs
+    under ``history/`` and the metadata is validated JSON, so reloading restores the timeline.
+    """
+    out = Path(path)
+    if out.suffix.lower() != ".zip":
+        out = out.with_suffix(".zip")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr(_SESSION_TOML, _dumps_toml(_SessionDoc.from_session(session).model_dump()))
+        if image is not None:
+            zf.writestr(_SESSION_IMAGE, _png_bytes(image))
+        if history:
+            doc = _HistoryDoc(entries=[item for item, _img in history])
+            zf.writestr(_SESSION_HISTORY_JSON, doc.model_dump_json())
+            for i, (_item, preview) in enumerate(history):
+                zf.writestr(f"history/{i:03d}.jpg", _jpeg_bytes(preview))
+    log.info("saved session %s", out)
+    return out
+
+
+def load_session(
+    path: str,
+) -> tuple[Session, Image.Image | None, list[tuple[HistoryItem, Image.Image]]]:
+    """Read a session ``.zip``: settings, the bundled result image (or None), and the history.
+
+    The TOML/JSON are validated through pydantic, so a malformed/old file raises a
+    ``ValidationError`` (caught by the caller) rather than failing obscurely.
+    """
+    with zipfile.ZipFile(path) as zf:
+        names = set(zf.namelist())
+        session = _SessionDoc.model_validate(tomllib.loads(zf.read(_SESSION_TOML).decode()))
+        image = _read_image(zf, _SESSION_IMAGE) if _SESSION_IMAGE in names else None
+        history: list[tuple[HistoryItem, Image.Image]] = []
+        if _SESSION_HISTORY_JSON in names:
+            doc = _HistoryDoc.model_validate_json(zf.read(_SESSION_HISTORY_JSON))
+            for i, item in enumerate(doc.entries):
+                name = f"history/{i:03d}.jpg"
+                if name in names:
+                    history.append((item, _read_image(zf, name)))
+    return session.to_session(), image, history
 
 
 # --- colours: load / save ----------------------------------------------------

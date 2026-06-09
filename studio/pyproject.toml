@@ -42,8 +42,14 @@ disco-diffusion = { workspace = true }
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 # Setting the native min window size uses pygame.Window.from_display_module (deprecated in
-# pygame-ce); harmless here and unrelated to the tests, so keep the output clean.
-filterwarnings = ["ignore:Please use Window.get_surface:DeprecationWarning"]
+# pygame-ce); a few tests set a slider value before re-ranging it (pygame_gui warns, then
+# clamps); and the message-window dialog asks for its bold font before the lazy preload. All
+# are harmless and unrelated to what's under test, so keep the output clean.
+filterwarnings = [
+    "ignore:Please use Window.get_surface:DeprecationWarning",
+    "ignore:value not in range:UserWarning",
+    "ignore:Finding font with id:UserWarning",
+]
 
 [tool.ruff]
 line-length = 100

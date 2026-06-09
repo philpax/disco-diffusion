@@ -19,6 +19,8 @@ import torch
 from disco_diffusion import DiscoSession, EncodedPrompt
 from PIL import Image
 
+from .presets import GuidanceSnapshot
+
 log = logging.getLogger("disco_diffusion_studio.worker")
 
 MAX_HISTORY = 60  # cap on edit-history checkpoints (each holds a CPU latent)
@@ -58,7 +60,7 @@ class HistoryEntry:
     preview: np.ndarray  # (H, W, 3) uint8 — the image at this checkpoint
     label: str
     prompts: list[PromptSpec] = field(default_factory=list)  # (text, weight, muted) at capture
-    config: dict[str, float] = field(default_factory=dict)  # live guidance values at capture
+    config: GuidanceSnapshot = field(default_factory=GuidanceSnapshot)  # live guidance at capture
 
 
 class GenerationWorker(threading.Thread):
@@ -74,7 +76,6 @@ class GenerationWorker(threading.Thread):
         encode_cache: dict[str, EncodedPrompt],
         cache_lock: threading.Lock,
         perlin: bool = False,
-        revert_attrs: list[str] | None = None,
         init_image: Image.Image | None = None,
         skip_steps: int = 0,
         seed: int | None = None,
@@ -92,9 +93,6 @@ class GenerationWorker(threading.Thread):
         # generation size by the library). A revert still resumes from a saved latent, not this.
         self._init_image = init_image
         self._init_skip_steps = skip_steps
-        # Config attrs to snapshot into each checkpoint so a revert restores them (the live
-        # guidance scales plus eta — anything the resumed run reads that the UI can retune).
-        self._revert_attrs = list(revert_attrs or [])
 
         self._resume = threading.Event()
         self._resume.set()  # start running (not paused)
@@ -209,7 +207,6 @@ class GenerationWorker(threading.Thread):
         if state is None or pil is None:
             return
         latent, step = state
-        cfg = self._session.config
         entry = HistoryEntry(
             latent=latent,
             step=step,
@@ -218,7 +215,7 @@ class GenerationWorker(threading.Thread):
             preview=np.asarray(pil),
             label=label,
             prompts=list(self._last_prompts),
-            config={a: getattr(cfg, a) for a in self._revert_attrs},
+            config=GuidanceSnapshot.capture(self._session.config),
         )
         with self._lock:
             self.history.append(entry)
