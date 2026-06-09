@@ -115,7 +115,7 @@ def test_picked_colour_is_remembered(app):
 
 def test_mute_button_toggles_and_excludes_from_snapshot(app):
     app.prompts = [A.PromptRow("a", 1.0), A.PromptRow("b", 1.0)]
-    app._rebuild_prompt_rows()
+    app.bottom_bar.rebuild_prompt_rows(app)
     mute_btn = next(b for b, i in app.bottom_bar._mute_buttons.items() if i == 1)
     app._handle_event(pygame.event.Event(pygame_gui.UI_BUTTON_PRESSED, ui_element=mute_btn))
     assert app.prompts[1].muted is True

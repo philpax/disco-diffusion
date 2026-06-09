@@ -179,7 +179,7 @@ def _handle_event(app: App, event: pygame.event.Event) -> bool:
             app._mark_custom()
         elif event.ui_element == app.bottom_bar.add_button:
             app.prompts.append(PromptRow("", 1.0))
-            app._rebuild_prompt_rows()
+            app.bottom_bar.rebuild_prompt_rows(app)
             app._push_prompts()
             app._request_checkpoint("add prompt")
         elif event.ui_element == app.sidebar.apply_button:
@@ -197,7 +197,7 @@ def _handle_event(app: App, event: pygame.event.Event) -> bool:
             idx = app.bottom_bar._remove_buttons[event.ui_element]
             if 0 <= idx < len(app.prompts):
                 app.prompts.pop(idx)
-                app._rebuild_prompt_rows()
+                app.bottom_bar.rebuild_prompt_rows(app)
                 app._push_prompts()
                 app._request_checkpoint("remove prompt")
         elif event.ui_element in app.bottom_bar._mute_buttons:
@@ -206,7 +206,7 @@ def _handle_event(app: App, event: pygame.event.Event) -> bool:
                 prompt = app.prompts[idx]
                 prompt.muted = not prompt.muted
                 (event.ui_element.select if prompt.muted else event.ui_element.unselect)()
-                app._refresh_rows()
+                app.bottom_bar.refresh_rows(app)
                 app._push_prompts()  # re-mix conditioning (muted excluded)
                 app._request_checkpoint("mute prompt" if prompt.muted else "unmute prompt")
         elif event.ui_element in app.bottom_bar._brush_buttons:
@@ -268,7 +268,7 @@ def _handle_event(app: App, event: pygame.event.Event) -> bool:
             slider_idx = app.bottom_bar._weight_sliders.get(event.ui_element)
             if slider_idx is not None and 0 <= slider_idx < len(app.prompts):
                 app.prompts[slider_idx].weight = float(event.value)
-                app._refresh_rows()
+                app.bottom_bar.refresh_rows(app)
                 app._push_prompts()
 
     elif event.type == pygame_gui.UI_DROP_DOWN_MENU_CHANGED:

@@ -366,9 +366,6 @@ class App:
             rect, html_message=message, manager=self.manager, window_title=title
         )
 
-    def _build_palette(self, rect: pygame.Rect) -> None:
-        return _ui_build._build_palette(self, rect)
-
     @property
     def running(self) -> bool:
         return (
@@ -381,18 +378,6 @@ class App:
     # -- UI construction --
     def _build_ui(self) -> None:
         return _ui_build._build_ui(self)
-
-    def _build_bottom_panel(self) -> None:
-        return _ui_build._build_bottom_panel(self)
-
-    def _displayed_prompts(self) -> list[PromptRow]:
-        return _ui_build._displayed_prompts(self)
-
-    def _rebuild_prompt_rows(self) -> None:
-        return _ui_build._rebuild_prompt_rows(self)
-
-    def _refresh_rows(self) -> None:
-        return _ui_build._refresh_rows(self)
 
     def _perrun_values(self) -> dict[str, str]:
         """Display strings for every CURRENT_PERRUN key from the current (pending) state.
@@ -656,7 +641,7 @@ class App:
         self.sidebar._init_denoise_slider.set_current_value(float(self._init.denoise))
         self.sidebar._init_denoise_label.set_text(f"{self._init.denoise}%")
         self.prompts = [PromptRow(t, w, m) for t, w, m in session.prompts] or [PromptRow("", 1.0)]
-        self._rebuild_prompt_rows()
+        self.bottom_bar.rebuild_prompt_rows(self)
         self._apply_recipe(session.config, session.clip_models, session.use_secondary_model)
         self._preset_selection = self._detect_preset()
         self.sidebar.spawn_preset_dropdown(self)
@@ -814,7 +799,7 @@ class App:
         if entry.get_text() == self.prompts[idx].text:
             return
         self.prompts[idx].text = entry.get_text()
-        self._refresh_rows()
+        self.bottom_bar.refresh_rows(self)
         self._push_prompts()
         self._request_checkpoint("prompt")
 
@@ -1066,7 +1051,7 @@ class App:
         self._preview_prompts = (
             [PromptRow(t, w, m) for t, w, m in want] if want is not None else None
         )
-        self._rebuild_prompt_rows()
+        self.bottom_bar.rebuild_prompt_rows(self)
         self._sync_enabled()
 
     def _refresh_preview_state(self) -> None:
@@ -1104,7 +1089,7 @@ class App:
         # Park the thumb on the checkpoint's actual step now — the worker processes the seek
         # asynchronously, so _live_index() would still read the stale (forward) live frame here.
         self.bottom_bar.history_slider.set_current_value(float(entry.index))
-        self._rebuild_prompt_rows()  # now-live (reverted) prompts
+        self.bottom_bar.rebuild_prompt_rows(self)  # now-live (reverted) prompts
         self._push_prompts()  # apply them to the resumed run
         self._sync_enabled()  # re-enable prompt editing
         self._refresh_preview_state()
@@ -1117,7 +1102,7 @@ class App:
         self._set_init_image(Image.fromarray(entry.preview), f"history: {entry.label}")
         self._timeline.preview_index = None
         self._preview_prompts = None
-        self._rebuild_prompt_rows()
+        self.bottom_bar.rebuild_prompt_rows(self)
         self._start_run()  # seeds the new run from the checkpoint preview (img2img)
 
     # -- keyboard shortcuts --
@@ -1267,9 +1252,8 @@ class App:
         """Adopt a picked colour as the brush colour and remember it (capped, persisted)."""
         self.brush.color = rgb
         self._palette.remember(rgb)  # records off-palette colours as recents (deduped, persisted)
-        self._build_palette(
-            self.bottom_bar._palette_rect
-        )  # relayout swatches to include any new recent
+        # relayout the swatches to include any new recent
+        self.bottom_bar.build_palette(self, self.bottom_bar._palette_rect)
 
     # -- painting --
     def _on_swatch(self, pos: tuple[int, int]) -> bool:
@@ -1335,7 +1319,7 @@ class App:
             self._poll_reload()  # swap in a reloaded session once its background thread finishes
             self._auto_apply_on_blur()
             # Live "edited · Enter" badge while typing (cheap; only mutates on change).
-            self._refresh_rows()
+            self.bottom_bar.refresh_rows(self)
             self._refresh_current()  # keep the "Current" sidebar tab in sync
             self.canvas.paint.sync(self.worker)
             self._sync_history()

@@ -1,15 +1,18 @@
 """The bottom panel of the left column: transport, history scrubber, paint tools, prompt list.
 
-:class:`BottomBar` owns those widgets as one named group, so the rest of the app reaches them via
-``app.bottom_bar.*``. Built by the ``_ui_build`` helpers and driven by the App's event router.
+:class:`BottomBar` owns those widgets *and* builds them (``build`` + ``build_palette`` /
+``rebuild_prompt_rows`` / ``refresh_rows``), keeping the left column's panel out of the god-class.
+It takes the App for shared state / actions; the App's event router still drives it.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 import pygame
-from pygame_gui.core import UIElement
+import pygame_gui
+from pygame_gui.core import ObjectID, UIElement
 from pygame_gui.elements import (
     UIButton,
     UIHorizontalSlider,
@@ -17,6 +20,15 @@ from pygame_gui.elements import (
     UIScrollingContainer,
     UITextEntryLine,
 )
+
+from .constants import BRUSH_SIZE_MAX, BRUSH_SIZE_MIN, BRUSH_STRENGTH_MAX, BRUSH_STRENGTH_MIN
+from .controls import PromptRow
+from .layout import CTRL_H, LABEL_H, MARGIN, PAD, ROW_PITCH, Row, Stack
+from .paint import BRUSHES
+from .theme import MUTED_COLOR, PENDING_COLOR, READOUT_COLOR
+
+if TYPE_CHECKING:
+    from .app import App
 
 RGB = tuple[int, int, int]
 
@@ -63,3 +75,199 @@ class BottomBar:
     _mute_buttons: dict[UIButton, int] = field(default_factory=dict)
     _prompt_entries: dict[UITextEntryLine, int] = field(default_factory=dict)
     _weight_sliders: dict[UIHorizontalSlider, int] = field(default_factory=dict)
+
+    def build(self, app: App) -> None:
+        """The left column's control panel: transport, history, tools, colours, prompts."""
+        ui = pygame_gui.elements
+        panel_w = app._panel_w()
+        stack = Stack(MARGIN, app._image_area_h() + PAD, panel_w - 2 * MARGIN)
+
+        # Row 1: transport — Play / Stop / Reset | step (left) … status (right) | Save.
+        r = stack.row(CTRL_H)
+        self.play_button = ui.UIButton(r.left(100), "Play", app.manager, object_id="#play_button")
+        self.stop_button = ui.UIButton(r.left(80), "Stop", app.manager, object_id="#stop_button")
+        # Reset discards the rendered frame (after a confirm) so the init / empty canvas shows.
+        self.reset_button = ui.UIButton(r.left(70), "Reset", app.manager)
+        self.save_button = ui.UIButton(r.right(80), "Save", app.manager, object_id="#save_button")
+        self.status_label = ui.UILabel(r.right(150), "", app.manager, object_id="#status_label")
+        self.step_label = ui.UILabel(r.fill(), "step 0 / 0", app.manager, object_id="#step_label")
+
+        # Row 2: history scrubber — directly under transport. Drag to preview a checkpoint.
+        r = stack.row(CTRL_H)
+        ui.UILabel(r.left(54), "History", app.manager)
+        self.cancel_button = ui.UIButton(r.right(70), "Cancel", app.manager)
+        self.revert_button = ui.UIButton(r.right(70), "Revert", app.manager)
+        self.history_label = ui.UILabel(r.right(120), "live", app.manager)
+        self._history_slider_rect = r.fill()
+        # The slider spans the 0..N step timeline (not the checkpoint count), so a checkpoint's
+        # thumb position matches its actual progress; drags snap to the nearest checkpoint.
+        self.history_slider = ui.UIHorizontalSlider(
+            self._history_slider_rect,
+            start_value=app._timeline.slider_start(app._live_index()),
+            value_range=(0.0, float(max(app._history_total(), 1))),
+            manager=app.manager,
+        )
+
+        # Row 3: painting tools — brush kind, noise toggle, size, opacity, clear
+        r = stack.row(CTRL_H)
+        self._brush_buttons = {}
+        for name in BRUSHES:
+            button = ui.UIButton(r.left(64), name, app.manager, object_id="#brush_button")
+            self._brush_buttons[button] = name
+            if name == app.brush.type:
+                button.select()
+        # Toggle: deposit fresh tinted noise (new structure) instead of plain colour.
+        self.noise_button = ui.UIButton(r.left(74), "Noise", app.manager, object_id="#brush_button")
+        if app.brush.noise:
+            self.noise_button.select()
+        # Right group (packed right-to-left, so it reads "Opacity [slider] Clear" left-to-right).
+        self.clear_paint_button = ui.UIButton(r.right(64), "Clear", app.manager)
+        self.strength_slider = ui.UIHorizontalSlider(
+            r.right(104),
+            app.brush.strength,
+            (BRUSH_STRENGTH_MIN, BRUSH_STRENGTH_MAX),
+            app.manager,
+        )
+        ui.UILabel(r.right(56), "Opacity", app.manager)
+        # Size label + slider, the slider flexing into whatever's left between the two groups.
+        ui.UILabel(r.left(36), "Size", app.manager)
+        self.size_slider = ui.UIHorizontalSlider(
+            r.fill(), app.brush.size, (BRUSH_SIZE_MIN, BRUSH_SIZE_MAX), app.manager
+        )
+
+        # Row 4: colour palette — current-colour preview + swatches (custom-drawn), and an
+        # "RGB…" button that opens the arbitrary-colour picker. The preview/swatches occupy the
+        # space left of the button.
+        r = stack.row(CTRL_H)
+        self.pick_color_button = ui.UIButton(
+            r.right(70), "RGB…", app.manager, object_id="#add_button"
+        )
+        self.build_palette(app, r.fill())
+
+        # Row 5: prompts header — Add + hint (hint fills the remaining width)
+        r = stack.row(LABEL_H)
+        self.add_button = ui.UIButton(
+            r.left(120), "+ Add prompt", app.manager, object_id="#add_button"
+        )
+        self.hint_label = ui.UILabel(
+            r.fill(),
+            "weight 0-2 applies instantly · Enter/click-away applies text · M mutes · % = mix",
+            app.manager,
+            object_id="#hint_label",
+        )
+
+        # Scrolling prompt list (extra rows scroll), flexing to fill the rest of the panel down
+        # to its bottom edge — so dragging the panel taller shows more rows. Pulled up under the
+        # header (less the usual row pad) to tighten the gap to the first row.
+        list_top = stack.y - 8
+        list_h = max(ROW_PITCH, app.layout.win_h - MARGIN - list_top)
+        list_rect = pygame.Rect(MARGIN, list_top, panel_w - 2 * MARGIN, list_h)
+        self.prompt_panel = ui.UIScrollingContainer(list_rect, app.manager)
+        # Lay rows out narrower than the viewport so the vertical scrollbar never forces a
+        # horizontal one (a horizontal bar appears only when content is wider than the view).
+        self._list_inner_w = list_rect.width - 24
+        self.rebuild_prompt_rows(app)
+
+    def build_palette(self, app: App, rect: pygame.Rect) -> None:
+        """Lay out the current-colour preview + swatch rects within ``rect`` (drawn custom)."""
+        self._palette_rect = rect
+        self._swatch_rects = []
+        self._color_preview_rect = pygame.Rect(rect.x, rect.y, CTRL_H, CTRL_H)
+        x = rect.x + CTRL_H + 10
+        colours = app._palette.swatches()
+        n = max(len(colours), 1)
+        gap = 4
+        sw = max(8, min(CTRL_H, (rect.right - x - (n - 1) * gap) // n))
+        y = rect.y + (CTRL_H - sw) // 2
+        for i, color in enumerate(colours):
+            self._swatch_rects.append((pygame.Rect(x + i * (sw + gap), y, sw, sw), color))
+
+    def displayed_prompts(self, app: App) -> list[PromptRow]:
+        """The prompts shown in the rows: a previewed checkpoint's, else the live set."""
+        return app._preview_prompts if app._preview_prompts is not None else app.prompts
+
+    def rebuild_prompt_rows(self, app: App) -> None:
+        for el in self._row_elements:
+            el.kill()
+        self._row_elements.clear()
+        self._remove_buttons.clear()
+        self._mute_buttons.clear()
+        self._prompt_entries.clear()
+        self._weight_sliders.clear()
+
+        container = self.prompt_panel
+        inner_w = self._list_inner_w
+        ui = pygame_gui.elements
+        v_pad = (ROW_PITCH - CTRL_H) // 2  # vertically centre widgets in their row pitch
+        prompts = self.displayed_prompts(app)
+        for i, prompt in enumerate(prompts):
+            # Pack: [mute] [text fills] [slider] [weight readout] [X]. Right-side widgets are
+            # taken first so the text entry flexes into whatever width is left.
+            r = Row(0, i * ROW_PITCH + v_pad, inner_w, CTRL_H)
+            mute = ui.UIButton(
+                r.left(30), "M", app.manager, container=container, object_id="#brush_button"
+            )
+            if prompt.muted:
+                mute.select()
+            remove = ui.UIButton(
+                r.right(30),
+                "×",
+                app.manager,
+                container=container,
+                object_id=ObjectID(object_id="#remove_button", class_id="@remove_button"),
+            )
+            wlabel = ui.UILabel(r.right(104), "", app.manager, container=container)
+            slider = ui.UIHorizontalSlider(
+                r.right(150),
+                start_value=prompt.weight,
+                value_range=(0.0, 2.0),
+                manager=app.manager,
+                container=container,
+            )
+            entry = ui.UITextEntryLine(r.fill(), app.manager, container=container)
+            entry.set_text(prompt.text)
+            self._row_elements += [mute, remove, entry, slider, wlabel]
+            self._remove_buttons[remove] = i
+            self._mute_buttons[mute] = i
+            self._prompt_entries[entry] = i
+            self._weight_sliders[slider] = i
+            prompt._wlabel = wlabel  # type: ignore[attr-defined]  # stash for live updates
+            prompt._entry = entry  # type: ignore[attr-defined]
+            prompt._label_state = None  # type: ignore[attr-defined]  # last (text, colour) shown
+        container.set_scrollable_area_dimensions((inner_w, max(len(prompts), 1) * ROW_PITCH + 6))
+        self.refresh_rows(app)
+
+    def refresh_rows(self, app: App) -> None:
+        """Update each row's readout: raw weight + normalised share, or a pending badge.
+
+        Mirrors Sampler.set_conditioning (empty rows ignored; remaining weights normalised
+        to sum to 1, so the % is exactly the mix the guidance uses). A row whose text box
+        differs from the applied prompt shows an amber "edited · Enter" badge instead — this
+        is the live "not yet applied" signal. Labels are only mutated when their state
+        changes, so this is cheap to call every frame.
+        """
+        prompts = self.displayed_prompts(app)
+        active = [(i, r.weight) for i, r in enumerate(prompts) if r.text.strip() and not r.muted]
+        total = sum(w for _, w in active)
+        shares = {i: w / total for i, w in active} if total > 1e-3 else {}
+        for i, row in enumerate(prompts):
+            wlabel = getattr(row, "_wlabel", None)
+            entry = getattr(row, "_entry", None)
+            if wlabel is None or entry is None:
+                continue
+            if entry.get_text() != row.text:
+                text, colour = "edited · Enter", PENDING_COLOR
+            elif row.muted:
+                text, colour = f"{row.weight:.2f}  muted", MUTED_COLOR
+            elif not row.text.strip():
+                text, colour = f"{row.weight:.2f}  empty", MUTED_COLOR
+            elif not shares:
+                text, colour = f"{row.weight:.2f}  off", MUTED_COLOR
+            else:
+                text, colour = f"{row.weight:.2f}  {shares[i] * 100:.0f}%", READOUT_COLOR
+            state = (text, colour)
+            if row._label_state == state:  # type: ignore[attr-defined]
+                continue
+            row._label_state = state  # type: ignore[attr-defined]
+            wlabel.text_colour = pygame.Color(*colour)
+            wlabel.set_text(text)
