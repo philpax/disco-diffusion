@@ -20,13 +20,13 @@ if TYPE_CHECKING:
 
 
 def _draw(app: App) -> None:
-    win_w, win_h = app._window_size()
-    img_h = app._image_area_h()
-    panel_w = app._panel_w()
+    win_w, win_h = app.layout.window_size()
+    img_h = app.layout.image_area_h()
+    panel_w = app.layout.panel_w()
     app.screen.fill(WINDOW_BG)
     pygame.draw.rect(app.screen, IMAGE_BG, (0, 0, panel_w, img_h))
     pygame.draw.rect(app.screen, PANEL_BG, (0, img_h, panel_w, win_h - img_h))
-    pygame.draw.rect(app.screen, PANEL_BG, app._sidebar_rect())  # full-height sidebar
+    pygame.draw.rect(app.screen, PANEL_BG, app.layout.sidebar_rect())  # full-height sidebar
     # Draggable divider band between the left column and the sidebar.
     div = pygame.Rect(panel_w, 0, DIVIDER_W, win_h)
     hot = app._dragging_divider or abs(app._mouse_pos[0] - panel_w) <= DIVIDER_W
@@ -41,15 +41,15 @@ def _draw(app: App) -> None:
     )
     # Draw the canvas (and unbaked paint overlay) under the view transform, clipped to
     # the viewport so a zoomed/panned canvas never spills into the panel.
-    app.screen.set_clip(app._image_region())
-    crect = app._canvas_screen_rect()
+    app.screen.set_clip(app.layout.image_region())
+    crect = app.canvas.canvas_screen_rect()
     surface = app._displayed_surface()
     if surface is not None:
-        app._blit_canvas(surface)
+        app.canvas.blit(surface)
     elif app._init.surface is not None:
         # No frame yet but an init image is set: preview it (dimmed) so it's clear the run
         # will seed from it.
-        app._blit_canvas(app._init.surface)
+        app.canvas.blit(app._init.surface)
         scrim = pygame.Surface(crect.size, pygame.SRCALPHA)
         scrim.fill((10, 12, 16, 120))
         app.screen.blit(scrim, crect.topleft)
@@ -68,9 +68,9 @@ def _draw(app: App) -> None:
     # stroke plus any flushed strokes not yet baked into a published frame.
     if app._timeline.preview_index is None:
         for overlay, _ in app.canvas.paint.pending_overlays:
-            app._blit_canvas(overlay)
+            app.canvas.blit(overlay)
         if not app.canvas.paint.layer.empty():
-            app._blit_canvas(app.canvas.paint.layer.to_surface())
+            app.canvas.blit(app.canvas.paint.layer.to_surface())
     pygame.draw.rect(app.screen, CANVAS_BORDER, crect, 1)  # canvas outline at any zoom
     app.screen.set_clip(None)
     # Draggable horizontal divider between the image area and the bottom panel, with a grip
@@ -102,7 +102,7 @@ def _draw_tools(app: App) -> None:
         pygame.draw.rect(app.screen, color, sr, border_radius=4)
         if color == app.brush.color:
             pygame.draw.rect(app.screen, (255, 255, 255), sr, width=2, border_radius=4)
-    region = app._image_region()
+    region = app.layout.image_region()
     # Brush ring (scaled by zoom) — only in draw mode (not navigating, not previewing, and
     # not while a dialog window is up).
     if (

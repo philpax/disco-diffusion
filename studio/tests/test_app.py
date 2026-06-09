@@ -96,7 +96,7 @@ def test_modal_blocks_canvas_painting(app):
     app._open_colour_picker()
     assert app._modal_open()
     app._handle_event(
-        pygame.event.Event(pygame.MOUSEBUTTONDOWN, button=1, pos=app._image_region().center)
+        pygame.event.Event(pygame.MOUSEBUTTONDOWN, button=1, pos=app.layout.image_region().center)
     )
     assert app.canvas.paint.painting is False
     assert app.canvas.paint.layer.empty()
@@ -309,7 +309,7 @@ def test_loaded_revert_continues_via_img2img(app, monkeypatch):
 
 def test_panel_height_clamps(app):
     app._set_panel_height(10**6)
-    assert app._image_area_h() >= A.MIN_IMAGE_H
+    assert app.layout.image_area_h() >= A.MIN_IMAGE_H
     app._set_panel_height(0)
     assert app.layout.panel_h == A.PANEL_MIN
 

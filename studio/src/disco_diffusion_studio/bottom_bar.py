@@ -79,8 +79,8 @@ class BottomBar:
     def build(self, app: App) -> None:
         """The left column's control panel: transport, history, tools, colours, prompts."""
         ui = pygame_gui.elements
-        panel_w = app._panel_w()
-        stack = Stack(MARGIN, app._image_area_h() + PAD, panel_w - 2 * MARGIN)
+        panel_w = app.layout.panel_w()
+        stack = Stack(MARGIN, app.layout.image_area_h() + PAD, panel_w - 2 * MARGIN)
 
         # Row 1: transport — Play / Stop / Reset | step (left) … status (right) | Save.
         r = stack.row(CTRL_H)

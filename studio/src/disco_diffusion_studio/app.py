@@ -279,57 +279,13 @@ class App:
         self._build_ui()
 
     # -- geometry --
-    # The window is a left column (image on top, bottom control panel below) plus a full-height
-    # right sidebar; the Layout owns the split maths. These thin wrappers keep the call sites
-    # short (and let the bottom panel's rebuild be coalesced to one per frame via the dirty flag).
-    def _panel_w(self) -> int:
-        return self.layout.panel_w()
-
-    def _divider_x(self) -> int:
-        return self.layout.divider_x()
-
-    def _sidebar_rect(self) -> pygame.Rect:
-        return self.layout.sidebar_rect()
-
-    def _bottom_panel_rect(self) -> pygame.Rect:
-        return self.layout.bottom_panel_rect()
-
-    def _image_area_h(self) -> int:
-        return self.layout.image_area_h()
-
+    # Window geometry lives on self.layout, the canvas transform/paint/frame on self.canvas; call
+    # those directly (e.g. self.layout.image_region(), self.canvas.fit()). Only _set_panel_height
+    # keeps a wrapper, for the coalesced-rebuild dirty flag (its sibling is _set_sidebar_width).
     def _set_panel_height(self, height: int) -> None:
         """Set the bottom-panel height (clamped); the rebuild is coalesced to one per frame."""
         if self.layout.set_panel_height(height):
             self._panel_dirty = True
-
-    def _window_size(self) -> tuple[int, int]:
-        return self.layout.window_size()
-
-    def _centered_rect(self, w: int, h: int) -> pygame.Rect:
-        return self.layout.centered_rect(w, h)
-
-    def _image_region(self) -> pygame.Rect:
-        return self.layout.image_region()
-
-    # The view transform / paint layer / frame live on the Canvas; these thin wrappers keep the
-    # call sites short (the Canvas supplies the ViewTransform with the live region + canvas size).
-    def _canvas_screen_rect(self) -> pygame.Rect:
-        return self.canvas.canvas_screen_rect()
-
-    def _fit_view(self) -> None:
-        self.canvas.fit()
-
-    def _zoom_at(self, pos: tuple[int, int], factor: float) -> None:
-        self.canvas.zoom_at(pos, factor)
-
-    def _clamp_pan(self) -> None:
-        self.canvas.clamp_pan()
-
-    def _screen_to_canvas(self, pos: tuple[int, int]) -> tuple[float, float] | None:
-        return self.canvas.screen_to_canvas(pos)
-
-    def _blit_canvas(self, surf: pygame.Surface) -> None:
-        self.canvas.blit(surf)
 
     def _typing(self) -> bool:
         """True while a text box has keyboard focus (so shortcut keys don't steal input)."""
@@ -361,7 +317,7 @@ class App:
         """Pop a small OK-dismissable modal to surface a user error (e.g. wrong load button)."""
         if self._message_window is not None and self._message_window.alive():
             self._message_window.kill()
-        rect = self._centered_rect(420, 200)
+        rect = self.layout.centered_rect(420, 200)
         self._message_window = UIMessageWindow(
             rect, html_message=message, manager=self.manager, window_title=title
         )
@@ -652,7 +608,7 @@ class App:
         """Open a small modal asking for a filename to save the current settings as a preset."""
         if self._save_preset_window is not None and self._save_preset_window.alive():
             return
-        rect = self._centered_rect(420, 168)
+        rect = self.layout.centered_rect(420, 168)
         ui = pygame_gui.elements
         self._save_preset_window = ui.UIWindow(
             rect, self.manager, window_display_title="Save preset"
@@ -897,7 +853,7 @@ class App:
         # rebuild the init preview (also generation-res), and refit the view.
         self.canvas.resize(self.width, self.height)
         self._init.rebuild_surface(self.width, self.height)
-        self._fit_view()
+        self.canvas.fit()
         self._status("Size set")
 
     def _set_sidebar_width(self, width: int) -> None:
@@ -917,7 +873,7 @@ class App:
             self.screen = surface
         self.manager.set_window_resolution((w, h))
         self._build_ui()
-        self._clamp_pan()  # keep the canvas in view after the viewport changed
+        self.canvas.clamp_pan()  # keep the canvas in view after the viewport changed
 
     def _commit_steps(self) -> None:
         """Adopt the steps box value (clamped). Safe to call on Enter, on blur, or at Play.
@@ -1008,7 +964,7 @@ class App:
             return
         if self._confirm_dialog is not None and self._confirm_dialog.alive():
             return
-        rect = self._centered_rect(360, 200)
+        rect = self.layout.centered_rect(360, 200)
         desc = "Discard the current image and stop the run? The init image (if set) is shown again."
         self._confirm_dialog = UIConfirmationDialog(
             rect, desc, self.manager, window_title="Reset canvas", action_short_name="Reset"
@@ -1200,9 +1156,6 @@ class App:
     def _handle_event(self, event: pygame.event.Event) -> bool:
         return _ui_events._handle_event(self, event)
 
-    def _update_frame_surface(self) -> None:
-        self.canvas.update_frame_surface()
-
     def _auto_apply_on_blur(self) -> None:
         """Apply a text box when keyboard focus leaves it (no Enter needed).
 
@@ -1240,7 +1193,7 @@ class App:
         """Open the arbitrary-RGB picker, seeded with the current brush colour."""
         if self._colour_picker is not None and self._colour_picker.alive():
             return
-        rect = self._centered_rect(420, 400)
+        rect = self.layout.centered_rect(420, 400)
         self._colour_picker = UIColourPickerDialog(
             rect,
             self.manager,
@@ -1263,10 +1216,6 @@ class App:
                 return True
         return False
 
-    def _paint_at(self, pos: tuple[int, int]) -> None:
-        """Paint into the layer at screen ``pos`` (no-op if outside the canvas)."""
-        self.canvas.paint_at(pos)
-
     # -- main loop --
     def run(self) -> None:
         clock = pygame.time.Clock()
@@ -1286,13 +1235,13 @@ class App:
             # startup window-manager resize has been applied above).
             if not self._did_initial_fit:
                 self._did_initial_fit = True
-                self._fit_view()
+                self.canvas.fit()
             # Rebuild once per frame after a sidebar- or panel-divider drag (both coalesced).
             if self._sidebar_dirty or self._panel_dirty:
                 self._sidebar_dirty = False
                 self._panel_dirty = False
                 self._build_ui()
-                self._clamp_pan()
+                self.canvas.clamp_pan()
             # Fire the debounced model auto-reload once its delay has elapsed.
             if self._reloader.due(pygame.time.get_ticks()):
                 self._reloader.cancel()  # clear the debounce; _start_reload re-validates the change
@@ -1323,7 +1272,7 @@ class App:
             self._refresh_current()  # keep the "Current" sidebar tab in sync
             self.canvas.paint.sync(self.worker)
             self._sync_history()
-            self._update_frame_surface()
+            self.canvas.update_frame_surface()
             self.manager.update(dt)
             self._draw()
             self.manager.draw_ui(self.screen)

@@ -83,7 +83,7 @@ class Sidebar:
     def build(self, app: App) -> None:
         """The full-height right sidebar: a Settings / Current tab pair over a scroll area."""
         ui = pygame_gui.elements
-        sb = app._sidebar_rect()
+        sb = app.layout.sidebar_rect()
         x = sb.x + PAD
         inner = max(40, sb.width - 2 * PAD)
         half = (inner - PAD) // 2

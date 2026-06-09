@@ -49,24 +49,24 @@ def _handle_event(app: App, event: pygame.event.Event) -> bool:
             app._set_panel_height(app.layout.win_h - event.pos[1] - DIVIDER_W // 2)
         elif app._panning:
             app.canvas.view.pan += pygame.Vector2(event.rel)
-            app._clamp_pan()
+            app.canvas.clamp_pan()
         elif app.canvas.paint.painting:
-            app._paint_at(event.pos)
+            app.canvas.paint_at(event.pos)
         return True
     if event.type == pygame.MOUSEBUTTONDOWN:
         # The draggable divider sits between the left column and the sidebar (full height).
-        if event.button == 1 and abs(event.pos[0] - app._divider_x()) <= DIVIDER_W:
+        if event.button == 1 and abs(event.pos[0] - app.layout.divider_x()) <= DIVIDER_W:
             app._dragging_divider = True
             return True
         # Horizontal divider between the image area and the bottom panel (left column only).
         if (
             event.button == 1
-            and event.pos[0] < app._panel_w()
-            and abs(event.pos[1] - app._image_area_h()) <= DIVIDER_W
+            and event.pos[0] < app.layout.panel_w()
+            and abs(event.pos[1] - app.layout.image_area_h()) <= DIVIDER_W
         ):
             app._dragging_panel = True
             return True
-        on_canvas = app._image_region().collidepoint(event.pos)
+        on_canvas = app.layout.image_region().collidepoint(event.pos)
         if event.button == 3 and on_canvas:  # right held = navigate mode (pan + scroll-zoom)
             app._navigating = True
             app._panning = True
@@ -78,10 +78,10 @@ def _handle_event(app: App, event: pygame.event.Event) -> bool:
             if app._on_swatch(event.pos):
                 return True
             # No painting while previewing history — it would be invisible and unapplied.
-            on_canvas = app._screen_to_canvas(event.pos) is not None
+            on_canvas = app.canvas.screen_to_canvas(event.pos) is not None
             if app._timeline.preview_index is None and on_canvas:
                 app.canvas.paint.begin()
-                app._paint_at(event.pos)
+                app.canvas.paint_at(event.pos)
             return True
     if event.type == pygame.MOUSEBUTTONUP:
         if event.button == 1:
@@ -96,9 +96,9 @@ def _handle_event(app: App, event: pygame.event.Event) -> bool:
             app._panning = False
         elif event.button == 2:
             app._panning = False
-    if event.type == pygame.MOUSEWHEEL and app._image_region().collidepoint(app._mouse_pos):
+    if event.type == pygame.MOUSEWHEEL and app.layout.image_region().collidepoint(app._mouse_pos):
         if app._navigating:  # canvas mode: wheel zooms toward the cursor
-            app._zoom_at(app._mouse_pos, 1.15**event.y)
+            app.canvas.zoom_at(app._mouse_pos, 1.15**event.y)
         elif pygame.key.get_mods() & pygame.KMOD_SHIFT:
             app._nudge_brush_strength(event.y * 0.05)
         else:
@@ -113,9 +113,9 @@ def _handle_event(app: App, event: pygame.event.Event) -> bool:
         elif event.key == pygame.K_SPACE:
             app._toggle_play()
         elif event.key == pygame.K_f:
-            app._fit_view()
+            app.canvas.fit()
         elif event.key == pygame.K_0:
-            app._zoom_at(app._image_region().center, 1.0 / app.canvas.view.zoom)
+            app.canvas.zoom_at(app.layout.image_region().center, 1.0 / app.canvas.view.zoom)
         elif event.key == pygame.K_LEFTBRACKET:
             app._nudge_brush_size(1.0 / 1.1)
         elif event.key == pygame.K_RIGHTBRACKET:
