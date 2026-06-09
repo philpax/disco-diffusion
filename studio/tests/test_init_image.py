@@ -18,27 +18,27 @@ def _png(tmp_path, size=(80, 50)):
 
 def test_load_init_file_sets_image_and_preview(app, tmp_path):
     app._load_init_file(str(_png(tmp_path)))
-    assert app._init_image is not None
-    assert app._init_label == "seed.png"
-    assert app._init_surface is not None
-    assert app._init_surface.get_size() == (app.width, app.height)  # resized to gen size
+    assert app._init.image is not None
+    assert app._init.label == "seed.png"
+    assert app._init.surface is not None
+    assert app._init.surface.get_size() == (app.width, app.height)  # resized to gen size
 
 
 def test_denoise_maps_to_skip_steps(app, tmp_path):
     app._load_init_file(str(_png(tmp_path)))
     app.steps = 100
-    app._init_denoise = 100
-    assert app._init_skip_steps() == 0  # full re-diffusion (ignore init structure)
-    app._init_denoise = 0
-    assert app._init_skip_steps() == 99  # keep the init (steps - 1)
-    app._init_denoise = 60
-    assert app._init_skip_steps() == 40
+    app._init.denoise = 100
+    assert app._init.skip_steps(app.steps) == 0  # full re-diffusion (ignore init structure)
+    app._init.denoise = 0
+    assert app._init.skip_steps(app.steps) == 99  # keep the init (steps - 1)
+    app._init.denoise = 60
+    assert app._init.skip_steps(app.steps) == 40
 
 
 def test_no_init_means_zero_skip(app):
-    app._init_image = None
-    app._init_denoise = 0
-    assert app._init_skip_steps() == 0
+    app._init.image = None
+    app._init.denoise = 0
+    assert app._init.skip_steps(app.steps) == 0
 
 
 def test_use_current_result_as_init(app):
@@ -46,8 +46,8 @@ def test_use_current_result_as_init(app):
     frame.fill((10, 200, 50))
     app._frame_surface = frame
     app._use_current_as_init()
-    assert app._init_image is not None
-    assert app._init_label == "current result"
+    assert app._init.image is not None
+    assert app._init.label == "current result"
 
 
 def test_denoise_slider_updates_value(app):
@@ -56,28 +56,28 @@ def test_denoise_slider_updates_value(app):
             pygame_gui.UI_HORIZONTAL_SLIDER_MOVED, ui_element=app._init_denoise_slider, value=25.0
         )
     )
-    assert app._init_denoise == 25
+    assert app._init.denoise == 25
 
 
 def test_clear_init(app, tmp_path):
     app._load_init_file(str(_png(tmp_path)))
     app._clear_init()
-    assert app._init_image is None
-    assert app._init_surface is None
+    assert app._init.image is None
+    assert app._init.surface is None
 
 
 def test_open_init_loads_via_native_dialog(app, tmp_path, stub_dialogs):
     path = _png(tmp_path)
     stub_dialogs(open=path)
     app._open_init()
-    assert app._init_image is not None
-    assert app._init_label == "seed.png"
+    assert app._init.image is not None
+    assert app._init.label == "seed.png"
 
 
 def test_dropfile_loads_init(app, tmp_path):
     app._handle_event(pygame.event.Event(pygame.DROPFILE, file=str(_png(tmp_path))))
-    assert app._init_image is not None
-    assert app._init_label == "seed.png"
+    assert app._init.image is not None
+    assert app._init.label == "seed.png"
 
 
 def test_reset_with_nothing_to_clear_opens_no_dialog(app):

@@ -160,26 +160,26 @@ def test_session_save_load_round_trip(app, tmp_path, stub_dialogs):
     app.prompts = [A.PromptRow("castle", 1.3, False), A.PromptRow("bg", 0.4, True)]
     app.steps = 137
     app.seed_entry.set_text("424242")
-    app._init_denoise = 35
+    app._init.denoise = 35
     app.session.config.clip_guidance_scale = 9999
     app._save_session()
     assert archive.exists()
     # mutate everything, then load the session back
     app.steps = 50
     app.seed_entry.set_text("1")
-    app._init_denoise = 90
+    app._init.denoise = 90
     app.session.config.clip_guidance_scale = 100
     app.prompts = [A.PromptRow("x", 1.0)]
-    app._init_image = None
+    app._init.image = None
     app._load_session()
     assert app.steps == 137
     assert app.seed_entry.get_text() == "424242"
-    assert app._init_denoise == 35
+    assert app._init.denoise == 35
     assert app.session.config.clip_guidance_scale == 9999
     restored = [(r.text, r.weight, r.muted) for r in app.prompts]
     assert restored == [("castle", 1.3, False), ("bg", 0.4, True)]
-    assert app._init_image is not None  # the bundled result became the init image
-    assert app._init_label == "session result"
+    assert app._init.image is not None  # the bundled result became the init image
+    assert app._init.label == "session result"
 
 
 def test_session_restores_scrubbable_history(app, tmp_path, stub_dialogs):
@@ -229,7 +229,7 @@ def test_session_loaded_via_init_button_shows_error(app, tmp_path):
         zf.writestr("session.toml", "x = 1")
     app._load_init_file(str(bundle))
     assert app._message_window is not None and app._message_window.alive()
-    assert app._init_image is None  # not mistaken for an image
+    assert app._init.image is None  # not mistaken for an image
 
 
 def test_image_loaded_via_session_button_shows_error(app, tmp_path, stub_dialogs):
@@ -269,8 +269,8 @@ def test_loaded_revert_continues_via_img2img(app, monkeypatch):
     app._preview_index = 0
     app._do_revert()  # worker is None -> img2img from the checkpoint preview
     assert started == [True]
-    assert app._init_image is not None
-    assert app._init_label == "history: prompt"
+    assert app._init.image is not None
+    assert app._init.label == "history: prompt"
     assert app.session.config.clip_guidance_scale == 3333
     assert [(r.text, r.weight, r.muted) for r in app.prompts] == [("castle", 1.0, False)]
 

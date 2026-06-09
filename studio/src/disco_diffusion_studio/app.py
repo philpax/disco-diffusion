@@ -41,6 +41,7 @@ from pygame_gui.elements import UIDropDownMenu
 from pygame_gui.windows import UIColourPickerDialog, UIConfirmationDialog, UIMessageWindow
 
 from . import native_dialog
+from .init_image import InitImage
 from .layout import (
     CTRL_H,
     DEFAULT_H,
@@ -363,14 +364,9 @@ class App:
         self._current_labels: dict[str, pygame_gui.elements.UILabel] = {}
 
         # img2img init image (per-run, applies on next Play): seed the run from an image instead
-        # of noise. _init_denoise (0-100%) maps to the skip_steps the run starts at — 100% = full
-        # re-diffusion (ignores the init's structure), 0% = keep the init (one step). Set by
-        # Open…/drag-drop (a file) or "Use current" (the on-screen frame); _init_surface is the
-        # canvas preview shown before Play.
-        self._init_image: Image.Image | None = None
-        self._init_label = "none"
-        self._init_denoise = 60
-        self._init_surface: pygame.Surface | None = None
+        # of noise, set by Open…/drag-drop (a file) or "Use current" (the on-screen frame). The
+        # InitImage owns the source image, denoise %, and the canvas preview shown before Play.
+        self._init = InitImage()
         # "Reset canvas" confirmation (discards the rendered frame so the init preview shows).
         self._confirm_dialog: UIConfirmationDialog | None = None
         # Transient error/notice modal (e.g. loading a session via the init button, or vice versa).
@@ -846,7 +842,7 @@ class App:
         # frame; Denoise sets how much the run re-diffuses it (applies on next Play).
         y = section(y + 6, "Init image — applies on next Play")
         self._init_status_label = ui.UILabel(
-            Row(0, y, inner_w, CTRL_H).fill(), f"Init: {self._init_label}", self.manager,
+            Row(0, y, inner_w, CTRL_H).fill(), f"Init: {self._init.label}", self.manager,
             container=container,
         )
         y += pitch
@@ -865,12 +861,12 @@ class App:
         self._init_denoise_label = ui.UILabel(r.right(48), "", self.manager, container=container)
         self._init_denoise_slider = ui.UIHorizontalSlider(
             r.fill(),
-            start_value=float(self._init_denoise),
+            start_value=float(self._init.denoise),
             value_range=(0.0, 100.0),
             manager=self.manager,
             container=container,
         )
-        self._init_denoise_label.set_text(f"{self._init_denoise}%")
+        self._init_denoise_label.set_text(f"{self._init.denoise}%")
         y += pitch
 
         # Preset (above Guidance): a dropdown of saved recipes + Save. Selecting one applies the
@@ -1227,7 +1223,7 @@ class App:
             height=self.height,
             steps=self.steps,
             seed=self._seed_for_run(),  # also fills the field with the seed in use
-            denoise=self._init_denoise,
+            denoise=self._init.denoise,
             prompts=[PromptSpec(r.text, r.weight, r.muted) for r in self.prompts],
             config=recipe.config,
             clip_models=recipe.clip_models,
@@ -1342,9 +1338,9 @@ class App:
         self.steps_entry.set_text(str(self.steps))
         self._seed_text = str(session.seed)
         self.seed_entry.set_text(self._seed_text)
-        self._init_denoise = session.denoise
-        self._init_denoise_slider.set_current_value(float(self._init_denoise))
-        self._init_denoise_label.set_text(f"{self._init_denoise}%")
+        self._init.denoise = session.denoise
+        self._init_denoise_slider.set_current_value(float(self._init.denoise))
+        self._init_denoise_label.set_text(f"{self._init.denoise}%")
         self.prompts = [PromptRow(t, w, m) for t, w, m in session.prompts] or [PromptRow("", 1.0)]
         self._rebuild_prompt_rows()
         self._apply_recipe(session.config, session.clip_models, session.use_secondary_model)
@@ -1562,8 +1558,8 @@ class App:
             encode_cache=self._encode_cache,
             cache_lock=self._cache_lock,
             perlin=self.session.config.perlin_init,
-            init_image=self._init_image,
-            skip_steps=self._init_skip_steps(),
+            init_image=self._init.image,
+            skip_steps=self._init.skip_steps(self.steps),
             seed=self._seed_for_run(),
         )
         self.worker.set_prompts(self._prompt_snapshot())
@@ -1628,7 +1624,7 @@ class App:
         self._paint_layer = PaintLayer(self.width, self.height)
         self._pending_overlays = []
         self._paint_submitted = 0
-        self._rebuild_init_surface()  # the init preview is generation-resolution too
+        self._init.rebuild_surface(self.width, self.height)  # the preview is generation-res too
         # The canvas changed shape: drop the stale frame and refit the view.
         self._frame_surface = None
         self._frame_key = None
@@ -1701,30 +1697,8 @@ class App:
         log.info("saved %s", path)
 
     # -- init image (img2img) --
-    def _init_skip_steps(self) -> int:
-        """skip_steps the next run starts at for the current init + denoise (0 when no init).
-
-        Denoise 100% -> skip 0 (full re-diffusion); 0% -> skip steps-1 (keep the init, one step).
-        """
-        if self._init_image is None:
-            return 0
-        skip = round((1 - self._init_denoise / 100) * self.steps)
-        return max(0, min(self.steps - 1, skip))
-
-    def _rebuild_init_surface(self) -> None:
-        """Build the canvas-resolution preview of the init image (shown before Play)."""
-        if self._init_image is None:
-            self._init_surface = None
-            return
-        pil = self._init_image.convert("RGB").resize(
-            (self.width, self.height), Image.Resampling.LANCZOS
-        )
-        self._init_surface = pygame.surfarray.make_surface(np.asarray(pil).swapaxes(0, 1))
-
     def _set_init_image(self, image: Image.Image, label: str) -> None:
-        self._init_image = image
-        self._init_label = label
-        self._rebuild_init_surface()
+        self._init.set(image, label, self.width, self.height)
         status = getattr(self, "_init_status_label", None)
         if status is not None:
             status.set_text(f"Init: {label}")
@@ -1755,9 +1729,7 @@ class App:
         self._set_init_image(surface_to_pil(surface), "current result")
 
     def _clear_init(self) -> None:
-        self._init_image = None
-        self._init_label = "none"
-        self._init_surface = None
+        self._init.clear()
         status = getattr(self, "_init_status_label", None)
         if status is not None:
             status.set_text("Init: none")
@@ -2212,8 +2184,8 @@ class App:
                 self._mark_custom()
             elif event.ui_element == self._init_denoise_slider:
                 # img2img strength — converted to skip_steps at the next Play.
-                self._init_denoise = int(round(event.value))
-                self._init_denoise_label.set_text(f"{self._init_denoise}%")
+                self._init.denoise = int(round(event.value))
+                self._init_denoise_label.set_text(f"{self._init.denoise}%")
             elif event.ui_element in self._scale_sliders:
                 attr, is_int, vlabel, fmt = self._scale_sliders[event.ui_element]
                 value: float | int = int(round(event.value)) if is_int else float(event.value)
@@ -2341,15 +2313,15 @@ class App:
         surface = self._displayed_surface()
         if surface is not None:
             self._blit_canvas(surface)
-        elif self._init_surface is not None:
+        elif self._init.surface is not None:
             # No frame yet but an init image is set: preview it (dimmed) so it's clear the run
             # will seed from it.
-            self._blit_canvas(self._init_surface)
+            self._blit_canvas(self._init.surface)
             scrim = pygame.Surface(crect.size, pygame.SRCALPHA)
             scrim.fill((10, 12, 16, 120))
             self.screen.blit(scrim, crect.topleft)
             label = self._hud_font.render(
-                f"init: {self._init_label} — press Play to evolve", True, (224, 228, 236)
+                f"init: {self._init.label} — press Play to evolve", True, (224, 228, 236)
             )
             self.screen.blit(label, label.get_rect(center=crect.center))
         else:
