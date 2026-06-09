@@ -198,8 +198,10 @@ class App:
         self.manager = pygame_gui.UIManager((win_w, win_h))
         self.manager.get_theme().load_theme(io.StringIO(json.dumps(THEME)))
         # The bottom panel (transport / history / paint tools / prompts) owns its widgets, built
-        # in _build_ui. The Sidebar (right column) does likewise; the App coordinates the two.
-        self.bottom_bar = BottomBar()
+        # in _build_ui. The Sidebar (right column) does likewise; the App coordinates the two. Both
+        # take their stable infra + shared state up front; siblings/glue come via app per-method.
+        infra = (self.manager, self.layout, self.signals, self.state, self.paint)
+        self.bottom_bar = BottomBar(*infra)
         # The prompt entry that last held keyboard focus, so we can auto-apply its text
         # when focus moves away (no need to press Enter).
         self._focused_entry: pygame_gui.elements.UITextEntryLine | None = None
@@ -210,7 +212,7 @@ class App:
         # Right-hand sidebar: owns its widgets (Settings/Current tabs + controls), built in
         # _build_ui. The coalesced "rebuild after a resize" flag is applied once per frame in
         # run(); its width is on self.layout.
-        self.sidebar = Sidebar()
+        self.sidebar = Sidebar(*infra)
         self._dragging_divider = False
         self._sidebar_dirty = False
         # Horizontal divider between the image area and the bottom panel (drag to resize the
@@ -243,7 +245,7 @@ class App:
 
         # The Canvas owns the image area: the view transform (zoom/pan), the paint controller
         # (active stroke + overlays), and the latest rendered frame surface.
-        self.canvas = Canvas(self)
+        self.canvas = Canvas(self.screen, self.layout, self.state, self.paint, self.bottom_bar)
         self._mouse_pos: tuple[int, int] = (0, 0)
         self._panning = False
         self._navigating = False  # right mouse held: canvas-navigation mode (pan + scroll-zoom)
@@ -378,6 +380,7 @@ class App:
         surface = pygame.display.get_surface()
         if surface is not None:
             self.screen = surface
+            self.canvas.screen = surface  # the canvas holds the window surface; keep it current
         self.manager.set_window_resolution((w, h))
         self._build_ui()
         self.canvas.clamp_pan()  # keep the canvas in view after the viewport changed

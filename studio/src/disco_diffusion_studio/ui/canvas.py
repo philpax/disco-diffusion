@@ -16,24 +16,37 @@ from ..paint import PaintController
 from ..view import ViewTransform
 
 if TYPE_CHECKING:
-    from ..app import App
+    from ..layout import Layout
+    from ..state import PaintState, SharedState
+    from .bottom_bar import BottomBar
 
 
 class Canvas:
     """View transform + paint controller + rendered frame for the image area."""
 
-    def __init__(self, app: App) -> None:
-        self.app = app
+    def __init__(
+        self,
+        screen: pygame.Surface,
+        layout: Layout,
+        state: SharedState,
+        paint: PaintState,
+        bottom_bar: BottomBar,
+    ) -> None:
+        self.screen = screen  # the window surface (App re-points this on resize)
+        self.layout = layout
+        self.state = state
+        self.paint_state = paint  # brush settings (self.paint below is the stroke controller)
+        self.bottom_bar = bottom_bar
         self.view = ViewTransform()
-        self.paint = PaintController.for_canvas(app.state.width, app.state.height)
+        self.paint = PaintController.for_canvas(state.width, state.height)
         self.frame_surface: pygame.Surface | None = None
         self.frame_key: tuple[int, int] | None = None  # (id(array), index) to detect new frames
 
     def _size(self) -> tuple[int, int]:
-        return (self.app.state.width, self.app.state.height)
+        return (self.state.width, self.state.height)
 
     def _region(self) -> pygame.Rect:
-        return self.app.layout.image_region()
+        return self.layout.image_region()
 
     # -- view transform (supplies the ViewTransform with the live region + canvas size) --
     def fit(self) -> None:
@@ -53,7 +66,7 @@ class Canvas:
 
     def blit(self, surf: pygame.Surface) -> None:
         """Blit a canvas-resolution surface onto the screen under the current view transform."""
-        self.view.blit(self.app.screen, surf, self._region())
+        self.view.blit(self.screen, surf, self._region())
 
     # -- frame + paint --
     def resize(self, width: int, height: int) -> None:
@@ -78,16 +91,15 @@ class Canvas:
 
     def update_frame_surface(self) -> None:
         """Pull the worker's latest frame into ``frame_surface`` (+ refresh the step label)."""
-        app = self.app
-        if app.state.worker is None:
+        if self.state.worker is None:
             return
-        frame = app.state.worker.latest_frame()
+        frame = self.state.worker.latest_frame()
         if frame is None:
             return
         # Refresh the step label every frame (cheap — pygame_gui no-ops if unchanged). A UI
         # rebuild (resize / divider drag) recreates the label as "step 0 / 0", so updating it
         # only when the *surface* changes would leave it stale at "0 / 0" once generation stops.
-        app.bottom_bar.set_step_label(f"step {frame.index} / {frame.total}")
+        self.bottom_bar.set_step_label(f"step {frame.index} / {frame.total}")
         key = (id(frame.image), frame.index)
         if key == self.frame_key:
             return
@@ -99,4 +111,4 @@ class Canvas:
         """Paint into the layer at screen ``pos`` (no-op if outside the canvas)."""
         gen = self.screen_to_canvas(pos)
         if gen is not None:
-            self.paint.paint_to(gen, self.app.paint.brush)
+            self.paint.paint_to(gen, self.paint_state.brush)

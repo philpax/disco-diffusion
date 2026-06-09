@@ -30,11 +30,22 @@ from ..util import int_or
 
 if TYPE_CHECKING:
     from ..app import App
+    from ..layout import Layout
+    from ..signals import Signals
+    from ..state import PaintState, SharedState
 
 
 @dataclass
 class Sidebar:
     """Owns the sidebar widgets (tabs, panels, and the Settings/Current controls)."""
+
+    # Injected dependencies: the stable UI infra + shared state this area reads/writes. Siblings
+    # (recipe / models / generation / …) and App glue are still reached via the `app` per-method.
+    manager: pygame_gui.UIManager
+    layout: Layout
+    signals: Signals
+    state: SharedState
+    paint: PaintState
 
     # Tabs + the two scrolling panels they switch between.
     tab_settings: UIButton = field(init=False)
@@ -83,7 +94,7 @@ class Sidebar:
     def build(self, app: App) -> None:
         """The full-height right sidebar: a Settings / Current tab pair over a scroll area."""
         ui = pygame_gui.elements
-        sb = app.layout.sidebar_rect()
+        sb = self.layout.sidebar_rect()
         x = sb.x + PAD
         inner = max(40, sb.width - 2 * PAD)
         half = (inner - PAD) // 2
@@ -92,23 +103,23 @@ class Sidebar:
         # not buried in Settings; what it saves/loads is clear from context (the whole session).
         r = Row(x, MARGIN, inner, CTRL_H)
         self.save_session_button = ui.UIButton(
-            r.left(half), "Save…", app.manager, object_id="#add_button"
+            r.left(half), "Save…", self.manager, object_id="#add_button"
         )
         self.load_session_button = ui.UIButton(
-            r.fill(), "Load…", app.manager, object_id="#add_button"
+            r.fill(), "Load…", self.manager, object_id="#add_button"
         )
 
         tabs_y = MARGIN + CTRL_H + PAD
         r = Row(x, tabs_y, inner, CTRL_H)
         self.tab_settings = ui.UIButton(
-            r.left(half), "Settings", app.manager, object_id="#tab_button"
+            r.left(half), "Settings", self.manager, object_id="#tab_button"
         )
-        self.tab_current = ui.UIButton(r.fill(), "Current", app.manager, object_id="#tab_button")
+        self.tab_current = ui.UIButton(r.fill(), "Current", self.manager, object_id="#tab_button")
 
         cont_y = tabs_y + CTRL_H + PAD
-        cont_rect = pygame.Rect(x, cont_y, inner, max(60, app.layout.win_h - cont_y - MARGIN))
-        self.settings_panel = ui.UIScrollingContainer(cont_rect, app.manager)
-        self.current_panel = ui.UIScrollingContainer(cont_rect, app.manager)
+        cont_rect = pygame.Rect(x, cont_y, inner, max(60, self.layout.win_h - cont_y - MARGIN))
+        self.settings_panel = ui.UIScrollingContainer(cont_rect, self.manager)
+        self.current_panel = ui.UIScrollingContainer(cont_rect, self.manager)
         self._sb_inner_w = inner - 24  # leave room for the vertical scrollbar
         self._build_settings_rows(app)
         self._build_current_rows(app)
@@ -121,7 +132,7 @@ class Sidebar:
         pygame_gui.elements.UILabel(
             Row(0, y, inner_w, LABEL_H).fill(),
             text,
-            app.manager,
+            self.manager,
             container=container,
             object_id="#section_label",
         )
@@ -158,33 +169,33 @@ class Sidebar:
         ui = pygame_gui.elements
         y = self._section_label(app, container, inner_w, y, "Output — apply on next Play")
         r = Row(0, y, inner_w, CTRL_H)
-        ui.UILabel(r.left(54), "Steps", app.manager, container=container)
-        self.steps_entry = ui.UITextEntryLine(r.fill(), app.manager, container=container)
-        self.steps_entry.set_text(str(app.state.steps))
+        ui.UILabel(r.left(54), "Steps", self.manager, container=container)
+        self.steps_entry = ui.UITextEntryLine(r.fill(), self.manager, container=container)
+        self.steps_entry.set_text(str(self.state.steps))
         y += pitch
         # Seed: always shows the concrete seed in use (so it's reproducible and visible); Play
         # uses whatever's here, and "Rnd" rolls a fresh one.
         r = Row(0, y, inner_w, CTRL_H)
-        ui.UILabel(r.left(54), "Seed", app.manager, container=container)
-        self.random_seed_button = ui.UIButton(r.right(46), "Rnd", app.manager, container=container)
-        self.seed_entry = ui.UITextEntryLine(r.fill(), app.manager, container=container)
-        self.seed_entry.set_text(app.state.seed_text)
+        ui.UILabel(r.left(54), "Seed", self.manager, container=container)
+        self.random_seed_button = ui.UIButton(r.right(46), "Rnd", self.manager, container=container)
+        self.seed_entry = ui.UITextEntryLine(r.fill(), self.manager, container=container)
+        self.seed_entry.set_text(self.state.seed_text)
         y += pitch
         r = Row(0, y, inner_w, CTRL_H)
-        ui.UILabel(r.left(20), "W", app.manager, container=container)
+        ui.UILabel(r.left(20), "W", self.manager, container=container)
         self.width_entry = ui.UITextEntryLine(
-            r.left((inner_w - 56) // 2), app.manager, container=container
+            r.left((inner_w - 56) // 2), self.manager, container=container
         )
-        self.width_entry.set_text(str(app.state.width))
-        ui.UILabel(r.left(20), "H", app.manager, container=container)
-        self.height_entry = ui.UITextEntryLine(r.fill(), app.manager, container=container)
-        self.height_entry.set_text(str(app.state.height))
+        self.width_entry.set_text(str(self.state.width))
+        ui.UILabel(r.left(20), "H", self.manager, container=container)
+        self.height_entry = ui.UITextEntryLine(r.fill(), self.manager, container=container)
+        self.height_entry.set_text(str(self.state.height))
         y += pitch
         r = Row(0, y, inner_w, CTRL_H)
         self.apply_button = ui.UIButton(
-            r.left((inner_w - PAD) // 2), "Apply size", app.manager, container=container
+            r.left((inner_w - PAD) // 2), "Apply size", self.manager, container=container
         )
-        self.swap_button = ui.UIButton(r.fill(), "Flip W/H", app.manager, container=container)
+        self.swap_button = ui.UIButton(r.fill(), "Flip W/H", self.manager, container=container)
         return y + pitch
 
     def _build_init_section(
@@ -195,32 +206,32 @@ class Sidebar:
         y = self._section_label(app, container, inner_w, y + 6, "Init image — applies on next Play")
         self._init_status_label = ui.UILabel(
             Row(0, y, inner_w, CTRL_H).fill(),
-            f"Init: {app.state.init.label}",
-            app.manager,
+            f"Init: {self.state.init.label}",
+            self.manager,
             container=container,
         )
         y += pitch
         r = Row(0, y, inner_w, CTRL_H)
         third = (inner_w - 2 * PAD) // 3
         self.open_init_button = ui.UIButton(
-            r.left(third), "Open…", app.manager, container=container
+            r.left(third), "Open…", self.manager, container=container
         )
         self.use_current_init_button = ui.UIButton(
-            r.left(third), "Use current", app.manager, container=container
+            r.left(third), "Use current", self.manager, container=container
         )
-        self.clear_init_button = ui.UIButton(r.fill(), "Clear", app.manager, container=container)
+        self.clear_init_button = ui.UIButton(r.fill(), "Clear", self.manager, container=container)
         y += pitch
         r = Row(0, y, inner_w, CTRL_H)
-        ui.UILabel(r.left(80), "Denoise", app.manager, container=container)
-        self._init_denoise_label = ui.UILabel(r.right(48), "", app.manager, container=container)
+        ui.UILabel(r.left(80), "Denoise", self.manager, container=container)
+        self._init_denoise_label = ui.UILabel(r.right(48), "", self.manager, container=container)
         self._init_denoise_slider = ui.UIHorizontalSlider(
             r.fill(),
-            start_value=float(app.state.init.denoise),
+            start_value=float(self.state.init.denoise),
             value_range=(0.0, 100.0),
-            manager=app.manager,
+            manager=self.manager,
             container=container,
         )
-        self._init_denoise_label.set_text(f"{app.state.init.denoise}%")
+        self._init_denoise_label.set_text(f"{self.state.init.denoise}%")
         return y + pitch
 
     def _build_preset_section(
@@ -231,7 +242,7 @@ class Sidebar:
         y = self._section_label(app, container, inner_w, y + 6, "Preset")
         r = Row(0, y, inner_w, CTRL_H)
         self.save_preset_button = ui.UIButton(
-            r.right(72), "Save…", app.manager, container=container, object_id="#add_button"
+            r.right(72), "Save…", self.manager, container=container, object_id="#add_button"
         )
         self._preset_dd_rect = r.fill()
         self.spawn_preset_dropdown(app)
@@ -242,18 +253,18 @@ class Sidebar:
     ) -> int:
         """The live-guidance sliders — each retunes the running step immediately."""
         ui = pygame_gui.elements
-        cfg = app.state.session.config
+        cfg = self.state.session.config
         y = self._section_label(app, container, inner_w, y + 6, "Guidance — retunes live")
         for sc in LIVE_SCALES:
             r = Row(0, y, inner_w, CTRL_H)
-            ui.UILabel(r.left(108), sc.label, app.manager, container=container)
-            vlabel = ui.UILabel(r.right(66), "", app.manager, container=container)
+            ui.UILabel(r.left(108), sc.label, self.manager, container=container)
+            vlabel = ui.UILabel(r.right(66), "", self.manager, container=container)
             cur = float(getattr(cfg, sc.attr))
             slider = ui.UIHorizontalSlider(
                 r.fill(),
                 start_value=min(max(cur, sc.lo), sc.hi),
                 value_range=(sc.lo, sc.hi),
-                manager=app.manager,
+                manager=self.manager,
                 container=container,
             )
             vlabel.set_text(sc.fmt.format(cur))
@@ -266,19 +277,19 @@ class Sidebar:
     ) -> int:
         """eta + Perlin init, then the raw cut-schedule text boxes (applied on next Play)."""
         ui = pygame_gui.elements
-        cfg = app.state.session.config
+        cfg = self.state.session.config
         y = self._section_label(app, container, inner_w, y + 6, "Per-run — apply on next Play")
         r = Row(0, y, inner_w, CTRL_H)
-        ui.UILabel(r.left(40), "eta", app.manager, container=container)
+        ui.UILabel(r.left(40), "eta", self.manager, container=container)
         self.perlin_button = ui.UIButton(
-            r.right(96), "Perlin init", app.manager, container=container
+            r.right(96), "Perlin init", self.manager, container=container
         )
-        self._eta_label = ui.UILabel(r.right(48), "", app.manager, container=container)
+        self._eta_label = ui.UILabel(r.right(48), "", self.manager, container=container)
         self._eta_slider = ui.UIHorizontalSlider(
             r.fill(),
             start_value=min(max(float(cfg.eta), 0.0), 1.0),
             value_range=(0.0, 1.0),
-            manager=app.manager,
+            manager=self.manager,
             container=container,
         )
         self._eta_label.set_text(f"{cfg.eta:.2f}")
@@ -289,12 +300,12 @@ class Sidebar:
             ui.UILabel(
                 Row(0, y, inner_w, LABEL_H).left(inner_w),
                 sch.label,
-                app.manager,
+                self.manager,
                 container=container,
             )
             y += LABEL_H + 2
             entry = ui.UITextEntryLine(
-                Row(0, y, inner_w, CTRL_H).fill(), app.manager, container=container
+                Row(0, y, inner_w, CTRL_H).fill(), self.manager, container=container
             )
             entry.set_text(str(getattr(cfg, sch.attr)))
             self._schedule_entries[entry] = sch.attr
@@ -314,7 +325,7 @@ class Sidebar:
             if i % per_row == 0:
                 r = Row(0, y, inner_w, CTRL_H)
             button = ui.UIButton(
-                r.left(bw), name, app.manager, container=container, object_id="#brush_button"
+                r.left(bw), name, self.manager, container=container, object_id="#brush_button"
             )
             self._clip_buttons[button] = name
             if name in app.models.clip_selected:
@@ -327,7 +338,7 @@ class Sidebar:
         self.secondary_button = ui.UIButton(
             r.fill(),
             "Secondary model",
-            app.manager,
+            self.manager,
             container=container,
             object_id="#brush_button",
         )
@@ -346,12 +357,12 @@ class Sidebar:
 
         def row(y: int, key: str, name: str) -> int:
             ui.UILabel(
-                Row(0, y, inner_w, CTRL_H).left(name_w), name, app.manager, container=container
+                Row(0, y, inner_w, CTRL_H).left(name_w), name, self.manager, container=container
             )
             value = ui.UILabel(
                 Row(name_w + PAD, y, inner_w - name_w - PAD, CTRL_H).fill(),
                 "",
-                app.manager,
+                self.manager,
                 container=container,
             )
             self._current_labels[key] = value
@@ -363,7 +374,7 @@ class Sidebar:
         ui.UILabel(
             Row(0, y, inner_w, LABEL_H).fill(),
             "Guidance",
-            app.manager,
+            self.manager,
             container=container,
             object_id="#section_label",
         )
@@ -374,7 +385,7 @@ class Sidebar:
         ui.UILabel(
             Row(0, y, inner_w, LABEL_H).fill(),
             "Per-run",
-            app.manager,
+            self.manager,
             container=container,
             object_id="#section_label",
         )
@@ -434,7 +445,7 @@ class Sidebar:
 
     def refresh_advanced_widgets(self, app: App) -> None:
         """Re-sync every Advanced widget from the current config (after a preset load)."""
-        cfg = app.state.session.config
+        cfg = self.state.session.config
         for slider, (attr, _is_int, vlabel, fmt) in self._scale_sliders.items():
             value = float(getattr(cfg, attr))
             slider.set_current_value(value)
@@ -456,7 +467,7 @@ class Sidebar:
             options,
             selected,
             self._preset_dd_rect,
-            app.manager,
+            self.manager,
             container=self.settings_panel,
         )
 
@@ -480,10 +491,10 @@ class Sidebar:
             elif e == self.clear_init_button:
                 app._clear_init()
             elif e == self.perlin_button:
-                app.state.session.config.perlin_init = not app.state.session.config.perlin_init
-                on = app.state.session.config.perlin_init
+                self.state.session.config.perlin_init = not self.state.session.config.perlin_init
+                on = self.state.session.config.perlin_init
                 (self.perlin_button.select if on else self.perlin_button.unselect)()
-                app.signals.status(f"Perlin {'on' if on else 'off'}")
+                self.signals.status(f"Perlin {'on' if on else 'off'}")
                 app.recipe.mark_custom()
             elif e in self._clip_buttons:
                 app.models.toggle_clip(e)
@@ -491,15 +502,15 @@ class Sidebar:
                 app.models.toggle_secondary()
             elif e == self.apply_button:
                 app.generation.apply_size(
-                    int_or(self.width_entry.get_text(), app.state.width),
-                    int_or(self.height_entry.get_text(), app.state.height),
+                    int_or(self.width_entry.get_text(), self.state.width),
+                    int_or(self.height_entry.get_text(), self.state.height),
                 )
             elif e == self.swap_button:
-                app.generation.apply_size(app.state.height, app.state.width)
+                app.generation.apply_size(self.state.height, self.state.width)
             elif e == self.random_seed_button:
-                app.state.seed_text = str(random.randrange(2**31))  # roll a fresh, visible seed
-                self.seed_entry.set_text(app.state.seed_text)
-                app.signals.status(f"Seed {app.state.seed_text}")
+                self.state.seed_text = str(random.randrange(2**31))  # roll a fresh, visible seed
+                self.seed_entry.set_text(self.state.seed_text)
+                self.signals.status(f"Seed {self.state.seed_text}")
             else:
                 return False
             return True
@@ -507,19 +518,19 @@ class Sidebar:
             e = event.ui_element
             if e == self._eta_slider:
                 # eta is read when the loop's generator is built, so this lands on the next run.
-                app.state.session.config.eta = float(event.value)
+                self.state.session.config.eta = float(event.value)
                 self._eta_label.set_text(f"{event.value:.2f}")
                 app.recipe.mark_custom()
             elif e == self._init_denoise_slider:
                 # img2img strength — converted to skip_steps at the next Play.
-                app.state.init.denoise = int(round(event.value))
-                self._init_denoise_label.set_text(f"{app.state.init.denoise}%")
+                self.state.init.denoise = int(round(event.value))
+                self._init_denoise_label.set_text(f"{self.state.init.denoise}%")
             elif e in self._scale_sliders:
                 attr, is_int, vlabel, fmt = self._scale_sliders[e]
                 value: float | int = int(round(event.value)) if is_int else float(event.value)
                 # session.config is the live config the running Sampler reads each step, so this
                 # retunes guidance on the next step (and seeds the next run when stopped).
-                setattr(app.state.session.config, attr, value)
+                setattr(self.state.session.config, attr, value)
                 vlabel.set_text(fmt.format(value))
                 app.recipe.mark_custom()
                 # Drop a revert point once the drag settles (debounced in run()).
@@ -554,13 +565,13 @@ class Sidebar:
         Driven by the key list itself: the two synthesised keys are special-cased, the rest are
         read off ``session.config`` by name (so they can't drift from the listed keys).
         """
-        cfg = app.state.session.config
+        cfg = self.state.session.config
         out: dict[str, str] = {}
         for key, _label in CURRENT_PERRUN:
             if key == "steps":
-                out[key] = str(app.state.steps)
+                out[key] = str(self.state.steps)
             elif key == "size":
-                out[key] = f"{app.state.width} × {app.state.height}"
+                out[key] = f"{self.state.width} × {self.state.height}"
             elif key == "clip_models":
                 out[key] = ", ".join(cfg.clip_models)
             else:
@@ -577,7 +588,7 @@ class Sidebar:
         """Update the Current tab: live knobs from session.config, per-run from the snapshot."""
         if not self._current_labels:
             return
-        cfg = app.state.session.config
+        cfg = self.state.session.config
         for sc in LIVE_SCALES:  # live: reflect session.config as sliders move
             label = self._current_labels.get(sc.attr)
             if label is not None:
@@ -588,7 +599,9 @@ class Sidebar:
         # what the image on screen was generated with; only once fully stopped do they show the
         # pending values the next run would use.
         perrun = (
-            app.generation.run_snapshot if app.state.worker is not None else self.perrun_values(app)
+            app.generation.run_snapshot
+            if self.state.worker is not None
+            else self.perrun_values(app)
         )
         for key, _name in CURRENT_PERRUN:
             label = self._current_labels.get(key)
@@ -606,22 +619,22 @@ class Sidebar:
         if attr is None:
             return
         text = entry.get_text().strip()
-        if text == str(getattr(app.state.session.config, attr)):
+        if text == str(getattr(self.state.session.config, attr)):
             return
         try:
             parsed = parse_schedule(text)
         except ValueError:
-            app.signals.status("Bad schedule")
-            entry.set_text(str(getattr(app.state.session.config, attr)))
+            self.signals.status("Bad schedule")
+            entry.set_text(str(getattr(self.state.session.config, attr)))
             return
         # cond_fn indexes these over the full 1000-step internal timeline, so a short schedule
         # would IndexError mid-run. Require it to cover 1000 (extra entries are harmless).
         if len(parsed) < 1000:
-            app.signals.status("Schedule short")
-            entry.set_text(str(getattr(app.state.session.config, attr)))
+            self.signals.status("Schedule short")
+            entry.set_text(str(getattr(self.state.session.config, attr)))
             return
-        setattr(app.state.session.config, attr, text)
-        app.signals.status("Schedule set")
+        setattr(self.state.session.config, attr, text)
+        self.signals.status("Schedule set")
         app.recipe.mark_custom()
 
     def sync_enabled(self, app: App) -> None:

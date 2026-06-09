@@ -29,6 +29,9 @@ from ..theme import MUTED_COLOR, PENDING_COLOR, READOUT_COLOR
 
 if TYPE_CHECKING:
     from ..app import App
+    from ..layout import Layout
+    from ..signals import Signals
+    from ..state import PaintState, SharedState
 
 RGB = tuple[int, int, int]
 
@@ -40,6 +43,14 @@ def _empty_rect() -> pygame.Rect:
 @dataclass
 class BottomBar:
     """Owns the bottom panel's widgets (transport, history, paint tools, prompts)."""
+
+    # Injected dependencies: the stable UI infra + shared state this area reads/writes. Siblings
+    # (history / generation / …) and App glue are still reached via the `app` passed to each method.
+    manager: pygame_gui.UIManager
+    layout: Layout
+    signals: Signals
+    state: SharedState
+    paint: PaintState
 
     # Transport row.
     play_button: UIButton = field(init=False)
@@ -79,60 +90,62 @@ class BottomBar:
     def build(self, app: App) -> None:
         """The left column's control panel: transport, history, tools, colours, prompts."""
         ui = pygame_gui.elements
-        panel_w = app.layout.panel_w()
-        stack = Stack(MARGIN, app.layout.image_area_h() + PAD, panel_w - 2 * MARGIN)
+        panel_w = self.layout.panel_w()
+        stack = Stack(MARGIN, self.layout.image_area_h() + PAD, panel_w - 2 * MARGIN)
 
         # Row 1: transport — Play / Stop / Reset | step (left) … status (right) | Save.
         r = stack.row(CTRL_H)
-        self.play_button = ui.UIButton(r.left(100), "Play", app.manager, object_id="#play_button")
-        self.stop_button = ui.UIButton(r.left(80), "Stop", app.manager, object_id="#stop_button")
+        self.play_button = ui.UIButton(r.left(100), "Play", self.manager, object_id="#play_button")
+        self.stop_button = ui.UIButton(r.left(80), "Stop", self.manager, object_id="#stop_button")
         # Reset discards the rendered frame (after a confirm) so the init / empty canvas shows.
-        self.reset_button = ui.UIButton(r.left(70), "Reset", app.manager)
-        self.save_button = ui.UIButton(r.right(80), "Save", app.manager, object_id="#save_button")
-        self.status_label = ui.UILabel(r.right(150), "", app.manager, object_id="#status_label")
-        self.step_label = ui.UILabel(r.fill(), "step 0 / 0", app.manager, object_id="#step_label")
+        self.reset_button = ui.UIButton(r.left(70), "Reset", self.manager)
+        self.save_button = ui.UIButton(r.right(80), "Save", self.manager, object_id="#save_button")
+        self.status_label = ui.UILabel(r.right(150), "", self.manager, object_id="#status_label")
+        self.step_label = ui.UILabel(r.fill(), "step 0 / 0", self.manager, object_id="#step_label")
 
         # Row 2: history scrubber — directly under transport. Drag to preview a checkpoint.
         r = stack.row(CTRL_H)
-        ui.UILabel(r.left(54), "History", app.manager)
-        self.cancel_button = ui.UIButton(r.right(70), "Cancel", app.manager)
-        self.revert_button = ui.UIButton(r.right(70), "Revert", app.manager)
-        self.history_label = ui.UILabel(r.right(120), "live", app.manager)
+        ui.UILabel(r.left(54), "History", self.manager)
+        self.cancel_button = ui.UIButton(r.right(70), "Cancel", self.manager)
+        self.revert_button = ui.UIButton(r.right(70), "Revert", self.manager)
+        self.history_label = ui.UILabel(r.right(120), "live", self.manager)
         self._history_slider_rect = r.fill()
         # The slider spans the 0..N step timeline (not the checkpoint count), so a checkpoint's
         # thumb position matches its actual progress; drags snap to the nearest checkpoint.
         self.history_slider = ui.UIHorizontalSlider(
             self._history_slider_rect,
-            start_value=app.state.timeline.slider_start(app.history.live_index()),
+            start_value=self.state.timeline.slider_start(app.history.live_index()),
             value_range=(0.0, float(max(app.history.total(), 1))),
-            manager=app.manager,
+            manager=self.manager,
         )
 
         # Row 3: painting tools — brush kind, noise toggle, size, opacity, clear
         r = stack.row(CTRL_H)
         self._brush_buttons = {}
         for name in BRUSHES:
-            button = ui.UIButton(r.left(64), name, app.manager, object_id="#brush_button")
+            button = ui.UIButton(r.left(64), name, self.manager, object_id="#brush_button")
             self._brush_buttons[button] = name
-            if name == app.paint.brush.type:
+            if name == self.paint.brush.type:
                 button.select()
         # Toggle: deposit fresh tinted noise (new structure) instead of plain colour.
-        self.noise_button = ui.UIButton(r.left(74), "Noise", app.manager, object_id="#brush_button")
-        if app.paint.brush.noise:
+        self.noise_button = ui.UIButton(
+            r.left(74), "Noise", self.manager, object_id="#brush_button"
+        )
+        if self.paint.brush.noise:
             self.noise_button.select()
         # Right group (packed right-to-left, so it reads "Opacity [slider] Clear" left-to-right).
-        self.clear_paint_button = ui.UIButton(r.right(64), "Clear", app.manager)
+        self.clear_paint_button = ui.UIButton(r.right(64), "Clear", self.manager)
         self.strength_slider = ui.UIHorizontalSlider(
             r.right(104),
-            app.paint.brush.strength,
+            self.paint.brush.strength,
             (BRUSH_STRENGTH_MIN, BRUSH_STRENGTH_MAX),
-            app.manager,
+            self.manager,
         )
-        ui.UILabel(r.right(56), "Opacity", app.manager)
+        ui.UILabel(r.right(56), "Opacity", self.manager)
         # Size label + slider, the slider flexing into whatever's left between the two groups.
-        ui.UILabel(r.left(36), "Size", app.manager)
+        ui.UILabel(r.left(36), "Size", self.manager)
         self.size_slider = ui.UIHorizontalSlider(
-            r.fill(), app.paint.brush.size, (BRUSH_SIZE_MIN, BRUSH_SIZE_MAX), app.manager
+            r.fill(), self.paint.brush.size, (BRUSH_SIZE_MIN, BRUSH_SIZE_MAX), self.manager
         )
 
         # Row 4: colour palette — current-colour preview + swatches (custom-drawn), and an
@@ -140,19 +153,19 @@ class BottomBar:
         # space left of the button.
         r = stack.row(CTRL_H)
         self.pick_color_button = ui.UIButton(
-            r.right(70), "RGB…", app.manager, object_id="#add_button"
+            r.right(70), "RGB…", self.manager, object_id="#add_button"
         )
         self.build_palette(app, r.fill())
 
         # Row 5: prompts header — Add + hint (hint fills the remaining width)
         r = stack.row(LABEL_H)
         self.add_button = ui.UIButton(
-            r.left(120), "+ Add prompt", app.manager, object_id="#add_button"
+            r.left(120), "+ Add prompt", self.manager, object_id="#add_button"
         )
         self.hint_label = ui.UILabel(
             r.fill(),
             "weight 0-2 applies instantly · Enter/click-away applies text · M mutes · % = mix",
-            app.manager,
+            self.manager,
             object_id="#hint_label",
         )
 
@@ -160,9 +173,9 @@ class BottomBar:
         # to its bottom edge — so dragging the panel taller shows more rows. Pulled up under the
         # header (less the usual row pad) to tighten the gap to the first row.
         list_top = stack.y - 8
-        list_h = max(ROW_PITCH, app.layout.win_h - MARGIN - list_top)
+        list_h = max(ROW_PITCH, self.layout.win_h - MARGIN - list_top)
         list_rect = pygame.Rect(MARGIN, list_top, panel_w - 2 * MARGIN, list_h)
-        self.prompt_panel = ui.UIScrollingContainer(list_rect, app.manager)
+        self.prompt_panel = ui.UIScrollingContainer(list_rect, self.manager)
         # Lay rows out narrower than the viewport so the vertical scrollbar never forces a
         # horizontal one (a horizontal bar appears only when content is wider than the view).
         self._list_inner_w = list_rect.width - 24
@@ -174,7 +187,7 @@ class BottomBar:
         self._swatch_rects = []
         self._color_preview_rect = pygame.Rect(rect.x, rect.y, CTRL_H, CTRL_H)
         x = rect.x + CTRL_H + 10
-        colours = app.paint.palette.swatches()
+        colours = self.paint.palette.swatches()
         n = max(len(colours), 1)
         gap = 4
         sw = max(8, min(CTRL_H, (rect.right - x - (n - 1) * gap) // n))
@@ -187,7 +200,7 @@ class BottomBar:
         return (
             app.history.preview_prompts
             if app.history.preview_prompts is not None
-            else app.state.prompts
+            else self.state.prompts
         )
 
     def rebuild_prompt_rows(self, app: App) -> None:
@@ -209,26 +222,26 @@ class BottomBar:
             # taken first so the text entry flexes into whatever width is left.
             r = Row(0, i * ROW_PITCH + v_pad, inner_w, CTRL_H)
             mute = ui.UIButton(
-                r.left(30), "M", app.manager, container=container, object_id="#brush_button"
+                r.left(30), "M", self.manager, container=container, object_id="#brush_button"
             )
             if prompt.muted:
                 mute.select()
             remove = ui.UIButton(
                 r.right(30),
                 "×",
-                app.manager,
+                self.manager,
                 container=container,
                 object_id=ObjectID(object_id="#remove_button", class_id="@remove_button"),
             )
-            wlabel = ui.UILabel(r.right(104), "", app.manager, container=container)
+            wlabel = ui.UILabel(r.right(104), "", self.manager, container=container)
             slider = ui.UIHorizontalSlider(
                 r.right(150),
                 start_value=prompt.weight,
                 value_range=(0.0, 2.0),
-                manager=app.manager,
+                manager=self.manager,
                 container=container,
             )
-            entry = ui.UITextEntryLine(r.fill(), app.manager, container=container)
+            entry = ui.UITextEntryLine(r.fill(), self.manager, container=container)
             entry.set_text(prompt.text)
             self._row_elements += [mute, remove, entry, slider, wlabel]
             self._remove_buttons[remove] = i
@@ -284,7 +297,7 @@ class BottomBar:
                 app.generation.toggle_play()
             elif e == self.stop_button:
                 app.generation.stop()
-                app.signals.status("Stopped")
+                self.signals.status("Stopped")
             elif e == self.reset_button:
                 app._open_reset_confirm()
             elif e == self.save_button:
@@ -292,21 +305,21 @@ class BottomBar:
             elif e == self.pick_color_button:
                 app._open_colour_picker()
             elif e == self.add_button:
-                app.state.prompts.append(PromptRow("", 1.0))
+                self.state.prompts.append(PromptRow("", 1.0))
                 self.rebuild_prompt_rows(app)
                 app._push_prompts()
                 app.history.request_checkpoint("add prompt")
             elif e in self._remove_buttons:
                 idx = self._remove_buttons[e]
-                if 0 <= idx < len(app.state.prompts):
-                    app.state.prompts.pop(idx)
+                if 0 <= idx < len(self.state.prompts):
+                    self.state.prompts.pop(idx)
                     self.rebuild_prompt_rows(app)
                     app._push_prompts()
                     app.history.request_checkpoint("remove prompt")
             elif e in self._mute_buttons:
                 idx = self._mute_buttons[e]
-                if 0 <= idx < len(app.state.prompts):
-                    prompt = app.state.prompts[idx]
+                if 0 <= idx < len(self.state.prompts):
+                    prompt = self.state.prompts[idx]
                     prompt.muted = not prompt.muted
                     (e.select if prompt.muted else e.unselect)()
                     self.refresh_rows(app)
@@ -315,14 +328,14 @@ class BottomBar:
                         "mute prompt" if prompt.muted else "unmute prompt"
                     )
             elif e in self._brush_buttons:
-                app.paint.brush.type = self._brush_buttons[e]
+                self.paint.brush.type = self._brush_buttons[e]
                 for button, name in self._brush_buttons.items():
-                    (button.select if name == app.paint.brush.type else button.unselect)()
+                    (button.select if name == self.paint.brush.type else button.unselect)()
             elif e == self.noise_button:
-                app.paint.brush.noise = not app.paint.brush.noise
+                self.paint.brush.noise = not self.paint.brush.noise
                 (
                     self.noise_button.select
-                    if app.paint.brush.noise
+                    if self.paint.brush.noise
                     else self.noise_button.unselect
                 )()
             elif e == self.clear_paint_button:
@@ -330,7 +343,7 @@ class BottomBar:
             elif e == self.revert_button:
                 app.history.revert()
             elif e == self.cancel_button:
-                app.state.timeline.clear_preview()
+                self.state.timeline.clear_preview()
                 self.park_history_thumb(float(app.history.live_index()))
                 app.history.refresh_preview_state()
             else:
@@ -339,19 +352,19 @@ class BottomBar:
         if event.type == pygame_gui.UI_HORIZONTAL_SLIDER_MOVED:
             e = event.ui_element
             if e == self.size_slider:
-                app.paint.brush.size = float(event.value)
+                self.paint.brush.size = float(event.value)
             elif e == self.strength_slider:
-                app.paint.brush.strength = float(event.value)
+                self.paint.brush.strength = float(event.value)
             elif e == self.history_slider:
                 # Step-space slider: snap the dragged value to the nearest checkpoint (or live)
                 # and park the thumb on that checkpoint's actual step position.
-                snapped = app.state.timeline.scrub(float(event.value), app.history.live_index())
+                snapped = self.state.timeline.scrub(float(event.value), app.history.live_index())
                 self.park_history_thumb(snapped)
                 app.history.refresh_preview_state()
             elif e in self._weight_sliders:
                 idx = self._weight_sliders[e]
-                if 0 <= idx < len(app.state.prompts):
-                    app.state.prompts[idx].weight = float(event.value)
+                if 0 <= idx < len(self.state.prompts):
+                    self.state.prompts[idx].weight = float(event.value)
                     self.refresh_rows(app)
                     app._push_prompts()
             else:
@@ -367,20 +380,20 @@ class BottomBar:
         """If ``pos`` hits a palette swatch, adopt it as the brush colour. True if it did."""
         for sr, color in self._swatch_rects:
             if sr.collidepoint(pos):
-                app.paint.brush.color = color
+                self.paint.brush.color = color
                 return True
         return False
 
     def select_palette_index(self, app: App, index: int) -> None:
         """Digit keys: pick the nth swatch (palette + recents) as the brush colour, if it exists."""
-        colours = app.paint.palette.swatches()
+        colours = self.paint.palette.swatches()
         if 0 <= index < len(colours):
-            app.paint.brush.color = colours[index]
+            self.paint.brush.color = colours[index]
 
     def apply_picked_colour(self, app: App, rgb: tuple[int, int, int]) -> None:
         """Adopt a picked colour as the brush colour and remember it (capped, persisted)."""
-        app.paint.brush.color = rgb
-        app.paint.palette.remember(
+        self.paint.brush.color = rgb
+        self.paint.palette.remember(
             rgb
         )  # records off-palette colours as recents (deduped, persisted)
         self.build_palette(app, self._palette_rect)  # relayout to include any new recent
@@ -395,22 +408,22 @@ class BottomBar:
 
     def nudge_brush_size(self, app: App, factor: float) -> None:
         """Scale the brush size (clamped) and sync the slider — shared by [ / ] and the wheel."""
-        app.paint.brush.nudge_size(factor)
-        self.size_slider.set_current_value(app.paint.brush.size)
+        self.paint.brush.nudge_size(factor)
+        self.size_slider.set_current_value(self.paint.brush.size)
 
     def nudge_brush_strength(self, app: App, delta: float) -> None:
         """Shift the brush opacity (clamped) and sync the slider — shared by the wheel."""
-        app.paint.brush.nudge_strength(delta)
-        self.strength_slider.set_current_value(app.paint.brush.strength)
+        self.paint.brush.nudge_strength(delta)
+        self.strength_slider.set_current_value(self.paint.brush.strength)
 
     def commit_prompt_entry(self, app: App, entry: UITextEntryLine) -> None:
         """Apply a prompt text box's contents (on Enter or when focus moves away)."""
         idx = self._prompt_entries.get(entry)
-        if idx is None or not (0 <= idx < len(app.state.prompts)):
+        if idx is None or not (0 <= idx < len(self.state.prompts)):
             return
-        if entry.get_text() == app.state.prompts[idx].text:
+        if entry.get_text() == self.state.prompts[idx].text:
             return
-        app.state.prompts[idx].text = entry.get_text()
+        self.state.prompts[idx].text = entry.get_text()
         self.refresh_rows(app)
         app._push_prompts()
         app.history.request_checkpoint("prompt")
@@ -433,24 +446,24 @@ class BottomBar:
         self.history_slider.kill()
         self.history_slider = pygame_gui.elements.UIHorizontalSlider(
             self._history_slider_rect,
-            start_value=app.state.timeline.slider_start(app.history.live_index()),
+            start_value=self.state.timeline.slider_start(app.history.live_index()),
             value_range=(0.0, float(max(app.history.total(), 1))),
-            manager=app.manager,
+            manager=self.manager,
         )
 
     def sync_enabled(self, app: App) -> None:
         """History scrubbing, prompt editing, and the Play button reflect run / preview state."""
         editable = not app.running
         # History controls are usable only while paused/stopped and there's history to scrub.
-        hist_on = editable and len(app.state.timeline.entries) > 0
+        hist_on = editable and len(self.state.timeline.entries) > 0
         for hist_el in (self.history_slider, self.revert_button, self.cancel_button):
             (hist_el.enable if hist_on else hist_el.disable)()
         # Prompt rows are read-only while previewing a checkpoint (they show its prompts).
-        prompts_on = app.state.timeline.preview_index is None
+        prompts_on = self.state.timeline.preview_index is None
         prompt_widgets = [self.add_button, *self._prompt_entries, *self._weight_sliders]
         for pw in (*prompt_widgets, *self._remove_buttons, *self._mute_buttons):
             (pw.enable if prompts_on else pw.disable)()
         self.play_button.set_text("Pause" if app.running else "Play")
         # Can't resume mid-preview or mid-reload — Revert/Cancel, or wait for the reload.
-        play_off = app.state.timeline.preview_index is not None or app.models.reloader.reloading
+        play_off = self.state.timeline.preview_index is not None or app.models.reloader.reloading
         (self.play_button.disable if play_off else self.play_button.enable)()
