@@ -32,7 +32,6 @@ from pathlib import Path
 import pygame
 import pygame_gui
 from disco_diffusion import DiscoSession, EncodedPrompt, RunConfig
-from disco_diffusion.config import AVAILABLE_CLIP_MODELS
 from PIL import Image
 from pygame_gui.windows import UIColourPickerDialog, UIConfirmationDialog, UIMessageWindow
 
@@ -40,16 +39,14 @@ from . import native_dialog
 from .constants import (
     APP_TITLE,
 )
-from .controls import CUSTOM_PRESET, PromptRow
+from .controls import PromptRow
 from .generation import Generation
 from .history import History
 from .init_image import InitImage
 from .layout import (
-    CTRL_H,
     DEFAULT_H,
     DEFAULT_W,
     DIVIDER_W,
-    LABEL_H,
     MIN_IMAGE_H,
     MIN_LEFT_PANEL_W,
     MIN_WINDOW_W,
@@ -63,13 +60,7 @@ from .loading import LoadingState, loading_screen
 from .models import Models
 from .paint import Brush
 from .palette import Palette
-from .presets import (
-    Preset,
-    PresetConfig,
-    load_presets,
-    match_preset,
-    save_preset,
-)
+from .recipe import Recipe
 from .session_io import SessionIO
 from .theme import (
     THEME,
@@ -146,6 +137,7 @@ class App:
     history: History = field(init=False)  # checkpoints / preview scrubbing / undo / revert
     generation: Generation = field(init=False)  # run lifecycle: start/stop/size/steps/seed/save
     models: Models = field(init=False)  # staged CLIP/secondary set + debounced weight reload
+    recipe: Recipe = field(init=False)  # presets: capture/apply/save + the dropdown selection
 
     def __post_init__(self) -> None:
         self.width = snap_side(self.width)
@@ -211,21 +203,9 @@ class App:
         # panel). Like the sidebar divider, the rebuild is coalesced to one per frame.
         self._dragging_panel = False
         self._panel_dirty = False
-        # Presets are loaded from studio/presets/*.toml and surfaced as a dropdown that flips to
-        # "Custom" once any preset-controlled knob is edited. _applying_preset suppresses that
-        # flip while a preset is being applied (so its own widget updates don't read as edits).
-        self._presets: dict[str, Preset] = load_presets()
-        self._applying_preset = False
-        self._save_preset_window: pygame_gui.elements.UIWindow | None = None
-        self._save_preset_entry: pygame_gui.elements.UITextEntryLine | None = None
-        self._save_preset_ok: pygame_gui.elements.UIButton | None = None
-        self._save_preset_cancel: pygame_gui.elements.UIButton | None = None
         # The schedule box that last held focus, so its text is committed on blur (like steps).
         self._focused_schedule: pygame_gui.elements.UITextEntryLine | None = None
 
-        # Model selection (CLIP set + secondary). Changing these needs a full weight reload,
-        # so the toggles stage a pending selection and *queue* an auto-reload (debounced); it
-        # fires after the user stops changing, and un-queues if they revert to the loaded set.
         # Model selection (staged CLIP set + secondary) and the debounced background weight
         # reload — changing the model set rebuilds the session off-thread (see models.py).
         self.models = Models(self)
@@ -234,8 +214,9 @@ class App:
         # It also holds the "Current" tab's per-run snapshot (read straight from session.config for
         # live knobs).
         self.generation = Generation(self)
-        # The preset matching the loaded session (or "Custom"); the dropdown's selected entry.
-        self._preset_selection = self._detect_preset()
+        # Presets / recipes (TOML on disk): capture/apply the full guidance recipe, the dropdown
+        # selection, the "Custom" flip on edits, and the save-as modal (see recipe.py).
+        self.recipe = Recipe(self)
 
         # img2img init image (per-run, applies on next Play): seed the run from an image instead
         # of noise, set by Open…/drag-drop (a file) or "Use current" (the on-screen frame). The
@@ -303,11 +284,10 @@ class App:
         (The native Save/Open dialogs are separate OS windows that block the loop, so they need
         no tracking here.)
         """
-        return any(
+        return self.recipe.save_modal_alive() or any(
             w is not None and w.alive()
             for w in (
                 self._colour_picker,
-                self._save_preset_window,
                 self._confirm_dialog,
                 self._message_window,
             )
@@ -347,65 +327,6 @@ class App:
         self.sidebar.build(self)
         self._sync_enabled()
 
-    def _current_preset(self) -> Preset:
-        """Capture the live settings (guidance + per-run + schedules + models) as a Preset."""
-        config = PresetConfig.from_run_config(self.session.config)
-        models = [m for m in AVAILABLE_CLIP_MODELS if m in self.models.clip_selected]
-        return Preset(
-            config=config, clip_models=models, use_secondary_model=self.models.secondary_on
-        )
-
-    def _detect_preset(self) -> str:
-        """The saved preset whose recipe matches the live settings, else "Custom"."""
-        return match_preset(self._presets, self._current_preset()) or CUSTOM_PRESET
-
-    def _set_preset_selection(self, name: str) -> None:
-        """Set the dropdown's selected entry (rebuilding it, since it has no set-selected API)."""
-        if self._preset_selection == name and self.sidebar.preset_dropdown is not None:
-            return
-        self._preset_selection = name
-        self.sidebar.spawn_preset_dropdown(self)
-
-    def _mark_custom(self) -> None:
-        """Flip the preset dropdown to "Custom" after the user edits a preset-controlled knob."""
-        if self._applying_preset:
-            return
-        self._set_preset_selection(CUSTOM_PRESET)
-
-    def _apply_recipe(
-        self, config: PresetConfig, clip_models: list[str], use_secondary: bool
-    ) -> None:
-        """Apply a recipe's config knobs (now) + stage its model set (a change auto-reloads).
-
-        Shared by preset and session loads; wrapped in _applying_preset so the widget updates
-        don't read as user edits (which would flip the preset dropdown to "Custom").
-        """
-        self._applying_preset = True
-        try:
-            cfg = self.session.config
-            for attr, value in config.model_dump().items():
-                setattr(cfg, attr, value)
-            self.sidebar.refresh_advanced_widgets(self)
-            self.models.clip_selected = set(clip_models)
-            self.models.secondary_on = use_secondary
-            self.sidebar.sync_model_buttons(self.models.clip_selected, self.models.secondary_on)
-            self.models.update_queue()
-        finally:
-            self._applying_preset = False
-
-    def _apply_preset(self, name: str) -> None:
-        """Load a full-recipe preset: config knobs apply now; a model change auto-reloads."""
-        preset = self._presets.get(name)
-        if preset is None:
-            return
-        self._apply_recipe(preset.config, preset.clip_models, preset.use_secondary_model)
-        self._preset_selection = name
-        # A preset retunes the live guidance, so record a revert point (discrete change — no
-        # debounce); supersede any pending guidance-drag checkpoint.
-        self.history.cancel_guidance_checkpoint()
-        self.history.request_checkpoint(f"preset {name}")
-        self._status(f"Loaded {name}")
-
     # -- sessions (full working state) --
     def _native_path(self, kind: str, title: str) -> str | None:
         """Open a native file dialog (``kind`` ``"save"``/``"open"``) rooted at ``out_dir``.
@@ -420,58 +341,6 @@ class App:
         except native_dialog.Unavailable:
             self._status("No native dialog (install zenity)")
             return None
-
-    def _open_save_preset_dialog(self) -> None:
-        """Open a small modal asking for a filename to save the current settings as a preset."""
-        if self._save_preset_window is not None and self._save_preset_window.alive():
-            return
-        rect = self.layout.centered_rect(420, 168)
-        ui = pygame_gui.elements
-        self._save_preset_window = ui.UIWindow(
-            rect, self.manager, window_display_title="Save preset"
-        )
-        cont = self._save_preset_window
-        inner_w = rect.width - 32
-        ui.UILabel(pygame.Rect(6, 4, inner_w, LABEL_H), "Filename", self.manager, container=cont)
-        self._save_preset_entry = ui.UITextEntryLine(
-            pygame.Rect(6, 32, inner_w, CTRL_H), self.manager, container=cont
-        )
-        self._save_preset_entry.set_text("my-preset")
-        self._save_preset_entry.focus()
-        self._save_preset_ok = ui.UIButton(
-            pygame.Rect(inner_w - 150, 78, 72, CTRL_H),
-            "Save",
-            self.manager,
-            container=cont,
-            object_id="#add_button",
-        )
-        self._save_preset_cancel = ui.UIButton(
-            pygame.Rect(inner_w - 70, 78, 72, CTRL_H), "Cancel", self.manager, container=cont
-        )
-
-    def _close_save_preset_dialog(self) -> None:
-        if self._save_preset_window is not None:
-            self._save_preset_window.kill()
-        self._save_preset_window = None
-        self._save_preset_entry = None
-        self._save_preset_ok = None
-        self._save_preset_cancel = None
-
-    def _save_current_preset(self) -> None:
-        """Write the current settings to presets/<filename>.toml and select the new preset."""
-        if self._save_preset_entry is None:
-            return
-        filename = self._save_preset_entry.get_text().strip() or "preset"
-        try:
-            name, _path = save_preset(filename, self._current_preset())
-        except Exception as exc:  # noqa: BLE001 - surface the failure instead of crashing
-            log.exception("saving preset failed")
-            self._status(f"Save failed: {exc}")
-            return
-        self._presets = load_presets()
-        self._close_save_preset_dialog()
-        self._set_preset_selection(name)
-        self._status(f"Saved {name}")
 
     def _sync_enabled(self) -> None:
         """Resync which widgets are enabled to the run / preview / reload state (both areas)."""

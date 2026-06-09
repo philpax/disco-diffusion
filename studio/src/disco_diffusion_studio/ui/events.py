@@ -131,17 +131,17 @@ def _handle_event(app: App, event: pygame.event.Event) -> bool:
         return True
 
     if event.type == pygame_gui.UI_BUTTON_PRESSED:
-        if event.ui_element is app._save_preset_ok:
-            app._save_current_preset()
-        elif event.ui_element is app._save_preset_cancel:
-            app._close_save_preset_dialog()
+        if event.ui_element is app.recipe.save_ok:
+            app.recipe.save_current()
+        elif event.ui_element is app.recipe.save_cancel:
+            app.recipe.close_save_dialog()
     elif event.type == pygame_gui.UI_COLOUR_PICKER_COLOUR_PICKED:
         if event.ui_element is app._colour_picker:
             col = event.colour
             app.bottom_bar.apply_picked_colour(app, (col.r, col.g, col.b))
     elif event.type == pygame_gui.UI_TEXT_ENTRY_FINISHED:
-        if event.ui_element is app._save_preset_entry:
-            app._save_current_preset()  # Enter in the filename box saves
+        if event.ui_element is app.recipe.save_entry:
+            app.recipe.save_current()  # Enter in the filename box saves
     elif event.type == pygame_gui.UI_CONFIRMATION_DIALOG_CONFIRMED:
         if event.ui_element is app._confirm_dialog:
             app._reset_canvas()
@@ -149,8 +149,8 @@ def _handle_event(app: App, event: pygame.event.Event) -> bool:
     elif event.type == pygame.DROPFILE:  # drag-drop an image onto the window -> init image
         app._load_init_file(event.file)
     elif event.type == pygame_gui.UI_WINDOW_CLOSE:
-        if event.ui_element is app._save_preset_window:
-            app._close_save_preset_dialog()
+        if event.ui_element is app.recipe.save_window:
+            app.recipe.close_save_dialog()
         elif event.ui_element is app._colour_picker:
             app._colour_picker = None
         elif event.ui_element is app._confirm_dialog:  # cancelled

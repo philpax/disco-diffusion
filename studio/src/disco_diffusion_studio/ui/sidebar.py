@@ -449,9 +449,9 @@ class Sidebar:
         """(Re)create the preset dropdown in the settings panel at the stored rect/selection."""
         if self.preset_dropdown is not None:
             self.preset_dropdown.kill()
-        options: list[str | tuple[str, str]] = [*app._presets.keys(), CUSTOM_PRESET]
-        selected = app._preset_selection if app._preset_selection in options else CUSTOM_PRESET
-        app._preset_selection = selected
+        options: list[str | tuple[str, str]] = [*app.recipe.presets.keys(), CUSTOM_PRESET]
+        selected = app.recipe.selection if app.recipe.selection in options else CUSTOM_PRESET
+        app.recipe.selection = selected
         self.preset_dropdown = UIDropDownMenu(
             options,
             selected,
@@ -468,7 +468,7 @@ class Sidebar:
                 self._sidebar_tab = "settings" if e == self.tab_settings else "current"
                 self.sync_tabs(app)
             elif e == self.save_preset_button:
-                app._open_save_preset_dialog()
+                app.recipe.open_save_dialog()
             elif e == self.save_session_button:
                 app.session_io.save()
             elif e == self.load_session_button:
@@ -484,7 +484,7 @@ class Sidebar:
                 on = app.session.config.perlin_init
                 (self.perlin_button.select if on else self.perlin_button.unselect)()
                 app._status(f"Perlin {'on' if on else 'off'}")
-                app._mark_custom()
+                app.recipe.mark_custom()
             elif e in self._clip_buttons:
                 app.models.toggle_clip(e)
             elif e == self.secondary_button:
@@ -509,7 +509,7 @@ class Sidebar:
                 # eta is read when the loop's generator is built, so this lands on the next run.
                 app.session.config.eta = float(event.value)
                 self._eta_label.set_text(f"{event.value:.2f}")
-                app._mark_custom()
+                app.recipe.mark_custom()
             elif e == self._init_denoise_slider:
                 # img2img strength — converted to skip_steps at the next Play.
                 app._init.denoise = int(round(event.value))
@@ -521,7 +521,7 @@ class Sidebar:
                 # retunes guidance on the next step (and seeds the next run when stopped).
                 setattr(app.session.config, attr, value)
                 vlabel.set_text(fmt.format(value))
-                app._mark_custom()
+                app.recipe.mark_custom()
                 # Drop a revert point once the drag settles (debounced in run()).
                 app.history.arm_guidance_checkpoint(
                     pygame.time.get_ticks() + GUIDANCE_CHECKPOINT_MS
@@ -531,9 +531,9 @@ class Sidebar:
             return True
         if event.type == pygame_gui.UI_DROP_DOWN_MENU_CHANGED:
             if event.ui_element == self.preset_dropdown:
-                app._preset_selection = event.text
+                app.recipe.selection = event.text
                 if event.text != CUSTOM_PRESET:
-                    app._apply_preset(event.text)
+                    app.recipe.apply_preset(event.text)
                 return True
             return False
         if event.type == pygame_gui.UI_TEXT_ENTRY_FINISHED:
@@ -620,7 +620,7 @@ class Sidebar:
             return
         setattr(app.session.config, attr, text)
         app._status("Schedule set")
-        app._mark_custom()
+        app.recipe.mark_custom()
 
     def sync_enabled(self, app: App) -> None:
         """The output boxes (steps / seed / size) are editable only when not generating."""

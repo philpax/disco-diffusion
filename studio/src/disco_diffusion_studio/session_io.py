@@ -103,7 +103,7 @@ class SessionIO:
     def _current_session(self) -> Session:
         """Capture the whole working state (prompts + output + denoise + recipe) as a Session."""
         app = self.app
-        recipe = app._current_preset()
+        recipe = app.recipe.current()
         return Session(
             width=app.width,
             height=app.height,
@@ -152,8 +152,8 @@ class SessionIO:
         app.sidebar.set_denoise(app._init.denoise)
         app.prompts = [PromptRow(t, w, m) for t, w, m in session.prompts] or [PromptRow("", 1.0)]
         app.bottom_bar.rebuild_prompt_rows(app)
-        app._apply_recipe(session.config, session.clip_models, session.use_secondary_model)
-        app._preset_selection = app._detect_preset()
+        app.recipe.apply_recipe(session.config, session.clip_models, session.use_secondary_model)
+        app.recipe.selection = app.recipe.detect()
         app.sidebar.spawn_preset_dropdown(app)
         app.generation.run_snapshot = app.sidebar.perrun_values(app)
         app._status("Session loaded — press Play")

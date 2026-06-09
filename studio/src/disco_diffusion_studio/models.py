@@ -46,7 +46,7 @@ class Models:
         self.clip_selected.symmetric_difference_update({name})  # toggle in/out
         app.sidebar.sync_model_buttons(self.clip_selected, self.secondary_on)
         self.update_queue()
-        app._mark_custom()
+        app.recipe.mark_custom()
 
     def toggle_secondary(self) -> None:
         """Stage the secondary model in/out of the pending selection (queues the auto-reload)."""
@@ -54,7 +54,7 @@ class Models:
         self.secondary_on = not self.secondary_on
         app.sidebar.sync_model_buttons(self.clip_selected, self.secondary_on)
         self.update_queue()
-        app._mark_custom()
+        app.recipe.mark_custom()
 
     def matches_session(self) -> bool:
         """True when the staged CLIP set + secondary toggle equal the loaded session's."""

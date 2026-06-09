@@ -12,6 +12,7 @@ import pygame_gui
 from PIL import Image
 
 from disco_diffusion_studio import app as A
+from disco_diffusion_studio.controls import CUSTOM_PRESET
 from disco_diffusion_studio.presets import GuidanceSnapshot
 from disco_diffusion_studio.timeline import Timeline
 from disco_diffusion_studio.worker import HistoryEntry, PromptSpec
@@ -32,7 +33,7 @@ def test_compute_window_size_respects_minimums():
 
 
 def test_opens_on_default_preset(app):
-    assert app._preset_selection == "Default"
+    assert app.recipe.selection == "Default"
 
 
 def test_editing_guidance_marks_custom_and_arms_checkpoint(app):
@@ -40,14 +41,14 @@ def test_editing_guidance_marks_custom_and_arms_checkpoint(app):
     app._handle_event(
         pygame.event.Event(pygame_gui.UI_HORIZONTAL_SLIDER_MOVED, ui_element=slider, value=9999.0)
     )
-    assert app._preset_selection == A.CUSTOM_PRESET
+    assert app.recipe.selection == CUSTOM_PRESET
     assert app.history.guidance_checkpoint_at is not None
 
 
 def test_apply_preset_sets_guidance_and_requests_checkpoint(app, fake_worker):
     calls: list[str] = []
     app.worker = fake_worker(checkpoint=calls.append)
-    app._apply_preset("2022 sauce")
+    app.recipe.apply_preset("2022 sauce")
     assert app.session.config.clip_guidance_scale == 15000
     assert calls == ["preset 2022 sauce"]
 
