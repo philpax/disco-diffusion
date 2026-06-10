@@ -16,10 +16,15 @@ from typing import TYPE_CHECKING
 import numpy as np
 import pygame
 
-from .constants import BRUSH_SIZE_MAX, BRUSH_SIZE_MIN, BRUSH_STRENGTH_MAX, BRUSH_STRENGTH_MIN
+from ..common.constants import (
+    BRUSH_SIZE_MAX,
+    BRUSH_SIZE_MIN,
+    BRUSH_STRENGTH_MAX,
+    BRUSH_STRENGTH_MIN,
+)
 
 if TYPE_CHECKING:
-    from .worker import GenerationWorker
+    from ..engine.worker import GenerationWorker
 
 # Brush kinds (in display order). Selected by name.
 BRUSHES = ["Soft", "Hard", "Spray"]

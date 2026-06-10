@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pygame
 
-from disco_diffusion_studio.view import MAX_ZOOM, MIN_ZOOM, ViewTransform
+from disco_diffusion_studio.ui.view import MAX_ZOOM, MIN_ZOOM, ViewTransform
 
 
 def test_fit_centres_the_canvas_in_the_region():

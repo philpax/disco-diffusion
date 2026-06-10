@@ -16,13 +16,13 @@ import pygame
 import pygame_gui
 from disco_diffusion.config import AVAILABLE_CLIP_MODELS
 
-from .constants import RELOAD_DEBOUNCE_MS
-from .reload import ModelReloader
-from .signals import Signals
-from .state import SharedState
+from ..common.constants import RELOAD_DEBOUNCE_MS
+from ..common.signals import Signals
+from ..engine.reload import ModelReloader
+from ..session.state import SharedState
 
 if TYPE_CHECKING:
-    from .app import App
+    from ..app import App
 
 
 class Models:

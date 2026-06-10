@@ -13,8 +13,8 @@ from dataclasses import dataclass, field
 
 import pygame
 
-from .theme import MUTED_COLOR, PENDING_COLOR, READOUT_COLOR
-from .worker import HistoryEntry
+from ..common.theme import MUTED_COLOR, PENDING_COLOR, READOUT_COLOR
+from ..engine.worker import HistoryEntry
 
 RGB = tuple[int, int, int]
 

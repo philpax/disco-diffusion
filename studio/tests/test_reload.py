@@ -6,8 +6,8 @@ import time
 
 from disco_diffusion import RunConfig
 
-from disco_diffusion_studio import reload as reload_mod
-from disco_diffusion_studio.reload import ModelReloader
+from disco_diffusion_studio.engine import reload as reload_mod
+from disco_diffusion_studio.engine.reload import ModelReloader
 
 
 def _wait_for_result(reloader: ModelReloader, timeout: float = 2.0):

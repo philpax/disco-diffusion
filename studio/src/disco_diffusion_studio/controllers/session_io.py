@@ -17,15 +17,15 @@ import numpy as np
 import pygame
 from PIL import Image
 
-from .controls import PromptRow
-from .presets import HistoryItem, Session, load_session, save_session
-from .signals import Signals
-from .state import SharedState
-from .util import surface_to_pil
-from .worker import HistoryEntry, PromptSpec
+from ..common.signals import Signals
+from ..common.util import surface_to_pil
+from ..engine.worker import HistoryEntry, PromptSpec
+from ..session.controls import PromptRow
+from ..session.presets import HistoryItem, Session, load_session, save_session
+from ..session.state import SharedState
 
 if TYPE_CHECKING:
-    from .app import App
+    from ..app import App
 
 log = logging.getLogger("disco_diffusion_studio.session_io")
 

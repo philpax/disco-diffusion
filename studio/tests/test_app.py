@@ -12,11 +12,11 @@ import pygame_gui
 from PIL import Image
 
 from disco_diffusion_studio import app as A
-from disco_diffusion_studio.controls import CUSTOM_PRESET
-from disco_diffusion_studio.specs import GuidanceSnapshot
-from disco_diffusion_studio.timeline import Timeline
+from disco_diffusion_studio.common.specs import GuidanceSnapshot
+from disco_diffusion_studio.engine.worker import HistoryEntry, PromptSpec
+from disco_diffusion_studio.session.controls import CUSTOM_PRESET
+from disco_diffusion_studio.session.timeline import Timeline
 from disco_diffusion_studio.ui import events
-from disco_diffusion_studio.worker import HistoryEntry, PromptSpec
 
 
 def test_app_constructs_and_renders(app):
@@ -326,7 +326,7 @@ def test_panel_height_clamps(app):
 
 
 def test_history_tick_colours_by_kind():
-    from disco_diffusion_studio.theme import MUTED_COLOR, PENDING_COLOR
+    from disco_diffusion_studio.common.theme import MUTED_COLOR, PENDING_COLOR
 
     paint = Timeline.tick_colour("paint soft 48px")
     assert paint[1] > paint[0] and paint[1] > paint[2]  # green-dominant

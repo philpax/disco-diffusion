@@ -24,16 +24,16 @@ from pygame_gui.elements import (
     UITextEntryLine,
 )
 
-from ..constants import GUIDANCE_CHECKPOINT_MS
-from ..controls import CURRENT_PERRUN, CUSTOM_PRESET, LIVE_SCALES, SCHEDULES
-from ..layout import CTRL_H, LABEL_H, MARGIN, PAD, Row
-from ..util import int_or
+from ..common.constants import GUIDANCE_CHECKPOINT_MS
+from ..common.layout import CTRL_H, LABEL_H, MARGIN, PAD, Row
+from ..common.util import int_or
+from ..session.controls import CURRENT_PERRUN, CUSTOM_PRESET, LIVE_SCALES, SCHEDULES
 
 if TYPE_CHECKING:
     from ..app import App
-    from ..layout import Layout
-    from ..signals import Signals
-    from ..state import PaintState, SharedState
+    from ..common.layout import Layout
+    from ..common.signals import Signals
+    from ..session.state import PaintState, SharedState
 
 
 @dataclass

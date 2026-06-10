@@ -35,14 +35,11 @@ from disco_diffusion import DiscoSession, RunConfig
 from PIL import Image
 from pygame_gui.windows import UIColourPickerDialog, UIConfirmationDialog, UIMessageWindow
 
-from . import native_dialog
-from .constants import (
+from .common import native_dialog
+from .common.constants import (
     APP_TITLE,
 )
-from .controls import PromptRow
-from .generation import Generation
-from .history import History
-from .layout import (
+from .common.layout import (
     DEFAULT_H,
     DEFAULT_W,
     DIVIDER_W,
@@ -55,27 +52,30 @@ from .layout import (
     Layout,
     snap_side,
 )
-from .loading import LoadingState, loading_screen
-from .models import Models
-from .paint import Brush
-from .palette import Palette
-from .recipe import Recipe
-from .session_io import SessionIO
-from .signals import Signals
-from .state import PaintState, SharedState
-from .theme import (
+from .common.signals import Signals
+from .common.theme import (
     DIVIDER,
     IMAGE_BG,
     PANEL_BG,
     THEME,
     WINDOW_BG,
 )
+from .common.util import surface_to_pil
+from .controllers.generation import Generation
+from .controllers.history import History
+from .controllers.models import Models
+from .controllers.recipe import Recipe
+from .controllers.session_io import SessionIO
+from .engine.worker import PromptSpec
+from .paint.paint import Brush
+from .paint.palette import Palette
+from .session.controls import PromptRow
+from .session.state import PaintState, SharedState
 from .ui import events
 from .ui.bottom_bar import BottomBar
 from .ui.canvas import Canvas
+from .ui.loading import LoadingState, loading_screen
 from .ui.sidebar import Sidebar
-from .util import surface_to_pil
-from .worker import PromptSpec
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger("disco_diffusion_studio")

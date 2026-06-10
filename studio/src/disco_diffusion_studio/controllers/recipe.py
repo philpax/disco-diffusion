@@ -17,14 +17,14 @@ import pygame
 import pygame_gui
 from disco_diffusion.config import AVAILABLE_CLIP_MODELS
 
-from .controls import CUSTOM_PRESET
-from .layout import CTRL_H, LABEL_H
-from .presets import Preset, PresetConfig, load_presets, match_preset, save_preset
-from .signals import Signals
-from .state import SharedState
+from ..common.layout import CTRL_H, LABEL_H
+from ..common.signals import Signals
+from ..session.controls import CUSTOM_PRESET
+from ..session.presets import Preset, PresetConfig, load_presets, match_preset, save_preset
+from ..session.state import SharedState
 
 if TYPE_CHECKING:
-    from .app import App
+    from ..app import App
 
 log = logging.getLogger("disco_diffusion_studio.recipe")
 

@@ -24,8 +24,8 @@ import pygame  # noqa: E402
 import pytest  # noqa: E402
 
 from disco_diffusion import RunConfig  # noqa: E402
-from disco_diffusion_studio import colours as colours_mod  # noqa: E402
-from disco_diffusion_studio import presets as presets_mod  # noqa: E402
+from disco_diffusion_studio.paint import colours as colours_mod  # noqa: E402
+from disco_diffusion_studio.session import presets as presets_mod  # noqa: E402
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -91,7 +91,7 @@ def fake_worker():
 @pytest.fixture
 def worker_factory():
     """Build a real ``GenerationWorker`` over a (stub) ``session`` with the standard rigging."""
-    from disco_diffusion_studio.worker import GenerationWorker
+    from disco_diffusion_studio.engine.worker import GenerationWorker
 
     def make(session, *, width: int = 64, height: int = 64, steps: int = 20, **kwargs):
         return GenerationWorker(

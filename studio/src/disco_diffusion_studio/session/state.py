@@ -14,12 +14,12 @@ from dataclasses import dataclass, field
 
 from disco_diffusion import DiscoSession, EncodedPrompt
 
+from ..engine.worker import GenerationWorker
+from ..paint.paint import Brush
+from ..paint.palette import Palette
 from .controls import PromptRow
 from .init_image import InitImage
-from .paint import Brush
-from .palette import Palette
 from .timeline import Timeline
-from .worker import GenerationWorker
 
 
 @dataclass

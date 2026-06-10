@@ -17,9 +17,9 @@ from pydantic import BaseModel, ConfigDict
 
 log = logging.getLogger("disco_diffusion_studio.colours")
 
-# This file is studio/src/disco_diffusion_studio/colours.py, so parents[2] is the studio project
+# This file is .../disco_diffusion_studio/paint/colours.py, so parents[3] is the studio project
 # dir — the same place ``disco-studio`` is run from. The colour config lives there.
-_STUDIO_ROOT = Path(__file__).resolve().parents[2]
+_STUDIO_ROOT = Path(__file__).resolve().parents[3]
 CONFIG_PATH = _STUDIO_ROOT / "config.toml"
 
 MAX_RECENT = 8  # how many recently-picked colours to remember

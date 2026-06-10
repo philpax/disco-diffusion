@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pygame
 
-from disco_diffusion_studio.loading import LoadingState, loading_screen
+from disco_diffusion_studio.ui.loading import LoadingState, loading_screen
 
 
 def test_loading_screen_returns_true_when_done(app):

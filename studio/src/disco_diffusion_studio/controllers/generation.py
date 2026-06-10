@@ -17,14 +17,14 @@ from typing import TYPE_CHECKING
 
 import pygame
 
-from .layout import snap_side
-from .signals import Signals
-from .state import PaintState, SharedState
-from .util import clamp_steps
-from .worker import GenerationWorker
+from ..common.layout import snap_side
+from ..common.signals import Signals
+from ..common.util import clamp_steps
+from ..engine.worker import GenerationWorker
+from ..session.state import PaintState, SharedState
 
 if TYPE_CHECKING:
-    from .app import App
+    from ..app import App
 
 log = logging.getLogger("disco_diffusion_studio.generation")
 

@@ -12,14 +12,14 @@ from typing import TYPE_CHECKING
 
 import pygame
 
-from ..constants import CANVAS_BORDER, CANVAS_EMPTY_BG, DRAW_HELP, NAV_HELP
-from ..paint import PaintController
-from ..view import ViewTransform
+from ..common.constants import CANVAS_BORDER, CANVAS_EMPTY_BG, DRAW_HELP, NAV_HELP
+from ..paint.paint import PaintController
+from .view import ViewTransform
 
 if TYPE_CHECKING:
     from ..app import App
-    from ..layout import Layout
-    from ..state import PaintState, SharedState
+    from ..common.layout import Layout
+    from ..session.state import PaintState, SharedState
     from .bottom_bar import BottomBar
 
 

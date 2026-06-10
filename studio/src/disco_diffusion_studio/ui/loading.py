@@ -12,8 +12,8 @@ from dataclasses import dataclass
 import pygame
 from disco_diffusion import DiscoSession
 
-from .constants import APP_TITLE
-from .theme import WINDOW_BG
+from ..common.constants import APP_TITLE
+from ..common.theme import WINDOW_BG
 
 
 @dataclass

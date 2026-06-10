@@ -15,13 +15,13 @@ from typing import TYPE_CHECKING
 import pygame
 from PIL import Image
 
-from .controls import PromptRow
-from .signals import Signals
-from .state import SharedState
-from .worker import HistoryEntry, PromptSpec
+from ..common.signals import Signals
+from ..engine.worker import HistoryEntry, PromptSpec
+from ..session.controls import PromptRow
+from ..session.state import SharedState
 
 if TYPE_CHECKING:
-    from .app import App
+    from ..app import App
 
 
 class History:

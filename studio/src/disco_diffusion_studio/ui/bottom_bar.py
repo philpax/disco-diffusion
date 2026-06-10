@@ -22,17 +22,22 @@ from pygame_gui.elements import (
     UITextEntryLine,
 )
 
-from ..constants import BRUSH_SIZE_MAX, BRUSH_SIZE_MIN, BRUSH_STRENGTH_MAX, BRUSH_STRENGTH_MIN
-from ..controls import PromptRow
-from ..layout import CTRL_H, LABEL_H, MARGIN, PAD, ROW_PITCH, Row, Stack
-from ..paint import BRUSHES
-from ..theme import DIVIDER, MUTED_COLOR, PENDING_COLOR, READOUT_COLOR
+from ..common.constants import (
+    BRUSH_SIZE_MAX,
+    BRUSH_SIZE_MIN,
+    BRUSH_STRENGTH_MAX,
+    BRUSH_STRENGTH_MIN,
+)
+from ..common.layout import CTRL_H, LABEL_H, MARGIN, PAD, ROW_PITCH, Row, Stack
+from ..common.theme import DIVIDER, MUTED_COLOR, PENDING_COLOR, READOUT_COLOR
+from ..paint.paint import BRUSHES
+from ..session.controls import PromptRow
 
 if TYPE_CHECKING:
     from ..app import App
-    from ..layout import Layout
-    from ..signals import Signals
-    from ..state import PaintState, SharedState
+    from ..common.layout import Layout
+    from ..common.signals import Signals
+    from ..session.state import PaintState, SharedState
 
 RGB = tuple[int, int, int]
 

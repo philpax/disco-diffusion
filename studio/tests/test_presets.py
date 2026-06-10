@@ -9,7 +9,7 @@ from disco_diffusion import RunConfig
 from PIL import Image
 from pydantic import ValidationError
 
-from disco_diffusion_studio import presets as P
+from disco_diffusion_studio.session import presets as P
 
 
 def test_bundled_presets_load():

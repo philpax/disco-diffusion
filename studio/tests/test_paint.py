@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import numpy as np
 
-from disco_diffusion_studio.paint import BRUSHES, Brush, PaintController, PaintLayer
+from disco_diffusion_studio.paint.paint import BRUSHES, Brush, PaintController, PaintLayer
 
 
 def _brush(color=(255, 0, 0), noise=False) -> Brush:

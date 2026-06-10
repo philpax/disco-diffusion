@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from disco_diffusion_studio.layout import MAX_SIDE, MIN_SIDE, Row, Stack, snap_side
+from disco_diffusion_studio.common.layout import MAX_SIDE, MIN_SIDE, Row, Stack, snap_side
 
 
 def test_snap_side_snaps_to_multiples_of_64():

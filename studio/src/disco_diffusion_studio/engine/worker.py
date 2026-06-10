@@ -19,7 +19,7 @@ import torch
 from disco_diffusion import DiscoSession, EncodedPrompt, Sampler
 from PIL import Image
 
-from .specs import GuidanceSnapshot, PromptSpec
+from ..common.specs import GuidanceSnapshot, PromptSpec
 
 log = logging.getLogger("disco_diffusion_studio.worker")
 

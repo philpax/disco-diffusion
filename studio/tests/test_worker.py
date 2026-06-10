@@ -13,7 +13,7 @@ from types import SimpleNamespace
 import numpy as np
 from PIL import Image
 
-from disco_diffusion_studio.worker import PromptSpec
+from disco_diffusion_studio.engine.worker import PromptSpec
 
 
 class _StepResult:

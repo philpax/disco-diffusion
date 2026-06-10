@@ -5,8 +5,8 @@ from __future__ import annotations
 import numpy as np
 import pygame
 
-from disco_diffusion_studio.timeline import Timeline
-from disco_diffusion_studio.worker import HistoryEntry
+from disco_diffusion_studio.engine.worker import HistoryEntry
+from disco_diffusion_studio.session.timeline import Timeline
 
 
 def _entry(index: int, total: int = 100, label: str = "edit") -> HistoryEntry:

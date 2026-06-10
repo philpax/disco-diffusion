@@ -22,13 +22,13 @@ from disco_diffusion.config import parse_schedule
 from PIL import Image
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from .specs import GuidanceSnapshot, PromptSpec
+from ..common.specs import GuidanceSnapshot, PromptSpec
 
 log = logging.getLogger("disco_diffusion_studio.presets")
 
-# This file is studio/src/disco_diffusion_studio/presets.py, so parents[2] is the studio project
+# This file is .../disco_diffusion_studio/session/presets.py, so parents[3] is the studio project
 # dir — the same place ``disco-studio`` is run from. Presets live there (alongside the package).
-_STUDIO_ROOT = Path(__file__).resolve().parents[2]
+_STUDIO_ROOT = Path(__file__).resolve().parents[3]
 PRESETS_DIR = _STUDIO_ROOT / "presets"
 
 
