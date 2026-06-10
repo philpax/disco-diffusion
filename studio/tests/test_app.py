@@ -13,7 +13,7 @@ from PIL import Image
 
 from disco_diffusion_studio import app as A
 from disco_diffusion_studio.controls import CUSTOM_PRESET
-from disco_diffusion_studio.presets import GuidanceSnapshot
+from disco_diffusion_studio.specs import GuidanceSnapshot
 from disco_diffusion_studio.timeline import Timeline
 from disco_diffusion_studio.ui import events
 from disco_diffusion_studio.worker import HistoryEntry, PromptSpec

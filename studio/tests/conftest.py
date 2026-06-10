@@ -24,6 +24,7 @@ import pygame  # noqa: E402
 import pytest  # noqa: E402
 
 from disco_diffusion import RunConfig  # noqa: E402
+from disco_diffusion_studio import colours as colours_mod  # noqa: E402
 from disco_diffusion_studio import presets as presets_mod  # noqa: E402
 
 
@@ -46,7 +47,7 @@ def studio_sandbox(tmp_path, monkeypatch):
     # palette with empty recents, and saves land in the sandbox.
     dst_config = tmp_path / "config.toml"
     monkeypatch.setattr(presets_mod, "PRESETS_DIR", dst_presets)
-    monkeypatch.setattr(presets_mod, "CONFIG_PATH", dst_config)
+    monkeypatch.setattr(colours_mod, "CONFIG_PATH", dst_config)
     return SimpleNamespace(presets_dir=dst_presets, config_path=dst_config)
 
 

@@ -1,10 +1,10 @@
-"""On-disk presets and the colour config, stored as TOML under the studio project dir.
+"""On-disk presets and session bundles, stored as TOML / zip under the studio project dir.
 
 Presets (full one-click recipes: guidance + per-run knobs + cut schedules + the model set) live
-as ``studio/presets/*.toml``; the colour palette and recently-picked colours live in
-``studio/config.toml``. Keeping them on disk means they can be hand-edited, version-controlled,
-and saved from the UI. Reading uses the stdlib ``tomllib``; writing uses ``tomli_w`` (the standard
-companion to ``tomllib``, which is read-only).
+as ``studio/presets/*.toml``; a whole working *session* saves/loads as a ``.zip``. Keeping them on
+disk means they can be hand-edited, version-controlled, and saved from the UI. Reading uses the
+stdlib ``tomllib``; writing uses ``tomli_w``. The shared torch-free records (PromptSpec /
+GuidanceSnapshot) live in specs.py; the colour config in colours.py.
 """
 
 from __future__ import annotations
@@ -15,7 +15,6 @@ import re
 import tomllib
 import zipfile
 from pathlib import Path
-from typing import NamedTuple
 
 import tomli_w
 from disco_diffusion import RunConfig
@@ -23,48 +22,14 @@ from disco_diffusion.config import parse_schedule
 from PIL import Image
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from .specs import GuidanceSnapshot, PromptSpec
+
 log = logging.getLogger("disco_diffusion_studio.presets")
 
 # This file is studio/src/disco_diffusion_studio/presets.py, so parents[2] is the studio project
-# dir — the same place ``disco-studio`` is run from in the workspace. Presets and the colour
-# config live there (alongside, not inside, the importable package).
+# dir — the same place ``disco-studio`` is run from. Presets live there (alongside the package).
 _STUDIO_ROOT = Path(__file__).resolve().parents[2]
 PRESETS_DIR = _STUDIO_ROOT / "presets"
-CONFIG_PATH = _STUDIO_ROOT / "config.toml"
-
-MAX_RECENT = 8  # how many recently-picked colours to remember
-
-RGB = tuple[int, int, int]
-
-
-class PromptSpec(NamedTuple):
-    """One prompt as a typed, tuple-compatible triple.
-
-    Lives here (torch-free) so both the session models and the worker share one prompt type; it
-    unpacks as ``text, weight, muted`` and compares equal to a plain 3-tuple, while giving the
-    UI↔worker wire format named, typed fields.
-    """
-
-    text: str
-    weight: float
-    muted: bool
-
-
-# Seed palette, used only if config.toml is missing/empty (a friendly default spread).
-DEFAULT_PALETTE: list[str] = [
-    "#000000",
-    "#ffffff",
-    "#7f7f7f",
-    "#d64541",
-    "#e8833a",
-    "#f1c40f",
-    "#2ecc71",
-    "#3498db",
-    "#6c7cff",
-    "#9b59b6",
-    "#ec70b4",
-    "#f5deb3",
-]
 
 
 # --- preset models -----------------------------------------------------------
@@ -131,15 +96,6 @@ class Preset(BaseModel):
 def match_preset(presets: dict[str, Preset], target: Preset) -> str | None:
     """The name of the saved preset whose recipe matches ``target``, else None."""
     return next((name for name, p in presets.items() if p.matches(target)), None)
-
-
-class ColourConfig(BaseModel):
-    """The studio colour state: the fixed palette plus the recently-picked colours."""
-
-    model_config = ConfigDict(frozen=True)
-
-    palette: list[RGB]
-    recent: list[RGB]
 
 
 # --- presets: load / save ----------------------------------------------------
@@ -275,43 +231,6 @@ class _SessionDoc(BaseModel):
         )
 
 
-class GuidanceSnapshot(BaseModel):
-    """The live-guidance values captured at a checkpoint, so Revert restores them exactly.
-
-    Fully typed (not a loose ``dict[str, float]``) so int knobs — ``clip_guidance_scale`` and
-    ``cutn_batches``, the latter used as ``range(cutn_batches)`` — stay ints through save/load.
-    Fields mirror the RunConfig live-guidance knobs + eta; the import-time check below guards
-    against drift, and the defaults match RunConfig's.
-    """
-
-    model_config = ConfigDict(frozen=True)
-
-    clip_guidance_scale: int = 5000
-    tv_scale: float = 0.0
-    range_scale: float = 150.0
-    sat_scale: float = 0.0
-    cutn_batches: int = 4
-    clamp_max: float = 0.05
-    eta: float = 0.8
-
-    @classmethod
-    def capture(cls, config: RunConfig) -> GuidanceSnapshot:
-        """Snapshot the guidance fields off a RunConfig (a field absent on ``config`` defaults)."""
-        return cls(**{f: getattr(config, f) for f in cls.model_fields if hasattr(config, f)})
-
-    def apply_to(self, config: RunConfig) -> None:
-        """Write the snapshot back onto a RunConfig — types preserved, no float/int surprises."""
-        for field_name, value in self.model_dump().items():
-            setattr(config, field_name, value)
-
-
-# Like PresetConfig, every GuidanceSnapshot field must name a real RunConfig field — checked at
-# import so a rename/typo fails fast.
-_UNKNOWN_SNAPSHOT_FIELDS = sorted(set(GuidanceSnapshot.model_fields) - set(RunConfig.model_fields))
-if _UNKNOWN_SNAPSHOT_FIELDS:
-    raise RuntimeError(f"GuidanceSnapshot fields not on RunConfig: {_UNKNOWN_SNAPSHOT_FIELDS}")
-
-
 class HistoryItem(BaseModel):
     """One saved checkpoint's metadata; its preview image is stored alongside in the zip.
 
@@ -403,41 +322,3 @@ def load_session(
                 if name in names:
                     history.append((item, _read_image(zf, name)))
     return session.to_session(), image, history
-
-
-# --- colours: load / save ----------------------------------------------------
-
-
-def _hex_to_rgb(value: str) -> RGB:
-    s = value.lstrip("#")
-    return (int(s[0:2], 16), int(s[2:4], 16), int(s[4:6], 16))
-
-
-def _rgb_to_hex(rgb: RGB) -> str:
-    return f"#{int(rgb[0]):02x}{int(rgb[1]):02x}{int(rgb[2]):02x}"
-
-
-def load_colours() -> ColourConfig:
-    """Load the palette + recents from config.toml, falling back to the seed palette."""
-    if CONFIG_PATH.exists():
-        try:
-            data = tomllib.loads(CONFIG_PATH.read_text()).get("colours", {})
-            palette = [_hex_to_rgb(h) for h in data.get("palette", [])]
-            recent = [_hex_to_rgb(h) for h in data.get("recent", [])]
-            if palette:
-                return ColourConfig(palette=palette, recent=recent)
-        except Exception:  # noqa: BLE001 - a malformed config shouldn't break startup
-            log.exception("failed to load colour config %s", CONFIG_PATH)
-    return ColourConfig(palette=[_hex_to_rgb(h) for h in DEFAULT_PALETTE], recent=[])
-
-
-def save_colours(colours: ColourConfig) -> None:
-    """Persist the palette + recents to config.toml as hex strings."""
-    data = {
-        "colours": {
-            "palette": [_rgb_to_hex(c) for c in colours.palette],
-            "recent": [_rgb_to_hex(c) for c in colours.recent],
-        }
-    }
-    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    CONFIG_PATH.write_text(tomli_w.dumps(data))

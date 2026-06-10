@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 
-from .presets import MAX_RECENT, RGB, ColourConfig, load_colours, save_colours
+from .colours import MAX_RECENT, RGB, ColourConfig, load_colours, save_colours
 
 log = logging.getLogger("disco_diffusion_studio.palette")
 

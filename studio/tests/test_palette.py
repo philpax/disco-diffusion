@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
+from disco_diffusion_studio.colours import MAX_RECENT
 from disco_diffusion_studio.palette import Palette
-from disco_diffusion_studio.presets import MAX_RECENT
 
 
 def test_swatches_are_fixed_then_recents_deduped():

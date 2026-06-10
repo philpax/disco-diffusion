@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from disco_diffusion_studio import presets as P
+from disco_diffusion_studio import colours as P
 
 
 def test_load_colours_has_palette_and_empty_recents():
