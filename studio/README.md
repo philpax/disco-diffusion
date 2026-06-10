@@ -7,8 +7,6 @@ API (`disco_diffusion.DiscoSession`). It takes manual control of the sampling lo
 Full-quality steps are slow on purpose: each one is a window to retune the prompt mix and watch
 the image respond.
 
-![the studio UI](docs/screenshot.png)
-
 ## What you can do
 
 The layout is an **image canvas** (top-left) over a **bottom panel** (transport, history,
@@ -73,8 +71,6 @@ between them to resize the sidebar; the canvas auto-fits the available space.
   won't change while you pick a location); a `.png` extension is added if you omit one.
 
 Generation runs on a background thread, so the UI stays responsive while the GPU works.
-
-![painting onto the canvas to steer the diffusion](docs/painting.png)
 
 ## Running
 
