@@ -31,6 +31,7 @@ import io
 import os
 import random
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -136,41 +137,98 @@ class DiscoSession:
     (:class:`disco_diffusion.generate.Generator` wraps a session).
     """
 
-    def __init__(self, config: RunConfig, device: torch.device | None = None) -> None:
+    def __init__(
+        self,
+        config: RunConfig,
+        device: torch.device | None = None,
+        progress: Callable[[str], None] | None = None,
+    ) -> None:
         ensure_certifi_ssl()
         self.config = config
         self.device = device or select_device(config.cpu)
         print(f"Using device: {self.device}")
 
+        # Optional progress hook: called with a short label as each component is loaded, so a
+        # frontend (e.g. the studio's loading screen) can show what's happening. No-op by default.
+        def note(label: str) -> None:
+            if progress is not None:
+                progress(label)
+
         if config.compile and self.device.type == "cuda":
             _configure_perf(config.models_dir)
 
         self.model_config = build_model_config(config)
+        note("diffusion model")
         self.model, self.diffusion = load_diffusion_model(config, self.model_config, self.device)
+        if config.use_secondary_model:
+            note("secondary model")
         self.secondary_model = (
             load_secondary_model(config, self.device) if config.use_secondary_model else None
         )
-        self.clip_models = load_clip_models(config, self.device)
+        self.clip_models = load_clip_models(
+            config, self.device, progress=lambda n: note(f"CLIP {n}")
+        )
         # LPIPS is only used for the init-image loss; load it lazily to avoid the
         # VGG backbone download when it isn't needed.
+        if config.init_image is not None:
+            note("LPIPS (init-image loss)")
         self.lpips_model = load_lpips(self.device) if config.init_image is not None else None
+
+        # Eager references kept so a caller can fall back if compile OOMs (see
+        # disable_compile): the compiled UNet's warmup spike can exceed VRAM at large
+        # sizes on a shared GPU even though its steady state fits.
+        self._compiled = False
+        self._eager_model: Any = self.model
+        self._eager_encode: list[Any] = []
 
         if config.compile and self.device.type == "cuda":
             # Compile the UNet and the CLIP image encoders. The first run pays a
             # one-time warmup (cached on disk by _configure_perf); later runs are fast.
             #
-            # The UNet forward is convolution-bound (~50% of its runtime is fp16
-            # tensor-core GEMMs), so we autotune kernel selection with
-            # "max-autotune-no-cudagraphs": it benchmarks Triton/CUTLASS conv+matmul
-            # templates and picks the fastest, taking the UNet from ~128 ms to ~109 ms
-            # (~14%) on a 1280x768 forward. The choice is lossless (still fp16 tensor
-            # cores, within the existing noise floor); only the first-run compile is
-            # slower (~90 s vs ~6 s), and that is cached on disk. CUDA graphs are skipped
-            # because the forward is GPU-bound, not launch-bound (they gave no speedup).
-            print("torch.compile enabled (first run autotunes kernels; later runs reuse cache)")
-            self.model = torch.compile(self.model, mode="max-autotune-no-cudagraphs")  # type: ignore[assignment]
+            # Make compile best-effort: if inductor can't compile a given graph/shape
+            # (e.g. a recipe whose cut schedule recompiles the CLIP encoder for an
+            # awkward cutout-batch shape, which trips an inductor tiling assertion at
+            # large sizes), fall back to eager for that graph instead of crashing the
+            # run. The compiled graphs still get the speedup; only the unsupported ones
+            # run eager.
+            torch._dynamo.config.suppress_errors = True
+            # "default" is the robust, low-memory mode (warms in ~60s). max-autotune
+            # benchmarks more kernels for a small extra win on light recipes, but at
+            # large sizes it gives no steady-state gain (conv kernels exceed the GPU
+            # shared-memory limit and fall back) for a much longer, memory-hungry
+            # warmup; opt into it via config.compile_mode when it pays off.
+            print("torch.compile enabled (first run warms kernels; later runs reuse cache)")
+            note("compiling models (first run only)")
+            self._eager_encode = [cm.encode_image for cm in self.clip_models]
+            mode = config.compile_mode
+            compiled = (
+                torch.compile(self.model)
+                if mode == "default"
+                else torch.compile(self.model, mode=mode)
+            )
+            self.model = compiled  # type: ignore[assignment]
             for clip_model in self.clip_models:
                 clip_model.encode_image = torch.compile(clip_model.encode_image)
+            self._compiled = True
+
+    @property
+    def compiled(self) -> bool:
+        """Whether the UNet/CLIP are currently torch.compile-wrapped."""
+        return self._compiled
+
+    def disable_compile(self) -> None:
+        """Revert to the eager UNet/CLIP encoders.
+
+        For recovering from a compile-warmup CUDA OOM: the caller drops any sampler
+        holding the compiled graphs, calls this, empties the cache, and rebuilds a
+        sampler — which then reads these eager modules. A no-op if not compiled.
+        """
+        if not self._compiled:
+            return
+        self.model = self._eager_model
+        for clip_model, encode in zip(self.clip_models, self._eager_encode, strict=True):
+            clip_model.encode_image = encode
+        self._compiled = False
 
     # -- encoding ---------------------------------------------------------
     def encode(self, prompt: str) -> EncodedPrompt:
@@ -503,6 +561,13 @@ class Sampler:
         # When resuming, the saved (pre-scaled) latent is fed as the loop's noise.
         noise = self._resume_noise
         if cfg.diffusion_sampling_mode == SamplingMode.ddim:
+            # With no secondary model the guidance has to run the full UNet to get
+            # pred_xstart. The no-grad loop would then run the UNet *twice* per step
+            # (once for the step, once in cond_fn), so take the grad-enabled DDIM path
+            # instead: it computes the forward once, with grad, and hands it to cond_fn
+            # to reuse. With a secondary model the cheap no-grad path is already optimal
+            # (guidance uses the surrogate, not the UNet), so leave it alone.
+            reuse_forward = self.session.secondary_model is None
             return self.diffusion.ddim_sample_loop_progressive(
                 self.session.model,
                 shape,
@@ -515,6 +580,7 @@ class Sampler:
                 init_image=self._init,
                 randomize_class=cfg.randomize_class,
                 eta=cfg.eta,
+                cond_fn_with_grad=reuse_forward,
             )
         return self.diffusion.plms_sample_loop_progressive(
             self.session.model,
@@ -531,7 +597,13 @@ class Sampler:
         )
 
     # -- guidance ---------------------------------------------------------
-    def _cond_fn(self, x: torch.Tensor, t: torch.Tensor, y: Any = None) -> torch.Tensor:
+    def _cond_fn(
+        self, x: torch.Tensor, t: torch.Tensor, precomputed_out: Any = None
+    ) -> torch.Tensor:
+        # ``precomputed_out`` is set only on the grad-enabled DDIM path
+        # (``condition_score_with_grad`` passes the model's forward output positionally):
+        # there ``x`` already requires grad and the UNet forward is done, so we reuse it
+        # instead of running the model again. On the no-grad path it stays None.
         # No active conditioning (no prompts, or all-zero weights) => no guidance.
         if not self._model_stats:
             return torch.zeros_like(x)
@@ -559,7 +631,13 @@ class Sampler:
             return guidance_cache["grad"]
         with torch.enable_grad():
             x_is_nan = False
-            x = x.detach().requires_grad_()
+            if precomputed_out is None:
+                x = x.detach().requires_grad_()  # build our own graph for the guidance
+            else:
+                # x already requires grad (from ddim_sample_with_grad); re-detaching here
+                # would sever precomputed_out from it. The cut schedule indexes by the
+                # rescaled timestep, which the no-grad path receives pre-scaled — match it.
+                t = diffusion._scale_timesteps(t)
             n = x.shape[0]
             if secondary_model is not None:
                 alpha = torch.tensor(
@@ -579,10 +657,13 @@ class Sampler:
                 x_in = out * fac + x * (1 - fac)
                 x_in_grad = torch.zeros_like(x_in)
             else:
-                my_t = torch.ones([n], device=device, dtype=torch.long) * cur_t[0]
-                out = diffusion.p_mean_variance(
-                    self.session.model, x, my_t, clip_denoised=False, model_kwargs={"y": y}
-                )
+                if precomputed_out is not None:
+                    out = precomputed_out  # reuse the loop's grad-enabled forward
+                else:
+                    my_t = torch.ones([n], device=device, dtype=torch.long) * cur_t[0]
+                    out = diffusion.p_mean_variance(
+                        self.session.model, x, my_t, clip_denoised=False, model_kwargs={}
+                    )
                 fac = diffusion.sqrt_one_minus_alphas_cumprod[cur_t[0]]
                 x_in = out["pred_xstart"] * fac + x * (1 - fac)
                 x_in_grad = torch.zeros_like(x_in)

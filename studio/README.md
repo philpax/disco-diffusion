@@ -11,15 +11,42 @@ the image respond.
 
 ## What you can do
 
+The layout is an **image canvas** (top-left) over a **bottom panel** (transport, history,
+paint tools, prompts), with a full-height **right sidebar** of settings. Drag the divider
+between them to resize the sidebar; the canvas auto-fits the available space.
+
 - **Play / Pause / Stop** the diffusion loop (Space toggles play/pause); a step counter shows
-  progress.
-- **Prompts**: add/remove rows, each with a live **weight slider (0–2)**. Text applies on
-  Enter *or* when you click away; an amber `edited · Enter` badge shows when a box hasn't been
-  applied yet. Each row shows the **normalised %** it actually contributes to guidance.
-- **Steps**: set the total step count (while paused/stopped).
-- **Size**: width/height (snapped to multiples of 64) and a landscape/portrait flip. The
-  canvas (at the chosen size) is shown before you generate, so you can see the aspect — and
-  paint on it — before pressing Play.
+  progress. The **History** scrubber sits directly underneath.
+- **Prompts** (bottom panel): add/remove rows, each with a live **weight slider (0–2)**. Text
+  applies on Enter *or* when you click away; an amber `edited · Enter` badge shows when a box
+  hasn't been applied yet. Each row shows the **normalised %** it contributes to guidance.
+- **Sidebar — Settings / Current tabs**: *Settings* holds every knob (below); *Current* is a
+  read-only readout of the settings the run is actually using — live knobs update as you drag
+  them, per-run values show what the active run was started with (or what the next Play will
+  use when stopped).
+- **Settings — output**: total **steps**, **width/height** (snapped to multiples of 64),
+  **Apply size**, and a landscape/portrait **flip**. The canvas (at the chosen size) is shown
+  before you generate, so you can see the aspect — and paint on it — before pressing Play.
+- **Settings — guidance (live)**: sliders for `clip_guidance_scale`, `tv_scale` (smoothing),
+  `range_scale`, `sat_scale`, `clamp_max`, and `cutn_batches`. These are read **every step**,
+  so dragging one retunes the run on the next step (no restart) — and seeds the next run when
+  stopped. Higher CLIP guidance = stronger prompt adherence; TV/range/sat are the regularisers
+  that keep detail from turning to mush.
+- **Settings — per-run (presets, eta/Perlin, cut schedules)**: one-click **full-recipe
+  presets** (`Default`, `2022 sauce`) that set *everything* at once; `eta` (DDIM stochasticity,
+  0 = deterministic) and a **Perlin init** toggle (seed from Perlin noise instead of flat
+  gaussian); and raw schedule strings for `cut_overview` / `cut_innercut` / `cut_ic_pow` /
+  `cut_icgray_p` (e.g. `[12]*400+[4]*600`). These are snapshotted when a run starts, so they
+  **apply on the next Play**. Schedule edits are validated (and must cover the 1000-step
+  timeline) — a malformed or too-short schedule is rejected and the previous value kept.
+  `cut_ic_pow` is the detail knob (higher = more fine texture); overview vs inner cuts trade
+  global composition for local detail across the run.
+- **Settings — models**: toggle the **CLIP model set** (add ViT-L/14, RN50x4, …) and the
+  **secondary model**. Changing the set **auto-reloads** — the session rebuilds (loads weights,
+  ~a minute; longer if a model still needs downloading) on a **background thread** shortly
+  after you stop changing things, so rapid toggling doesn't reload repeatedly; reverting to the
+  loaded set cancels the queued reload. More/larger CLIP models = stronger guidance at a real
+  speed cost.
 - **Canvas navigation**: the window is a viewport onto the canvas. **Hold the right mouse
   button** to navigate — drag to pan, scroll to zoom toward the cursor; release to go back to
   drawing. **F** fits the canvas to the window, **0** is 100%. A help line in the canvas
@@ -62,6 +89,15 @@ uv run disco-studio
 
 Options: `disco-studio --help` (`--steps`, `--width`, `--height`, `--compile`, `--cpu`,
 `--models-dir`, `--out`). Paths default to the repo-root `models/` and `images_out/`.
+
+`torch.compile` is **off by default**. It's worth enabling (`--compile`) on a GPU with free
+VRAM headroom or for smaller/lighter runs (~1.4× faster steps, with a one-time ~60s warmup per
+size, cached on disk). It's **robust** — compile-time errors and OOM fall back to eager rather
+than crashing — but it's off by default because the heavy multi-CLIP presets at large sizes
+need ~21 GB *to compile* (a transient warmup spike; steady state fits in ~15 GB), which can
+exceed the free memory on a shared desktop GPU. Eager already runs the `2022 sauce` preset at
+1280×768 in ~1.5 min on a 5090 (thanks to the single-forward guidance path), so compile isn't
+needed there.
 
 ## Layout
 

@@ -1,43 +1,63 @@
-"""Brushes, a colour palette, and a paintable RGBA layer.
+"""Brushes and the paint subsystem: a paintable RGBA layer + the stroke lifecycle.
 
-The :class:`PaintLayer` is a generation-resolution RGBA buffer the user paints into. The app
-shows it as an overlay on the image and hands snapshots to the worker, which injects them into
-the diffusion latent (see ``disco_diffusion.Sampler.paint``).
+The :class:`PaintLayer` is a generation-resolution RGBA buffer the user paints into.
+:class:`PaintController` drives the stroke lifecycle — paint into the layer, flush a finished
+stroke to the worker as one batch (its own checkpoint), and keep it on-screen as a pending overlay
+until a baked frame incorporates it (see ``disco_diffusion.Sampler.paint``). The app keeps the
+brush *parameters* (size / strength / colour / kind / noise) and passes them in as a :class:`Brush`.
 """
 
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 import numpy as np
 import pygame
 
+from .constants import BRUSH_SIZE_MAX, BRUSH_SIZE_MIN, BRUSH_STRENGTH_MAX, BRUSH_STRENGTH_MIN
+
+if TYPE_CHECKING:
+    from .worker import GenerationWorker
+
 # Brush kinds (in display order). Selected by name.
 BRUSHES = ["Soft", "Hard", "Spray"]
 
-# A compact, friendly palette (RGB 0-255).
-PALETTE: list[tuple[int, int, int]] = [
-    (0, 0, 0),
-    (255, 255, 255),
-    (127, 127, 127),
-    (214, 69, 65),
-    (232, 131, 58),
-    (241, 196, 15),
-    (46, 204, 113),
-    (52, 152, 219),
-    (108, 124, 255),
-    (155, 89, 182),
-    (236, 112, 180),
-    (245, 222, 179),
-]
+# Noise-mode injection shaping: for noise-mode pixels the *injected* mask is gamma-shaped to
+# `NOISE_MAX_INJECT * opacity**gamma`, while the on-screen overlay stays at the raw opacity.
+NOISE_MAX_INJECT = 0.2
+NOISE_OPACITY_GAMMA = 2.0
+
+
+@dataclass
+class Brush:
+    """The mutable brush state: kind, size (radius px), opacity, colour, and noise mode.
+
+    Passed to :class:`PaintController` to paint a stroke; the size/opacity nudges clamp to the
+    slider bounds. ``color`` is shared with the palette (swatch / picker selections set it here).
+    """
+
+    type: str = "Soft"
+    size: float = 48.0
+    strength: float = 0.7
+    color: tuple[int, int, int] = (255, 255, 255)
+    noise: bool = False  # paint fresh tinted noise (new structure) vs plain colour
+
+    def nudge_size(self, factor: float) -> None:
+        """Scale the radius by ``factor``, clamped to the brush-size bounds."""
+        self.size = max(BRUSH_SIZE_MIN, min(BRUSH_SIZE_MAX, self.size * factor))
+
+    def nudge_strength(self, delta: float) -> None:
+        """Shift the opacity by ``delta``, clamped to the brush-strength bounds."""
+        self.strength = max(BRUSH_STRENGTH_MIN, min(BRUSH_STRENGTH_MAX, self.strength + delta))
 
 
 class PaintLayer:
     """A generation-resolution RGBA buffer with brush stamping.
 
     ``rgb`` is ``(H, W, 3)`` in ``[0, 1]`` and ``alpha`` is ``(H, W)`` in ``[0, 1]``.
-    ``dirty`` marks strokes not yet handed to the worker; ``_surf_dirty`` caches the
-    overlay surface.
+    ``_surf_dirty`` caches the overlay surface.
     """
 
     def __init__(self, width: int, height: int) -> None:
@@ -46,7 +66,6 @@ class PaintLayer:
         self.rgb = np.zeros((height, width, 3), dtype=np.float32)
         self.alpha = np.zeros((height, width), dtype=np.float32)
         self.tint = np.zeros((height, width), dtype=np.float32)  # per-pixel tinted-noise amount
-        self.dirty = False  # new strokes awaiting hand-off to the worker
         self._nonempty = False
         self._surf_dirty = True
         self._surface: pygame.Surface | None = None
@@ -61,7 +80,6 @@ class PaintLayer:
         self.alpha.fill(0.0)
         self.tint.fill(0.0)
         self._nonempty = False
-        self.dirty = False
         self._surf_dirty = True
 
     def stamp(
@@ -107,7 +125,6 @@ class PaintLayer:
         sub_t = self.tint[y0:y1, x0:x1]
         self.tint[y0:y1, x0:x1] = float(tint) * a + sub_t * (1.0 - a)
         self._nonempty = True
-        self.dirty = True
         self._surf_dirty = True
 
     def stroke(
@@ -149,3 +166,85 @@ class PaintLayer:
             self._surface = surf
             self._surf_dirty = False
         return self._surface
+
+
+@dataclass
+class PaintController:
+    """The active paint layer plus the stroke lifecycle (paint -> flush to worker -> overlay)."""
+
+    layer: PaintLayer
+    pending_overlays: list[tuple[pygame.Surface, int]] = field(default_factory=list)
+    submitted: int = 0  # mirrors the worker's paint_applied_count target for the last flush
+    last_gen: tuple[float, float] | None = None  # previous canvas point in the current stroke
+    painting: bool = False
+
+    @classmethod
+    def for_canvas(cls, width: int, height: int) -> PaintController:
+        return cls(layer=PaintLayer(width, height))
+
+    def resize(self, width: int, height: int) -> None:
+        """Rebuild the (generation-resolution) layer for a new canvas size; drop stale overlays."""
+        self.layer = PaintLayer(width, height)
+        self.reset_overlays()
+
+    def reset_overlays(self, submitted: int = 0) -> None:
+        """Drop pending overlays and re-baseline the submit counter (fresh run / after a revert)."""
+        self.pending_overlays = []
+        self.submitted = submitted
+
+    def begin(self) -> None:
+        """Start a stroke (left mouse-down on the canvas)."""
+        self.painting = True
+        self.last_gen = None
+
+    def end(self) -> None:
+        """End a stroke (mouse-up); the caller flushes it."""
+        self.painting = False
+        self.last_gen = None
+
+    def paint_to(self, gen: tuple[float, float], brush: Brush) -> None:
+        """Stamp (or stroke from the last point) the brush into the layer at canvas coords."""
+        c = brush.color
+        color01 = (c[0] / 255.0, c[1] / 255.0, c[2] / 255.0)
+        tint = 1.0 if brush.noise else 0.0
+        if self.last_gen is None:
+            self.layer.stamp(gen[0], gen[1], brush.size, color01, brush.strength, brush.type, tint)
+        else:
+            self.layer.stroke(
+                self.last_gen, gen, brush.size, color01, brush.strength, brush.type, tint
+            )
+        self.last_gen = gen
+
+    def flush(self, worker: GenerationWorker | None, brush: Brush) -> None:
+        """Hand the just-finished stroke to the worker as one batch (its own checkpoint).
+
+        The stroke stays on screen as a pending overlay until a baked frame incorporates it (the
+        injecting step takes seconds), then clears. Each stroke gets its own batch, so painting
+        with different settings yields separate history entries rather than merging.
+        """
+        layer = self.layer
+        if layer.empty():
+            return
+        if worker is None or not worker.is_alive():
+            return  # no run yet: keep the stroke on the active overlay; the next run flushes it
+        rgb, alpha, tint = layer.snapshot()
+        # Gamma-shape the *injected* mask for noise-mode pixels (tint/alpha = how much of the
+        # pixel is noise-mode), keeping the on-screen overlay at the raw opacity.
+        frac_noise = np.divide(tint, alpha, out=np.zeros_like(tint), where=alpha > 1e-6)
+        shaped = NOISE_MAX_INJECT * alpha**NOISE_OPACITY_GAMMA
+        alpha = alpha * (1.0 - frac_noise) + shaped * frac_noise
+        label = f"paint {brush.type.lower()} {int(brush.size)}px"
+        # Keep `submitted` monotonic even if a frame's count overtook our last target (e.g. after
+        # a revert reset it), so an overlay clears only once its own batch has been applied.
+        self.submitted = max(self.submitted, worker.paint_applied_count) + 1
+        worker.set_paint(rgb, alpha, tint, label)
+        self.pending_overlays.append((layer.to_surface().copy(), self.submitted))
+        layer.clear()  # next stroke starts fresh; the overlay copy keeps this one visible
+
+    def sync(self, worker: GenerationWorker | None) -> None:
+        """Drop pending stroke overlays once a baked frame has incorporated them."""
+        if worker is None or not self.pending_overlays:
+            return
+        frame = worker.latest_frame()
+        if frame is not None:
+            self.pending_overlays = [o for o in self.pending_overlays if o[1] > frame.paint_applied]

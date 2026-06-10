@@ -69,6 +69,7 @@ THEME: dict[str, Any] = {
     "#step_label": {
         "colours": {"normal_text": "#ffffff"},
         "font": {"name": "noto_sans", "size": "15", "bold": "1"},
+        "misc": {"text_horiz_alignment": "left"},
     },
     "#section_label": {
         "colours": {"normal_text": "#8b93a3"},
@@ -78,7 +79,10 @@ THEME: dict[str, Any] = {
         "colours": {"normal_text": "#6f7787"},
         "font": {"name": "noto_sans", "size": "12"},
     },
-    "#status_label": {"colours": {"normal_text": "#9aa3b2"}},
+    "#status_label": {
+        "colours": {"normal_text": "#9aa3b2"},
+        "misc": {"text_horiz_alignment": "right"},
+    },
     "#play_button": {
         "colours": {
             "normal_bg": ACCENT,

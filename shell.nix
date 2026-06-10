@@ -12,13 +12,13 @@ let
     gtk3
     pango
     cairo
-    xorg.libX11
-    xorg.libXcomposite
-    xorg.libXdamage
-    xorg.libXext
-    xorg.libXfixes
-    xorg.libXrandr
-    xorg.libxcb
+    libx11
+    libxcomposite
+    libxdamage
+    libxext
+    libxfixes
+    libxrandr
+    libxcb
     mesa
     libgbm
     libGL
@@ -27,12 +27,13 @@ let
     alsa-lib
     at-spi2-atk
     at-spi2-core
-    xorg.libxshmfence
+    libxshmfence
   ];
 in
 pkgs.mkShell {
   nativeBuildInputs = with pkgs; [
     pkg-config
+    zenity  # native file dialogs for the studio (crossfiledialog drives it on Linux)
   ];
 
   buildInputs = electronDeps;

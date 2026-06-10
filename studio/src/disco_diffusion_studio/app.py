@@ -22,132 +22,192 @@ import argparse
 import io
 import json
 import logging
-import math
 import os
+import random
 import threading
-from dataclasses import dataclass, field
-from datetime import datetime
+import zipfile
+from dataclasses import InitVar, dataclass, field
 from pathlib import Path
 
-import numpy as np
 import pygame
 import pygame_gui
-from disco_diffusion import DiscoSession, EncodedPrompt, RunConfig
-from pygame_gui.core import ObjectID
-from pygame_gui.windows import UIFileDialog
+from disco_diffusion import DiscoSession, RunConfig
+from PIL import Image
+from pygame_gui.windows import UIColourPickerDialog, UIConfirmationDialog, UIMessageWindow
 
+from . import native_dialog
+from .constants import (
+    APP_TITLE,
+)
+from .controls import PromptRow
+from .generation import Generation
+from .history import History
 from .layout import (
-    CTRL_H,
     DEFAULT_H,
     DEFAULT_W,
-    LABEL_H,
-    MARGIN,
+    DIVIDER_W,
     MIN_IMAGE_H,
+    MIN_LEFT_PANEL_W,
     MIN_WINDOW_W,
-    PAD,
     PANEL_H,
-    PROMPT_LIST_H,
-    ROW_PITCH,
-    Row,
-    Stack,
+    PANEL_MIN,
+    SIDEBAR_W_DEFAULT,
+    Layout,
     snap_side,
 )
-from .paint import BRUSHES, PALETTE, PaintLayer
+from .loading import LoadingState, loading_screen
+from .models import Models
+from .paint import Brush
+from .palette import Palette
+from .recipe import Recipe
+from .session_io import SessionIO
+from .signals import Signals
+from .state import PaintState, SharedState
 from .theme import (
     DIVIDER,
     IMAGE_BG,
-    MUTED_COLOR,
     PANEL_BG,
-    PENDING_COLOR,
-    READOUT_COLOR,
     THEME,
     WINDOW_BG,
 )
-from .worker import GenerationWorker, HistoryEntry
+from .ui import events
+from .ui.bottom_bar import BottomBar
+from .ui.canvas import Canvas
+from .ui.sidebar import Sidebar
+from .util import surface_to_pil
+from .worker import PromptSpec
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger("disco_diffusion_studio")
 
-MIN_ZOOM, MAX_ZOOM = 0.1, 16.0  # view zoom bounds
-# Help HUD text per interaction mode (hold right mouse = navigate, release = draw).
-DRAW_HELP = (
-    "left-drag: paint · scroll: size · shift+scroll: opacity · hold right: pan/zoom"
-    " · F: fit · space: play/pause"
-)
-NAV_HELP = "right-drag: pan · scroll: zoom · release right: draw · F: fit · space: play/pause"
-CANVAS_EMPTY_BG = (18, 20, 26)  # placeholder canvas fill shown before the first frame
-CANVAS_BORDER = (70, 78, 92)
-# Noise-mode re-rolls the patch from fresh noise, which is potent, so its opacity is mapped
-# through a gamma curve into a capped injection range: gentle at the low end, and bounded at
-# the top so even a full-opacity stroke re-rolls a controlled fraction rather than wiping the
-# region. injection = NOISE_MAX_INJECT * opacity**gamma. Overlay stays at the raw opacity.
-NOISE_MAX_INJECT = 0.2
-NOISE_OPACITY_GAMMA = 2.0
+# Tuning constants (APP_TITLE, BRUSH_*, STEP_*, *_HELP, CANVAS_*, *_MS) live in .constants.
+
+
+# Preset / PresetConfig and their loading/saving live in .presets (TOML on disk); the advanced-
+# control tables (LIVE_SCALES / SCHEDULES / CURRENT_PERRUN) + PromptRow live in .controls.
+
+
+def compute_window_size(width: int, height: int, sidebar_w: int, panel_h: int) -> tuple[int, int]:
+    """The initial window size: the canvas fitted into the image area, plus the chrome.
+
+    Seeded once from the desktop size (the window is user-resizable thereafter). Shared by the
+    startup loading screen (``main``) and ``App.__post_init__`` so both open at the same size.
+    """
+    chrome_w = sidebar_w + DIVIDER_W  # width taken by the sidebar + its divider
+    try:
+        sizes = pygame.display.get_desktop_sizes()
+        desk_w, desk_h = sizes[0] if sizes and sizes[0][0] > 0 else (1920, 1080)
+    except (pygame.error, IndexError):  # headless / older pygame
+        desk_w, desk_h = 1920, 1080
+    avail_w = max(320, int(desk_w * 0.9) - chrome_w)
+    avail_h = max(240, int(desk_h * 0.9) - panel_h)
+    # Fit the canvas into the available image area, never upscaling past 1:1.
+    scale = min(avail_w / width, avail_h / height, 1.0)
+    img_w, img_h = int(width * scale), int(height * scale)
+    # The left column is at least MIN_LEFT_PANEL_W wide; the sidebar always gets its full width on
+    # top of that, so the chrome never squeezes either below its minimum.
+    return max(MIN_LEFT_PANEL_W, img_w) + chrome_w, max(MIN_IMAGE_H, img_h) + panel_h
 
 
 # --- app ---------------------------------------------------------------------
 
 
 @dataclass
-class PromptRow:
-    text: str = ""
-    weight: float = 1.0
-
-
-@dataclass
 class App:
-    session: DiscoSession
+    # Construction inputs (InitVar: passed to __post_init__ to seed SharedState, not kept on App).
+    session: InitVar[DiscoSession]
     out_dir: Path
+    width: InitVar[int] = DEFAULT_W
+    height: InitVar[int] = DEFAULT_H
+    steps: InitVar[int] = 100
+    prompts: InitVar[list[PromptRow] | None] = None
 
-    width: int = DEFAULT_W
-    height: int = DEFAULT_H
-    steps: int = 100
-    prompts: list[PromptRow] = field(default_factory=list)
-
-    worker: GenerationWorker | None = None
-    paused: bool = False
-    _frame_surface: pygame.Surface | None = None
-    _frame_key: tuple[int, int] | None = None  # (id(array), index) to detect new frames
     _pending_size: tuple[int, int] | None = None  # coalesced window resize, applied per frame
-    _file_dialog: UIFileDialog | None = None  # open Save dialog, if any
-    _save_surface: pygame.Surface | None = None  # frame frozen when Save was clicked
 
-    # painting tools
-    brush_type: str = "Soft"
-    brush_size: float = 48.0  # radius in generation pixels
-    brush_strength: float = 0.7
-    noise_mode: bool = False  # paint fresh tinted noise (new structure) vs plain colour
+    # The App is a coordinator over its pieces. The screen areas (ui/) own their own widgets +
+    # build + event handling; the rest are the value objects / services. field(init=False) keeps
+    # the late-bound ones (built in __post_init__/_build_ui) out of the constructor.
+    state: SharedState = field(init=False)  # the working session model the pieces read + mutate
+    paint: PaintState = field(init=False)  # painting tools: live brush settings + colour palette
+    manager: pygame_gui.UIManager = field(init=False)
+    screen: pygame.Surface = field(init=False)
+    layout: Layout = field(init=False)  # window geometry (split + divider positions)
+    canvas: Canvas = field(init=False)  # image area: view transform + paint layer + frame
+    sidebar: Sidebar = field(init=False)  # right sidebar: Settings/Current tabs + their widgets
+    bottom_bar: BottomBar = field(init=False)  # transport / history / paint tools / prompts
+    session_io: SessionIO = field(init=False)  # save/load the working state as a .zip
+    history: History = field(init=False)  # checkpoints / preview scrubbing / undo / revert
+    generation: Generation = field(init=False)  # run lifecycle: start/stop/size/steps/seed/save
+    models: Models = field(init=False)  # staged CLIP/secondary set + debounced weight reload
+    recipe: Recipe = field(init=False)  # presets: capture/apply/save + the dropdown selection
 
-    def __post_init__(self) -> None:
-        self.width = snap_side(self.width)
-        self.height = snap_side(self.height)
-        if not self.prompts:
-            self.prompts = [PromptRow("a vast alien landscape, oil painting", 1.0)]
-        self._encode_cache: dict[str, EncodedPrompt] = {}
-        self._cache_lock = threading.Lock()
-        # The window size is independent of the generation size: it's seeded from the
-        # initial dimensions, then owned by the user (resizable). The image is letterboxed
-        # into the image region, so flipping orientation never changes the window.
-        self.win_w = max(self.width, MIN_WINDOW_W)
-        self.win_h = max(self.height, MIN_IMAGE_H) + PANEL_H
-        self.screen = pygame.display.set_mode((self.win_w, self.win_h), pygame.RESIZABLE)
-        pygame.display.set_caption("Disco Diffusion - interactive")
+    def __post_init__(
+        self,
+        session: DiscoSession,
+        width: int,
+        height: int,
+        steps: int,
+        prompts: list[PromptRow] | None,
+    ) -> None:
+        # Painting tools (the live brush + colour palette; brush.color is seeded from the palette).
+        palette = Palette.load()
+        self.paint = PaintState(brush=Brush(color=palette.default_brush()), palette=palette)
+        # The working session model the pieces share (session / worker / geometry / prompts /
+        # timeline / init image / encode cache). Output size is snapped to a multiple of 64.
+        self.state = SharedState(
+            session=session,
+            width=snap_side(width),
+            height=snap_side(height),
+            steps=steps,
+            prompts=prompts or [PromptRow("a vast alien landscape, oil painting", 1.0)],
+            seed_text=str(random.randrange(2**31)),
+            clip_selected=set(session.config.clip_models),
+            secondary_on=session.config.use_secondary_model,
+        )
+        # The UI event bus: controllers announce status messages / enablement-invalidation through
+        # it instead of reaching back into the bottom bar + sidebar. Listeners are wired below,
+        # once those areas exist (see _resync_enabled / bottom_bar.set_status).
+        self.signals = Signals()
+        # The window size is independent of the generation size: it's seeded once, then owned
+        # by the user (resizable). Seed it so the image region — the window minus the sidebar
+        # and the bottom panel — matches the canvas aspect, so the canvas fills it with minimal
+        # letterboxing, and so the whole thing fits on the desktop. (On a tiling WM the size is
+        # overridden anyway; the image is letterboxed into the region, so a flip never resizes.)
+        sidebar_w = SIDEBAR_W_DEFAULT
+        # Bottom-panel height — seeded to its natural default, then user-owned (draggable via a
+        # horizontal divider, clamped to [PANEL_MIN, win_h - MIN_IMAGE_H]).
+        panel_h = PANEL_H
+        # If a window already exists — the startup loading screen creates it at this exact size
+        # (see main()) — adopt it as-is, so we don't re-issue a SetWindowSize that a tiling WM
+        # would fight, and so there's no visible resize after the models finish loading. Only
+        # create the window here when constructed standalone (no loading screen, e.g. tests).
+        existing = pygame.display.get_surface()
+        if existing is not None:
+            self.screen = existing
+            win_w, win_h = existing.get_size()
+        else:
+            win_w, win_h = compute_window_size(
+                self.state.width, self.state.height, sidebar_w, panel_h
+            )
+            self.screen = pygame.display.set_mode((win_w, win_h), pygame.RESIZABLE)
+        self.layout = Layout(win_w, win_h, sidebar_w, panel_h)
+        pygame.display.set_caption(APP_TITLE)
         # Enforce the minimum size natively (SDL) instead of by re-calling set_mode on
         # resize. Re-calling set_mode issues a SetWindowSize that a tiling WM treats as the
         # app demanding geometry, snapping a floated window back under tiling. With a native
         # minimum we just adopt whatever size the window becomes and never fight the WM.
         try:
             window = pygame.Window.from_display_module()
-            window.minimum_size = (MIN_WINDOW_W, MIN_IMAGE_H + PANEL_H)
+            window.minimum_size = (MIN_WINDOW_W, MIN_IMAGE_H + PANEL_MIN)
         except (AttributeError, pygame.error):  # older pygame / headless: best-effort only
             pass
-        self.manager = pygame_gui.UIManager((self.win_w, self.win_h))
+        self.manager = pygame_gui.UIManager((win_w, win_h))
         self.manager.get_theme().load_theme(io.StringIO(json.dumps(THEME)))
-        # element-reference tables, rebuilt by _build_ui
-        self._row_elements: list[pygame_gui.core.UIElement] = []
-        self._remove_buttons: dict[pygame_gui.elements.UIButton, int] = {}
-        self._prompt_entries: dict[pygame_gui.elements.UITextEntryLine, int] = {}
-        self._weight_sliders: dict[pygame_gui.elements.UIHorizontalSlider, int] = {}
+        # The bottom panel (transport / history / paint tools / prompts) owns its widgets, built
+        # in _build_ui. The Sidebar (right column) does likewise; the App coordinates the two. Both
+        # take their stable infra + shared state up front; siblings/glue come via app per-method.
+        infra = (self.manager, self.layout, self.signals, self.state, self.paint)
+        self.bottom_bar = BottomBar(*infra)
         # The prompt entry that last held keyboard focus, so we can auto-apply its text
         # when focus moves away (no need to press Enter).
         self._focused_entry: pygame_gui.elements.UITextEntryLine | None = None
@@ -155,114 +215,71 @@ class App:
         # the prompt boxes; without this, typing a value and clicking away wouldn't apply it).
         self._steps_focused = False
 
-        # Painting state. The paint layer is generation-resolution and persists across runs
-        # (re-created only on a size change); strokes are injected into the latent by the
-        # worker and the overlay clears once a step has baked them.
-        self.brush_color: tuple[int, int, int] = PALETTE[3]
-        self._paint_layer = PaintLayer(self.width, self.height)
-        self._mouse_pos: tuple[int, int] = (0, 0)
-        self._painting = False
-        self._last_gen: tuple[float, float] | None = None
-        self._paint_awaiting_bake = False
-        self._paint_baseline = 0
-        self._brush_buttons: dict[pygame_gui.elements.UIButton, str] = {}
-        self._swatch_rects: list[tuple[pygame.Rect, tuple[int, int, int]]] = []
-        self._color_preview_rect = pygame.Rect(0, 0, 0, 0)
-        self._list_inner_w = 0  # row width inside the prompt list (set in _build_ui)
+        # Right-hand sidebar: owns its widgets (Settings/Current tabs + controls), built in
+        # _build_ui. The coalesced "rebuild after a resize" flag is applied once per frame in
+        # run(); its width is on self.layout.
+        self.sidebar = Sidebar(*infra)
+        self._dragging_divider = False
+        self._sidebar_dirty = False
+        # Horizontal divider between the image area and the bottom panel (drag to resize the
+        # panel). Like the sidebar divider, the rebuild is coalesced to one per frame.
+        self._dragging_panel = False
+        self._panel_dirty = False
+        # The schedule box that last held focus, so its text is committed on blur (like steps).
+        self._focused_schedule: pygame_gui.elements.UITextEntryLine | None = None
 
-        # View transform: the canvas is decoupled from the window, which is just a viewport
-        # onto it. zoom = screen px per canvas px; pan = screen pos of canvas pixel (0, 0).
-        self._zoom = 1.0
-        self._pan = pygame.Vector2(0, 0)
+        # Model selection (staged CLIP set + secondary) and the debounced background weight
+        # reload — changing the model set rebuilds the session off-thread (see models.py).
+        self.models = Models(self, self.signals, self.state)
+        self.session_io = SessionIO(
+            self, self.signals, self.state
+        )  # save/load the working state as a .zip
+        # The run lifecycle: start/stop/pause, output size + steps, seed, save (see generation.py).
+        # It also holds the "Current" tab's per-run snapshot (read straight from session.config for
+        # live knobs).
+        self.generation = Generation(self, self.signals, self.state, self.paint)
+        # Presets / recipes (TOML on disk): capture/apply the full guidance recipe, the dropdown
+        # selection, the "Custom" flip on edits, and the save-as modal (see recipe.py).
+        self.recipe = Recipe(self, self.signals, self.state)
+
+        # "Reset canvas" confirmation (discards the rendered frame so the init preview shows).
+        self._confirm_dialog: UIConfirmationDialog | None = None
+        # Transient error/notice modal (e.g. loading a session via the init button, or vice versa).
+        self._message_window: UIMessageWindow | None = None
+        # The arbitrary-RGB colour picker dialog (None when closed).
+        self._colour_picker: UIColourPickerDialog | None = None
+
+        # The Canvas owns the image area: the view transform (zoom/pan), the paint controller
+        # (active stroke + overlays), and the latest rendered frame surface.
+        self.canvas = Canvas(self.screen, self.layout, self.state, self.paint, self.bottom_bar)
+        self._mouse_pos: tuple[int, int] = (0, 0)
         self._panning = False
         self._navigating = False  # right mouse held: canvas-navigation mode (pan + scroll-zoom)
         self._hud_font = pygame.font.SysFont(None, 19)
 
-        # Edit history / revert preview. _preview_index None = showing the live frame; an int
-        # = showing that checkpoint's image (non-destructive) until Revert commits it.
-        self._history: list[HistoryEntry] = []
-        self._hist_len = 0
-        self._preview_index: int | None = None
-        self._preview_prompts: list[PromptRow] | None = None  # prompts shown while previewing
-        self._preview_surface: pygame.Surface | None = None
-        self._preview_key: int | None = None
-        self._history_slider_rect = pygame.Rect(0, 0, 10, 10)
+        # The History controller drives the edit timeline (state.timeline): checkpoint requests,
+        # preview scrubbing, undo, revert, and the per-frame sync (see history.py).
+        self.history = History(self, self.signals, self.state)
+        # Fit the canvas to the available area once the real window size is settled. The window
+        # manager may resize the window right after it opens (firing a VIDEORESIZE that only
+        # re-clamps), so the fit happens on the first run-loop frame, not here — by then any
+        # startup resize has landed. (_zoom/_pan keep their defaults above until then.)
+        self._did_initial_fit = False
+        # Wire the event bus now that the bottom bar + sidebar exist: status messages go to the
+        # bottom bar's status line, and an invalidation re-syncs both areas' widget enablement.
+        self.signals.on_status(self.bottom_bar.set_status)
+        self.signals.on_invalidate(self._resync_enabled)
+        self.signals.on_edited(self.recipe.mark_custom)  # editing a knob flips the preset to Custom
         self._build_ui()
-        self._fit_view()
 
     # -- geometry --
-    def _image_area_h(self) -> int:
-        return max(0, self.win_h - PANEL_H)
-
-    def _window_size(self) -> tuple[int, int]:
-        return (self.win_w, self.win_h)
-
-    def _image_region(self) -> pygame.Rect:
-        """The screen area the canvas viewport occupies (above the panel)."""
-        return pygame.Rect(0, 0, self.win_w, self._image_area_h())
-
-    def _canvas_size(self) -> tuple[int, int]:
-        return (self.width, self.height)
-
-    def _canvas_screen_rect(self) -> pygame.Rect:
-        """The canvas bounds in screen coords under the current view transform."""
-        w, h = self._canvas_size()
-        return pygame.Rect(
-            int(self._pan.x), int(self._pan.y), int(w * self._zoom), int(h * self._zoom)
-        )
-
-    def _fit_view(self) -> None:
-        """Reset the view so the whole canvas fits the viewport, centred."""
-        region = self._image_region()
-        w, h = self._canvas_size()
-        self._zoom = min(region.width / w, region.height / h) if w and h else 1.0
-        self._pan = pygame.Vector2(
-            region.x + (region.width - w * self._zoom) / 2,
-            region.y + (region.height - h * self._zoom) / 2,
-        )
-
-    def _zoom_at(self, pos: tuple[int, int], factor: float) -> None:
-        """Multiply the zoom by ``factor``, keeping the canvas point under ``pos`` fixed."""
-        new_zoom = max(MIN_ZOOM, min(MAX_ZOOM, self._zoom * factor))
-        ratio = new_zoom / self._zoom
-        anchor = pygame.Vector2(pos)
-        self._pan = anchor - (anchor - self._pan) * ratio
-        self._zoom = new_zoom
-        self._clamp_pan()
-
-    def _clamp_pan(self) -> None:
-        """Keep the canvas centre within the viewport so the canvas can't be lost off-screen."""
-        region = self._image_region()
-        w, h = self._canvas_size()
-        cw, ch = w * self._zoom, h * self._zoom
-        cx = max(region.left, min(region.right, self._pan.x + cw / 2))
-        cy = max(region.top, min(region.bottom, self._pan.y + ch / 2))
-        self._pan = pygame.Vector2(cx - cw / 2, cy - ch / 2)
-
-    def _screen_to_canvas(self, pos: tuple[int, int]) -> tuple[float, float] | None:
-        """Map a screen position to canvas-pixel coords, or None if outside the canvas."""
-        if not self._image_region().collidepoint(pos):
-            return None
-        cx = (pos[0] - self._pan.x) / self._zoom
-        cy = (pos[1] - self._pan.y) / self._zoom
-        w, h = self._canvas_size()
-        return (cx, cy) if 0 <= cx < w and 0 <= cy < h else None
-
-    def _blit_canvas(self, surf: pygame.Surface) -> None:
-        """Blit only the visible part of a canvas-resolution surface under the view transform."""
-        w, h = surf.get_size()
-        z = self._zoom
-        region = self._image_region()
-        cx0 = max(0, int((region.left - self._pan.x) / z))
-        cy0 = max(0, int((region.top - self._pan.y) / z))
-        cx1 = min(w, math.ceil((region.right - self._pan.x) / z))
-        cy1 = min(h, math.ceil((region.bottom - self._pan.y) / z))
-        if cx1 <= cx0 or cy1 <= cy0:
-            return
-        sub = surf.subsurface(pygame.Rect(cx0, cy0, cx1 - cx0, cy1 - cy0))
-        dest = (max(1, int((cx1 - cx0) * z)), max(1, int((cy1 - cy0) * z)))
-        scaled = pygame.transform.smoothscale(sub, dest)
-        self.screen.blit(scaled, (self._pan.x + cx0 * z, self._pan.y + cy0 * z))
+    # Window geometry lives on self.layout, the canvas transform/paint/frame on self.canvas; call
+    # those directly (e.g. self.layout.image_region(), self.canvas.fit()). Only _set_panel_height
+    # keeps a wrapper, for the coalesced-rebuild dirty flag (its sibling is _set_sidebar_width).
+    def _set_panel_height(self, height: int) -> None:
+        """Set the bottom-panel height (clamped); the rebuild is coalesced to one per frame."""
+        if self.layout.set_panel_height(height):
+            self._panel_dirty = True
 
     def _typing(self) -> bool:
         """True while a text box has keyboard focus (so shortcut keys don't steal input)."""
@@ -271,636 +288,167 @@ class App:
             isinstance(e, pygame_gui.elements.UITextEntryLine) for e in focus
         )
 
-    def _build_palette(self, rect: pygame.Rect) -> None:
-        """Lay out the current-colour preview + swatch rects within ``rect`` (drawn custom)."""
-        self._swatch_rects = []
-        self._color_preview_rect = pygame.Rect(rect.x, rect.y, CTRL_H, CTRL_H)
-        x = rect.x + CTRL_H + 10
-        n = len(PALETTE)
-        gap = 4
-        sw = max(10, min(CTRL_H, (rect.right - x - (n - 1) * gap) // n))
-        y = rect.y + (CTRL_H - sw) // 2
-        for i, color in enumerate(PALETTE):
-            self._swatch_rects.append((pygame.Rect(x + i * (sw + gap), y, sw, sw), color))
+    def _modal_open(self) -> bool:
+        """True while an in-window dialog (RGB picker / save preset / reset confirm) is open.
+
+        Those are ``UIWindow``s pygame_gui draws over the canvas, but our raw mouse/keyboard
+        canvas handling runs regardless — so while one is up we suppress painting, panning,
+        zooming, swatch clicks, shortcuts, and the brush cursor to keep it from leaking through.
+        (The native Save/Open dialogs are separate OS windows that block the loop, so they need
+        no tracking here.)
+        """
+        return self.recipe.save_modal_alive() or any(
+            w is not None and w.alive()
+            for w in (
+                self._colour_picker,
+                self._confirm_dialog,
+                self._message_window,
+            )
+        )
+
+    def _show_message(self, title: str, message: str) -> None:
+        """Pop a small OK-dismissable modal to surface a user error (e.g. wrong load button)."""
+        if self._message_window is not None and self._message_window.alive():
+            self._message_window.kill()
+        rect = self.layout.centered_rect(420, 200)
+        self._message_window = UIMessageWindow(
+            rect, html_message=message, manager=self.manager, window_title=title
+        )
 
     @property
     def running(self) -> bool:
         return (
-            self.worker is not None
-            and self.worker.is_alive()
-            and not self.paused
-            and not self.worker.finished
+            self.state.worker is not None
+            and self.state.worker.is_alive()
+            and not self.state.paused
+            and not self.state.worker.finished
         )
 
     # -- UI construction --
     def _build_ui(self) -> None:
-        win_w, _ = self._window_size()
+        """Rebuild every widget (the bottom panel + sidebar own their own build)."""
+        # Preserve the seed field's contents across the rebuild (the widget is recreated).
+        if hasattr(self.sidebar, "seed_entry"):
+            self.state.seed_text = self.sidebar.seed_text()
         self.manager.clear_and_reset()
-        self._remove_buttons.clear()
-        self._prompt_entries.clear()
-        self._weight_sliders.clear()
-        self._row_elements.clear()
+        self.bottom_bar.forget_prompt_widgets()  # drop refs the manager just destroyed
+        self.bottom_bar.build(self)
+        self.sidebar.build(self)
+        self.signals.invalidate()
 
-        ui = pygame_gui.elements
-        stack = Stack(MARGIN, self._image_area_h() + PAD, win_w - 2 * MARGIN)
+    # -- sessions (full working state) --
+    def _native_path(self, kind: str, title: str) -> str | None:
+        """Open a native file dialog (``kind`` ``"save"``/``"open"``) rooted at ``out_dir``.
 
-        # Row 1: transport — Play / Stop | step counter | (Save, right-aligned)
-        r = stack.row(CTRL_H)
-        self.play_button = ui.UIButton(r.left(110), "Play", self.manager, object_id="#play_button")
-        self.stop_button = ui.UIButton(r.left(90), "Stop", self.manager, object_id="#stop_button")
-        self.save_button = ui.UIButton(r.right(90), "Save", self.manager, object_id="#save_button")
-        self.step_label = ui.UILabel(r.fill(), "step 0 / 0", self.manager, object_id="#step_label")
-
-        # Row 2: steps | width / height / apply / orientation swap
-        r = stack.row(CTRL_H)
-        ui.UILabel(r.left(50), "Steps", self.manager)
-        self.steps_entry = ui.UITextEntryLine(r.left(70), self.manager)
-        self.steps_entry.set_text(str(self.steps))
-        r.left(16)  # spacer
-        ui.UILabel(r.left(24), "W", self.manager)
-        self.width_entry = ui.UITextEntryLine(r.left(70), self.manager)
-        self.width_entry.set_text(str(self.width))
-        ui.UILabel(r.left(24), "H", self.manager)
-        self.height_entry = ui.UITextEntryLine(r.left(70), self.manager)
-        self.height_entry.set_text(str(self.height))
-        self.apply_button = ui.UIButton(r.left(96), "Apply size", self.manager)
-        self.swap_button = ui.UIButton(r.left(96), "Flip W/H", self.manager)
-
-        # Row 3: painting tools — brush kind, size, opacity, palette, clear
-        r = stack.row(CTRL_H)
-        self._brush_buttons = {}
-        for name in BRUSHES:
-            button = ui.UIButton(r.left(64), name, self.manager, object_id="#brush_button")
-            self._brush_buttons[button] = name
-            if name == self.brush_type:
-                button.select()
-        # Toggle: deposit fresh tinted noise (new structure) instead of plain colour.
-        self.noise_button = ui.UIButton(
-            r.left(74), "Noise", self.manager, object_id="#brush_button"
-        )
-        if self.noise_mode:
-            self.noise_button.select()
-        ui.UILabel(r.left(36), "Size", self.manager)
-        self.size_slider = ui.UIHorizontalSlider(
-            r.left(104), self.brush_size, (4.0, 160.0), self.manager
-        )
-        ui.UILabel(r.left(56), "Opacity", self.manager)
-        self.strength_slider = ui.UIHorizontalSlider(
-            r.left(104), self.brush_strength, (0.05, 1.0), self.manager
-        )
-        self.clear_paint_button = ui.UIButton(r.right(64), "Clear", self.manager)
-        self._build_palette(r.fill())  # custom-drawn swatches fill the middle
-
-        # Row 4: history scrubber — drag to preview an earlier checkpoint, then Revert/Cancel.
-        r = stack.row(CTRL_H)
-        ui.UILabel(r.left(54), "History", self.manager)
-        self.cancel_button = ui.UIButton(r.right(70), "Cancel", self.manager)
-        self.revert_button = ui.UIButton(r.right(70), "Revert", self.manager)
-        self.history_label = ui.UILabel(r.right(150), "live", self.manager)
-        self._history_slider_rect = r.fill()
-        n = len(self._history)
-        self.history_slider = ui.UIHorizontalSlider(
-            self._history_slider_rect,
-            start_value=float(self._preview_index if self._preview_index is not None else n),
-            value_range=(0.0, float(max(n, 1))),
-            manager=self.manager,
-        )
-
-        # Row 5: status line (fills the width)
-        self.status_label = ui.UILabel(
-            stack.row(LABEL_H).fill(), "", self.manager, object_id="#status_label"
-        )
-
-        # Row 6: prompt list header + add + hint (hint fills the remaining width)
-        r = stack.row(LABEL_H)
-        ui.UILabel(r.left(90), "PROMPTS", self.manager, object_id="#section_label")
-        self.add_button = ui.UIButton(
-            r.left(120), "+ Add prompt", self.manager, object_id="#add_button"
-        )
-        ui.UILabel(
-            r.fill(),
-            "weight 0-2 applies instantly · text applies on Enter or click-away · % = mix used",
-            self.manager,
-            object_id="#hint_label",
-        )
-
-        # Fixed-height scrolling prompt list (extra rows scroll); keeps the panel compact.
-        list_rect = pygame.Rect(MARGIN, stack.y, win_w - 2 * MARGIN, PROMPT_LIST_H)
-        self.prompt_panel = ui.UIScrollingContainer(list_rect, self.manager)
-        # Lay rows out narrower than the viewport so the vertical scrollbar never forces a
-        # horizontal one (a horizontal bar appears only when content is wider than the view).
-        self._list_inner_w = list_rect.width - 24
-        self._rebuild_prompt_rows()
-        self._sync_enabled()
-
-    def _displayed_prompts(self) -> list[PromptRow]:
-        """The prompts shown in the rows: a previewed checkpoint's, else the live set."""
-        return self._preview_prompts if self._preview_prompts is not None else self.prompts
-
-    def _rebuild_prompt_rows(self) -> None:
-        for el in self._row_elements:
-            el.kill()
-        self._row_elements.clear()
-        self._remove_buttons.clear()
-        self._prompt_entries.clear()
-        self._weight_sliders.clear()
-
-        container = self.prompt_panel
-        inner_w = self._list_inner_w
-        ui = pygame_gui.elements
-        v_pad = (ROW_PITCH - CTRL_H) // 2  # vertically centre widgets in their row pitch
-        prompts = self._displayed_prompts()
-        for i, prompt in enumerate(prompts):
-            # Pack: [text fills] [slider] [weight readout] [X]. Right-side widgets are taken
-            # first so the text entry flexes into whatever width is left.
-            r = Row(0, i * ROW_PITCH + v_pad, inner_w, CTRL_H)
-            remove = ui.UIButton(
-                r.right(30),
-                "×",
-                self.manager,
-                container=container,
-                object_id=ObjectID(object_id="#remove_button", class_id="@remove_button"),
-            )
-            wlabel = ui.UILabel(r.right(104), "", self.manager, container=container)
-            slider = ui.UIHorizontalSlider(
-                r.right(150),
-                start_value=prompt.weight,
-                value_range=(0.0, 2.0),
-                manager=self.manager,
-                container=container,
-            )
-            entry = ui.UITextEntryLine(r.fill(), self.manager, container=container)
-            entry.set_text(prompt.text)
-            self._row_elements += [remove, entry, slider, wlabel]
-            self._remove_buttons[remove] = i
-            self._prompt_entries[entry] = i
-            self._weight_sliders[slider] = i
-            prompt._wlabel = wlabel  # type: ignore[attr-defined]  # stash for live updates
-            prompt._entry = entry  # type: ignore[attr-defined]
-            prompt._label_state = None  # type: ignore[attr-defined]  # last (text, colour) shown
-        container.set_scrollable_area_dimensions((inner_w, max(len(prompts), 1) * ROW_PITCH + 6))
-        self._refresh_rows()
-
-    def _refresh_rows(self) -> None:
-        """Update each row's readout: raw weight + normalised share, or a pending badge.
-
-        Mirrors Sampler.set_conditioning (empty rows ignored; remaining weights normalised
-        to sum to 1, so the % is exactly the mix the guidance uses). A row whose text box
-        differs from the applied prompt shows an amber "edited · Enter" badge instead — this
-        is the live "not yet applied" signal. Labels are only mutated when their state
-        changes, so this is cheap to call every frame.
+        Returns the chosen path, or ``None`` if cancelled or no backend is installed (reported
+        via the status line). Ensures ``out_dir`` exists so the dialog opens there.
         """
-        prompts = self._displayed_prompts()
-        active = [(i, r.weight) for i, r in enumerate(prompts) if r.text.strip()]
-        total = sum(w for _, w in active)
-        shares = {i: w / total for i, w in active} if total > 1e-3 else {}
-        for i, row in enumerate(prompts):
-            wlabel = getattr(row, "_wlabel", None)
-            entry = getattr(row, "_entry", None)
-            if wlabel is None or entry is None:
-                continue
-            if entry.get_text() != row.text:
-                text, colour = "edited · Enter", PENDING_COLOR
-            elif not row.text.strip():
-                text, colour = f"{row.weight:.2f}  empty", MUTED_COLOR
-            elif not shares:
-                text, colour = f"{row.weight:.2f}  off", MUTED_COLOR
-            else:
-                text, colour = f"{row.weight:.2f}  {shares[i] * 100:.0f}%", READOUT_COLOR
-            state = (text, colour)
-            if row._label_state == state:  # type: ignore[attr-defined]
-                continue
-            row._label_state = state  # type: ignore[attr-defined]
-            wlabel.text_colour = pygame.Color(*colour)
-            wlabel.set_text(text)
+        self.out_dir.mkdir(parents=True, exist_ok=True)
+        pick = native_dialog.save_file if kind == "save" else native_dialog.open_file
+        try:
+            return pick(title=title, start_dir=str(self.out_dir))
+        except native_dialog.Unavailable:
+            self.signals.status("No native dialog (install zenity)")
+            return None
 
-    def _sync_enabled(self) -> None:
-        """Total-steps + size boxes are editable only when not actively generating."""
-        editable = not self.running
-        for el in (
-            self.steps_entry,
-            self.width_entry,
-            self.height_entry,
-            self.apply_button,
-            self.swap_button,
-        ):
-            (el.enable if editable else el.disable)()
-        # History controls are usable only while paused/stopped and there's history to scrub.
-        hist_on = editable and len(self._history) > 0
-        for hist_el in (self.history_slider, self.revert_button, self.cancel_button):
-            (hist_el.enable if hist_on else hist_el.disable)()
-        # Prompt rows are read-only while previewing a checkpoint (they show its prompts).
-        prompts_on = self._preview_index is None
-        prompt_widgets = [self.add_button, *self._prompt_entries, *self._weight_sliders]
-        for pw in (*prompt_widgets, *self._remove_buttons):
-            (pw.enable if prompts_on else pw.disable)()
-        self.play_button.set_text("Pause" if self.running else "Play")
-        # Can't resume mid-preview — you must Revert or Cancel first.
-        (self.play_button.disable if self._preview_index is not None else self.play_button.enable)()
+    def _resync_enabled(self) -> None:
+        """Re-sync widget enablement to the run / preview / reload state (the invalidate handler).
 
-    def _status(self, text: str) -> None:
-        self.status_label.set_text(text)
+        Wired to ``signals.invalidate()`` — both areas re-evaluate which widgets are enabled.
+        """
+        self.sidebar.sync_enabled(self)
+        self.bottom_bar.sync_enabled(self)
 
     # -- prompt snapshot --
-    def _prompt_snapshot(self) -> list[tuple[str, float]]:
-        return [(r.text, r.weight) for r in self.prompts]
+    def _prompt_snapshot(self) -> list[PromptSpec]:
+        return [PromptSpec(r.text, r.weight, r.muted) for r in self.state.prompts]
 
     def _push_prompts(self) -> None:
-        if self.worker is not None and self.worker.is_alive():
-            self.worker.set_prompts(self._prompt_snapshot())
+        if self.state.worker is not None and self.state.worker.is_alive():
+            self.state.worker.set_prompts(self._prompt_snapshot())
 
-    def _commit_prompt_entry(self, entry: pygame_gui.elements.UITextEntryLine) -> None:
-        """Apply a prompt text box's contents (on Enter or when focus moves away)."""
-        idx = self._prompt_entries.get(entry)
-        if idx is None or not (0 <= idx < len(self.prompts)):
-            return
-        if entry.get_text() == self.prompts[idx].text:
-            return
-        self.prompts[idx].text = entry.get_text()
-        self._refresh_rows()
-        self._push_prompts()
-        self._request_checkpoint("prompt")
-
-    # -- run lifecycle --
-    def _start_run(self) -> None:
-        # Adopt any step count typed into the box but not yet Enter-applied: clicking Play
-        # moves focus off the box without firing UI_TEXT_ENTRY_FINISHED, so without this the
-        # run would silently use the previous value.
-        self._commit_steps()
-        self._stop_run()
-        self.worker = GenerationWorker(
-            self.session,
-            width=self.width,
-            height=self.height,
-            steps=self.steps,
-            encode_cache=self._encode_cache,
-            cache_lock=self._cache_lock,
-        )
-        self.worker.set_prompts(self._prompt_snapshot())
-        if not self._paint_layer.empty():
-            self._paint_layer.dirty = True  # re-send any standing strokes to the new run
-        self._history = []
-        self._hist_len = 0
-        self._preview_index = None
-        self.paused = False
-        self.worker.start()
-        self._status("Generating…")
-        self._sync_enabled()
-
-    def _stop_run(self) -> None:
-        if self.worker is not None:
-            self.worker.stop()
-            self.worker.join(timeout=5.0)
-        self.worker = None
-        self.paused = False
-        self._history = []
-        self._hist_len = 0
-        self._preview_index = None
-        self._sync_enabled()
-
-    def _toggle_play(self) -> None:
-        if self._preview_index is not None:
-            self._status("Revert or Cancel the history preview before resuming")
-            return
-        if self.worker is None or not self.worker.is_alive() or self.worker.finished:
-            self._start_run()  # finished -> Play starts a fresh run (Revert continues a branch)
-        elif self.paused:
-            self.paused = False
-            self._preview_index = None  # resume from live, drop any history preview
-            self.worker.resume()
-            self._status("Generating…")
-            self._sync_enabled()
-        else:
-            self.paused = True
-            self.worker.pause()
-            self._status("Paused — adjust prompts, steps, or size")
-            self._sync_enabled()
-
-    def _apply_size(self, width: int, height: int) -> None:
-        # Changing the output shape requires a fresh run. The window does NOT change — the
-        # image is letterboxed into the image region — so orientation flips keep proportions.
-        self._stop_run()
-        self.width = snap_side(width)
-        self.height = snap_side(height)
-        self.width_entry.set_text(str(self.width))
-        self.height_entry.set_text(str(self.height))
-        # The paint layer is generation-resolution, so rebuild it for the new size.
-        self._paint_layer = PaintLayer(self.width, self.height)
-        self._paint_awaiting_bake = False
-        # The canvas changed shape: drop the stale frame and refit the view.
-        self._frame_surface = None
-        self._frame_key = None
-        self._fit_view()
-        self._status(f"Size set to {self.width}x{self.height} - press Play")
+    def _set_sidebar_width(self, width: int) -> None:
+        """Set the sidebar width (clamped); the rebuild is coalesced to one per frame."""
+        if self.layout.set_sidebar_width(width):
+            self._sidebar_dirty = True
 
     def _resize_window(self, w: int, h: int) -> None:
         # Adopt the window's actual new size — do NOT call set_mode (that fights tiling WMs;
         # see __post_init__). The SDL surface tracks the resize on its own; we just relay
         # out the UI. The native minimum size (set at startup) keeps it from going too small.
-        if (w, h) == (self.win_w, self.win_h):
+        # Layout.resize clamps the sidebar + bottom panel to fit the new window.
+        if not self.layout.resize(w, h):
             return
-        self.win_w, self.win_h = w, h
         surface = pygame.display.get_surface()
         if surface is not None:
             self.screen = surface
+            self.canvas.screen = surface  # the canvas holds the window surface; keep it current
         self.manager.set_window_resolution((w, h))
         self._build_ui()
-        self._clamp_pan()  # keep the canvas in view after the viewport changed
+        self.canvas.clamp_pan()  # keep the canvas in view after the viewport changed
 
-    def _commit_steps(self) -> None:
-        """Adopt the steps box value (clamped). Safe to call on Enter, on blur, or at Play.
+    # -- init image (img2img) --
+    def _set_init_image(self, image: Image.Image, label: str) -> None:
+        self.state.init.set(image, label, self.state.width, self.state.height)
+        self.sidebar.set_init_status(f"Init: {label}")
+        self.signals.status(f"Init set ({label})")
 
-        Idempotent: re-committing the same value is a no-op, so calling it just before a run
-        starts (to pick up a number typed but not Enter-applied) never disturbs anything.
-        """
+    def _load_init_file(self, path_str: str) -> None:
+        if zipfile.is_zipfile(path_str):  # a session bundle picked via the init-image button
+            self._show_message(
+                "Not an image",
+                f"<b>{Path(path_str).name}</b> looks like a session bundle, not an image."
+                "<br><br>Use the <b>Load…</b> button at the top of the sidebar to open it.",
+            )
+            return
         try:
-            value = clamp_steps(self.steps_entry.get_text())
-        except ValueError:
-            self.steps_entry.set_text(str(self.steps))
+            image = Image.open(path_str).convert("RGB")
+        except Exception as exc:  # noqa: BLE001 - surface the failure instead of crashing
+            log.exception("failed to load init image %s", path_str)
+            self._show_message("Bad image", f"Couldn't load <b>{Path(path_str).name}</b>:<br>{exc}")
             return
-        self.steps_entry.set_text(str(value))
-        if value == self.steps:
-            return
-        changed = value
-        self.steps = value
-        # If a run is paused, changing steps abandons it (respacing is fixed per run).
-        if self.worker is not None and self.worker.is_alive():
-            self._stop_run()
-            self._status(f"Steps set to {changed} — press Play to start fresh")
+        self._set_init_image(image, Path(path_str).name)
 
-    def _open_save_dialog(self) -> None:
-        """Freeze the current frame and open a file dialog to choose where to write it."""
-        if self._frame_surface is None:
-            self._status("Nothing to save yet")
+    def _use_current_as_init(self) -> None:
+        """Seed the next run from whatever is currently on the canvas (live frame or preview)."""
+        surface = self.history.displayed_surface()
+        if surface is None:
+            self.signals.status("No frame")
             return
-        if self._file_dialog is not None and self._file_dialog.alive():
-            return  # a dialog is already open
-        self._save_surface = self._frame_surface.copy()  # freeze; generation may advance
-        self.out_dir.mkdir(parents=True, exist_ok=True)
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        win_w, win_h = self._window_size()
-        rect = pygame.Rect(0, 0, 560, 440)
-        rect.center = (win_w // 2, win_h // 2)
-        self._file_dialog = UIFileDialog(
-            rect,
-            self.manager,
-            window_title="Save image",
-            initial_file_path=str(self.out_dir / f"interactive_{stamp}.png"),
-            allow_existing_files_only=False,
+        self._set_init_image(surface_to_pil(surface), "current result")
+
+    def _clear_init(self) -> None:
+        self.state.init.clear()
+        self.sidebar.set_init_status("Init: none")
+        self.signals.status("Init cleared")
+
+    def _open_init(self) -> None:
+        """Pick an init image via the native Open dialog (blocks while it's open)."""
+        path_str = self._native_path("open", "Open init image")
+        if path_str:
+            self._load_init_file(path_str)
+
+    def _open_reset_confirm(self) -> None:
+        """Confirm before discarding the rendered frame (so the init / empty canvas shows again)."""
+        if self.canvas.frame_surface is None and self.state.worker is None:
+            self.signals.status("Nothing to clear")
+            return
+        if self._confirm_dialog is not None and self._confirm_dialog.alive():
+            return
+        rect = self.layout.centered_rect(360, 200)
+        desc = "Discard the current image and stop the run? The init image (if set) is shown again."
+        self._confirm_dialog = UIConfirmationDialog(
+            rect, desc, self.manager, window_title="Reset canvas", action_short_name="Reset"
         )
 
-    def _write_save(self, path_str: str) -> None:
-        """Write the frozen frame to the path the dialog returned (defaulting to .png)."""
-        if self._save_surface is None:
-            return
-        path = Path(path_str)
-        if path.suffix.lower() not in (".png", ".jpg", ".jpeg", ".bmp", ".tga"):
-            path = path.with_suffix(".png")
-        path.parent.mkdir(parents=True, exist_ok=True)
-        pygame.image.save(self._save_surface, str(path))
-        self._save_surface = None
-        self._status(f"Saved {path}")
-        log.info("saved %s", path)
-
-    # -- history / revert --
-    def _request_checkpoint(self, label: str) -> None:
-        if self.worker is not None and self.worker.is_alive():
-            self.worker.checkpoint(label)
-
-    def _set_history_label(self) -> None:
-        if self._preview_index is not None and self._preview_index < len(self._history):
-            e = self._history[self._preview_index]
-            text = f"{e.label} {e.index}/{e.total}"
-        else:
-            frame = self.worker.latest_frame() if self.worker is not None else None
-            text = f"live {frame.index}/{frame.total}" if frame is not None else "live"
-        if self.history_label.text != text:  # avoid re-rendering when unchanged
-            self.history_label.set_text(text)
-
-    def _sync_preview_prompts(self) -> None:
-        """Show the previewed checkpoint's prompts in the rows (live set when not previewing)."""
-        want: list[tuple[str, float]] | None = None
-        if self._preview_index is not None and self._preview_index < len(self._history):
-            want = self._history[self._preview_index].prompts
-        cur = (
-            [(p.text, p.weight) for p in self._preview_prompts]
-            if self._preview_prompts is not None
-            else None
-        )
-        if (list(want) if want is not None else None) == cur:
-            return  # already showing the right prompts
-        self._preview_prompts = [PromptRow(t, w) for t, w in want] if want is not None else None
-        self._rebuild_prompt_rows()
-        self._sync_enabled()
-
-    def _refresh_preview_state(self) -> None:
-        """Update the prompt rows, label, and Play gating whenever the preview changes."""
-        self._sync_preview_prompts()
-        self._set_history_label()
-        (self.play_button.disable if self._preview_index is not None else self.play_button.enable)()
-
-    def _rebuild_history_slider(self, n: int) -> None:
-        """Recreate the history slider when the number of checkpoints changes."""
-        self.history_slider.kill()
-        start = float(self._preview_index if self._preview_index is not None else n)
-        self.history_slider = pygame_gui.elements.UIHorizontalSlider(
-            self._history_slider_rect,
-            start_value=start,
-            value_range=(0.0, float(max(n, 1))),
-            manager=self.manager,
-        )
-
-    def _sync_history(self) -> None:
-        """Pull the worker's history each frame; rebuild the slider when it changes length."""
-        self._history = self.worker.get_history() if self.worker is not None else []
-        if len(self._history) != self._hist_len:
-            self._hist_len = len(self._history)
-            if self._preview_index is not None and self._preview_index >= self._hist_len:
-                self._preview_index = None
-            self._rebuild_history_slider(self._hist_len)
-            self._sync_enabled()
-        self._set_history_label()  # keep the live step current as it ticks
-
-    def _displayed_surface(self) -> pygame.Surface | None:
-        """The canvas surface to show: a previewed checkpoint, else the live frame."""
-        if self._preview_index is not None and self._preview_index < len(self._history):
-            entry = self._history[self._preview_index]
-            if self._preview_key != id(entry.preview):
-                self._preview_key = id(entry.preview)
-                self._preview_surface = pygame.surfarray.make_surface(entry.preview.swapaxes(0, 1))
-            return self._preview_surface
-        return self._frame_surface
+    def _reset_canvas(self) -> None:
+        """Stop the run and drop the rendered frame, revealing the init preview / empty canvas."""
+        self.generation.stop()  # also clears history / preview index
+        self.canvas.clear_frame()
+        self.bottom_bar.set_step_label("step 0 / 0")
+        self.signals.status("Canvas cleared")
 
     # -- events --
-    def _handle_event(self, event: pygame.event.Event) -> bool:
-        if event.type == pygame.QUIT:
-            return False
-
-        if event.type == pygame.VIDEORESIZE:
-            # Resize events stream while dragging; coalesce to one relayout per frame
-            # (see run()) instead of rebuilding the UI on every event.
-            self._pending_size = (event.w, event.h)
-            return True
-
-        if event.type == pygame.MOUSEMOTION:
-            self._mouse_pos = event.pos
-            if self._panning:
-                self._pan += pygame.Vector2(event.rel)
-                self._clamp_pan()
-            elif self._painting:
-                self._paint_to(event.pos)
-            return True
-        if event.type == pygame.MOUSEBUTTONDOWN:
-            on_canvas = self._image_region().collidepoint(event.pos)
-            if event.button == 3 and on_canvas:  # right held = navigate mode (pan + scroll-zoom)
-                self._navigating = True
-                self._panning = True
-                return True
-            if event.button == 2 and on_canvas:  # middle-drag also pans
-                self._panning = True
-                return True
-            if event.button == 1:  # left-drag on the canvas paints
-                if self._on_swatch(event.pos):
-                    return True
-                # No painting while previewing history — it would be invisible and unapplied.
-                if self._preview_index is None and self._screen_to_canvas(event.pos) is not None:
-                    self._painting = True
-                    self._last_gen = None
-                    self._paint_to(event.pos)
-                return True
-        if event.type == pygame.MOUSEBUTTONUP:
-            if event.button == 1:
-                self._painting = False
-                self._last_gen = None
-            elif event.button == 3:
-                self._navigating = False
-                self._panning = False
-            elif event.button == 2:
-                self._panning = False
-        if event.type == pygame.MOUSEWHEEL and self._image_region().collidepoint(self._mouse_pos):
-            if self._navigating:  # canvas mode: wheel zooms toward the cursor
-                self._zoom_at(self._mouse_pos, 1.15**event.y)
-            elif pygame.key.get_mods() & pygame.KMOD_SHIFT:
-                self.brush_strength = max(0.05, min(1.0, self.brush_strength + event.y * 0.05))
-                self.strength_slider.set_current_value(self.brush_strength)
-            else:
-                self.brush_size = max(4.0, min(160.0, self.brush_size * (1.1**event.y)))
-                self.size_slider.set_current_value(self.brush_size)
-            return True
-        if event.type == pygame.KEYDOWN and not self._typing():
-            if event.key == pygame.K_SPACE:
-                self._toggle_play()
-            elif event.key == pygame.K_f:
-                self._fit_view()
-            elif event.key == pygame.K_0:
-                self._zoom_at(self._image_region().center, 1.0 / self._zoom)
-
-        if event.type == pygame_gui.UI_BUTTON_PRESSED:
-            if event.ui_element == self.play_button:
-                self._toggle_play()
-            elif event.ui_element == self.stop_button:
-                self._stop_run()
-                self._status("Stopped")
-            elif event.ui_element == self.save_button:
-                self._open_save_dialog()
-            elif event.ui_element == self.add_button:
-                self.prompts.append(PromptRow("", 1.0))
-                self._rebuild_prompt_rows()
-                self._push_prompts()
-                self._request_checkpoint("add prompt")
-            elif event.ui_element == self.apply_button:
-                self._apply_size(
-                    int_or(self.width_entry.get_text(), self.width),
-                    int_or(self.height_entry.get_text(), self.height),
-                )
-            elif event.ui_element == self.swap_button:
-                self._apply_size(self.height, self.width)
-            elif event.ui_element in self._remove_buttons:
-                idx = self._remove_buttons[event.ui_element]
-                if 0 <= idx < len(self.prompts):
-                    self.prompts.pop(idx)
-                    self._rebuild_prompt_rows()
-                    self._push_prompts()
-                    self._request_checkpoint("remove prompt")
-            elif event.ui_element in self._brush_buttons:
-                self.brush_type = self._brush_buttons[event.ui_element]
-                for button, name in self._brush_buttons.items():
-                    (button.select if name == self.brush_type else button.unselect)()
-            elif event.ui_element == self.noise_button:
-                self.noise_mode = not self.noise_mode
-                (self.noise_button.select if self.noise_mode else self.noise_button.unselect)()
-            elif event.ui_element == self.clear_paint_button:
-                self._paint_layer.clear()
-            elif event.ui_element == self.revert_button:
-                if self._preview_index is not None and self.worker is not None:
-                    # Adopt the checkpoint's prompts as the live set, then branch from it.
-                    self.prompts = [
-                        PromptRow(t, w) for t, w in self._history[self._preview_index].prompts
-                    ]
-                    self.worker.seek(self._preview_index)
-                    self._preview_index = None
-                    self._preview_prompts = None
-                    self.history_slider.set_current_value(float(len(self._history)))
-                    self._rebuild_prompt_rows()  # now-live (reverted) prompts
-                    self._push_prompts()  # apply them to the resumed run
-                    self._sync_enabled()  # re-enable prompt editing
-                    self._refresh_preview_state()
-            elif event.ui_element == self.cancel_button:
-                self._preview_index = None
-                self.history_slider.set_current_value(float(len(self._history)))
-                self._refresh_preview_state()
-
-        elif event.type == pygame_gui.UI_HORIZONTAL_SLIDER_MOVED:
-            if event.ui_element == self.size_slider:
-                self.brush_size = float(event.value)
-            elif event.ui_element == self.strength_slider:
-                self.brush_strength = float(event.value)
-            elif event.ui_element == self.history_slider:
-                idx = int(round(event.value))  # rightmost = live; left = older checkpoints
-                self._preview_index = None if idx >= len(self._history) else idx
-                self._refresh_preview_state()
-            else:
-                slider_idx = self._weight_sliders.get(event.ui_element)
-                if slider_idx is not None and 0 <= slider_idx < len(self.prompts):
-                    self.prompts[slider_idx].weight = float(event.value)
-                    self._refresh_rows()
-                    self._push_prompts()
-
-        elif event.type == pygame_gui.UI_TEXT_ENTRY_FINISHED:
-            if event.ui_element == self.steps_entry:
-                self._commit_steps()
-            elif event.ui_element in (self.width_entry, self.height_entry):
-                pass  # applied via the Apply button
-            elif event.ui_element in self._prompt_entries:
-                self._commit_prompt_entry(event.ui_element)
-
-        elif event.type == pygame_gui.UI_FILE_DIALOG_PATH_PICKED:
-            if event.ui_element is self._file_dialog:
-                self._write_save(event.text)
-                self._file_dialog = None
-
-        elif event.type == pygame_gui.UI_WINDOW_CLOSE:
-            if event.ui_element is self._file_dialog:  # cancelled
-                self._file_dialog = None
-                self._save_surface = None
-
-        return True
-
-    # -- drawing --
-    def _update_frame_surface(self) -> None:
-        if self.worker is None:
-            return
-        frame = self.worker.latest_frame()
-        if frame is None:
-            return
-        key = (id(frame.image), frame.index)
-        if key == self._frame_key:
-            return
-        self._frame_key = key
-        # pygame.surfarray expects (W, H, 3), so swap the first two axes.
-        self._frame_surface = pygame.surfarray.make_surface(frame.image.swapaxes(0, 1))
-        self.step_label.set_text(f"step {frame.index} / {frame.total}")
-
     def _auto_apply_on_blur(self) -> None:
         """Apply a text box when keyboard focus leaves it (no Enter needed).
 
@@ -908,129 +456,74 @@ class App:
         away from is adopted just as if Enter had been pressed.
         """
         focus = self.manager.get_focus_set() or set()
-        current = next((e for e in self._prompt_entries if e in focus), None)
+        current = self.bottom_bar.focused_entry(focus)
         if current is not self._focused_entry:
             previous = self._focused_entry
             self._focused_entry = current
             if previous is not None and previous.alive():
-                self._commit_prompt_entry(previous)
-        steps_focused = self.steps_entry in focus
+                self.bottom_bar.commit_prompt_entry(self, previous)
+        steps_focused = self.sidebar.steps_entry in focus
         if self._steps_focused and not steps_focused:
-            self._commit_steps()
+            self.generation.commit_steps()
         self._steps_focused = steps_focused
+        sched = self.sidebar.focused_schedule(focus)
+        if sched is not self._focused_schedule:
+            previous = self._focused_schedule
+            self._focused_schedule = sched
+            if previous is not None and previous.alive():
+                self.sidebar.commit_schedule_entry(self, previous)
 
-    def _draw(self) -> None:
-        win_w, win_h = self._window_size()
-        img_h = self._image_area_h()
-        self.screen.fill(WINDOW_BG)
-        pygame.draw.rect(self.screen, IMAGE_BG, (0, 0, win_w, img_h))
-        pygame.draw.rect(self.screen, PANEL_BG, (0, img_h, win_w, win_h - img_h))
-        # Draw the canvas (and unbaked paint overlay) under the view transform, clipped to
-        # the viewport so a zoomed/panned canvas never spills into the panel.
-        self.screen.set_clip(self._image_region())
-        crect = self._canvas_screen_rect()
-        surface = self._displayed_surface()
-        if surface is not None:
-            self._blit_canvas(surface)
-        else:
-            # No frame yet: show the canvas bounds so the size/aspect is clear before Play.
-            pygame.draw.rect(self.screen, CANVAS_EMPTY_BG, crect)
-            label = self._hud_font.render(
-                f"{self.width} × {self.height} — press Play", True, (140, 147, 160)
-            )
-            self.screen.blit(label, label.get_rect(center=crect.center))
-        # Paint overlay only on the live view (hidden while previewing history).
-        if self._preview_index is None and not self._paint_layer.empty():
-            self._blit_canvas(self._paint_layer.to_surface())
-        pygame.draw.rect(self.screen, CANVAS_BORDER, crect, 1)  # canvas outline at any zoom
-        self.screen.set_clip(None)
-        pygame.draw.line(self.screen, DIVIDER, (0, img_h), (win_w, img_h))
-
-    def _draw_tools(self) -> None:
-        """Draw the colour palette, the brush-preview ring, and the canvas help HUD."""
-        # Palette: current-colour preview + swatches (selected one outlined).
-        pygame.draw.rect(self.screen, self.brush_color, self._color_preview_rect, border_radius=5)
-        pygame.draw.rect(self.screen, DIVIDER, self._color_preview_rect, width=1, border_radius=5)
-        for sr, color in self._swatch_rects:
-            pygame.draw.rect(self.screen, color, sr, border_radius=4)
-            if color == self.brush_color:
-                pygame.draw.rect(self.screen, (255, 255, 255), sr, width=2, border_radius=4)
-        region = self._image_region()
-        # Brush ring (scaled by zoom) — only in draw mode (not navigating, not previewing).
-        if (
-            not self._navigating
-            and self._preview_index is None
-            and region.collidepoint(self._mouse_pos)
-        ):
-            ring = max(2, int(self.brush_size * self._zoom))
-            pygame.draw.circle(self.screen, self.brush_color, self._mouse_pos, ring, 2)
-            pygame.draw.circle(self.screen, (255, 255, 255), self._mouse_pos, ring + 1, 1)
-        # Help HUD in the corner of the canvas (doesn't cost panel height), per mode.
-        text = self._hud_font.render(
-            NAV_HELP if self._navigating else DRAW_HELP, True, (210, 214, 222)
-        )
-        pad = 6
-        chip = pygame.Surface(
-            (text.get_width() + 2 * pad, text.get_height() + 2 * pad), pygame.SRCALPHA
-        )
-        chip.fill((0, 0, 0, 120))
-        pos = (10, region.bottom - chip.get_height() - 10)
-        self.screen.blit(chip, pos)
-        self.screen.blit(text, (pos[0] + pad, pos[1] + pad))
-
-    # -- painting --
-    def _on_swatch(self, pos: tuple[int, int]) -> bool:
-        for sr, color in self._swatch_rects:
-            if sr.collidepoint(pos):
-                self.brush_color = color
-                return True
-        return False
-
-    def _paint_to(self, pos: tuple[int, int]) -> None:
-        gen = self._screen_to_canvas(pos)
-        if gen is None:
+    def _open_colour_picker(self) -> None:
+        """Open the arbitrary-RGB picker, seeded with the current brush colour."""
+        if self._colour_picker is not None and self._colour_picker.alive():
             return
-        c = self.brush_color
-        color01 = (c[0] / 255.0, c[1] / 255.0, c[2] / 255.0)
-        tint = 1.0 if self.noise_mode else 0.0
-        if self._last_gen is None:
-            self._paint_layer.stamp(
-                gen[0], gen[1], self.brush_size, color01, self.brush_strength, self.brush_type, tint
-            )
-        else:
-            self._paint_layer.stroke(
-                self._last_gen,
-                gen,
-                self.brush_size,
-                color01,
-                self.brush_strength,
-                self.brush_type,
-                tint,
-            )
-        self._last_gen = gen
+        rect = self.layout.centered_rect(420, 400)
+        self._colour_picker = UIColourPickerDialog(
+            rect,
+            self.manager,
+            initial_colour=pygame.Color(*self.paint.brush.color),
+            window_title="Pick a colour",
+        )
 
-    def _sync_paint(self) -> None:
-        """Hand new strokes to the worker, and clear the overlay once a step has baked them."""
-        layer = self._paint_layer
-        if layer.dirty and self.worker is not None and self.worker.is_alive():
-            layer.dirty = False
-            rgb, alpha, tint = layer.snapshot()
-            # Gamma-shape the *injected* mask for noise-mode pixels (tint/alpha = how much of
-            # the pixel is noise-mode), keeping the on-screen overlay at the raw opacity.
-            frac_noise = np.divide(tint, alpha, out=np.zeros_like(tint), where=alpha > 1e-6)
-            shaped = NOISE_MAX_INJECT * alpha**NOISE_OPACITY_GAMMA
-            alpha = alpha * (1.0 - frac_noise) + shaped * frac_noise
-            self.worker.set_paint(rgb, alpha, tint)
-            self._paint_awaiting_bake = True
-            self._paint_baseline = self.worker.paint_applied_count
-        # Clear the overlay only when a *published frame* that incorporated the paint arrives —
-        # not merely when the worker started applying it. The injecting step takes seconds, so
-        # clearing on apply would make the stroke vanish before the baked image catches up.
-        if self._paint_awaiting_bake and not self._painting and self.worker is not None:
-            frame = self.worker.latest_frame()
-            if frame is not None and frame.paint_applied > self._paint_baseline:
-                layer.clear()
-                self._paint_awaiting_bake = False
+    # -- rendering --
+    def _draw_frame(self) -> None:
+        """The window chrome under everything: panel/sidebar backgrounds + the two dividers.
+
+        The overarching frame; the canvas and bottom bar then draw their own regions on top
+        (self.canvas.draw / self.bottom_bar.draw), and pygame_gui draws the widgets in between.
+        """
+        win_w, win_h = self.layout.window_size()
+        img_h = self.layout.image_area_h()
+        panel_w = self.layout.panel_w()
+        self.screen.fill(WINDOW_BG)
+        pygame.draw.rect(self.screen, IMAGE_BG, (0, 0, panel_w, img_h))
+        pygame.draw.rect(self.screen, PANEL_BG, (0, img_h, panel_w, win_h - img_h))
+        pygame.draw.rect(self.screen, PANEL_BG, self.layout.sidebar_rect())  # full-height sidebar
+        # Draggable divider band between the left column and the sidebar.
+        pygame.draw.rect(self.screen, DIVIDER, pygame.Rect(panel_w, 0, DIVIDER_W, win_h))
+        hot = self._dragging_divider or abs(self._mouse_pos[0] - panel_w) <= DIVIDER_W
+        grip_x = panel_w + DIVIDER_W // 2
+        pygame.draw.line(
+            self.screen,
+            (110, 120, 140) if hot else (70, 78, 92),
+            (grip_x, win_h // 2 - 14),
+            (grip_x, win_h // 2 + 14),
+            2,
+        )
+        # Draggable horizontal divider between the image area and the bottom panel, grip lights
+        # up on hover/drag (mirrors the sidebar divider).
+        pygame.draw.line(self.screen, DIVIDER, (0, img_h), (panel_w, img_h))
+        hot_h = self._dragging_panel or (
+            self._mouse_pos[0] < panel_w and abs(self._mouse_pos[1] - img_h) <= DIVIDER_W
+        )
+        grip_cx = panel_w // 2
+        pygame.draw.line(
+            self.screen,
+            (110, 120, 140) if hot_h else (70, 78, 92),
+            (grip_cx - 14, img_h),
+            (grip_cx + 14, img_h),
+            2,
+        )
 
     # -- main loop --
     def run(self) -> None:
@@ -1040,52 +533,55 @@ class App:
             dt = clock.tick(60) / 1000.0
             for event in pygame.event.get():
                 self.manager.process_events(event)
-                if not self._handle_event(event):
+                if not events.handle(self, event):
                     alive = False
             # Apply at most one window relayout per frame (resize events are coalesced).
             if self._pending_size is not None:
                 w, h = self._pending_size
                 self._pending_size = None
                 self._resize_window(w, h)
+            # Fit the canvas to the available area on the first realized frame (after any
+            # startup window-manager resize has been applied above).
+            if not self._did_initial_fit:
+                self._did_initial_fit = True
+                self.canvas.fit()
+            # Rebuild once per frame after a sidebar- or panel-divider drag (both coalesced).
+            if self._sidebar_dirty or self._panel_dirty:
+                self._sidebar_dirty = False
+                self._panel_dirty = False
+                self._build_ui()
+                self.canvas.clamp_pan()
+            # Fire the debounced model auto-reload once its delay has elapsed.
+            self.models.tick_reload(pygame.time.get_ticks())
+            # Drop a "guidance" checkpoint once a guidance slider has settled (no-op if no run).
+            self.history.tick_guidance_checkpoint(pygame.time.get_ticks())
             # When the run finishes (worker idles) or exits unexpectedly, drop to a paused
             # state so controls/history are usable and the image can still be reverted.
-            wk = self.worker
-            if wk is not None and not self.paused and (wk.finished or not wk.is_alive()):
-                self.paused = True
+            wk = self.state.worker
+            if wk is not None and not self.state.paused and (wk.finished or not wk.is_alive()):
+                self.state.paused = True
                 if wk.is_alive():
                     wk.pause()
-                self._status("Done — scrub History to revert, Save, or Play to start over")
-                self._sync_enabled()
+                self.signals.status("Done")
+                self.signals.invalidate()
+            if wk is not None and wk.notice is not None:  # e.g. compile OOM -> eager fallback
+                self.signals.status(wk.notice)
+                wk.notice = None
+            self.models.poll()  # swap in a reloaded session once its background thread finishes
             self._auto_apply_on_blur()
             # Live "edited · Enter" badge while typing (cheap; only mutates on change).
-            self._refresh_rows()
-            self._sync_paint()
-            self._sync_history()
-            self._update_frame_surface()
+            self.bottom_bar.refresh_rows(self)
+            self.sidebar.refresh_current(self)  # keep the "Current" sidebar tab in sync
+            self.canvas.paint.sync(self.state.worker)
+            self.history.sync()
+            self.canvas.update_frame_surface()
             self.manager.update(dt)
-            self._draw()
-            self.manager.draw_ui(self.screen)
-            self._draw_tools()
+            self._draw_frame()  # window chrome + dividers
+            self.canvas.draw(self)  # the image area (frame / init / overlays / cursor / HUD)
+            self.manager.draw_ui(self.screen)  # the pygame_gui widgets
+            self.bottom_bar.draw(self)  # palette + history-slider ticks, on top of the widgets
             pygame.display.flip()
-        self._stop_run()
-
-
-STEP_MIN, STEP_MAX = 1, 1000
-
-
-def clamp_steps(text: str) -> int:
-    """Parse a steps box value and clamp it to the supported range.
-
-    Raises ``ValueError`` on non-integer input so the caller can restore the prior value.
-    """
-    return max(STEP_MIN, min(STEP_MAX, int(text)))
-
-
-def int_or(text: str, fallback: int) -> int:
-    try:
-        return int(text)
-    except ValueError:
-        return fallback
+        self.generation.stop()
 
 
 def main() -> None:
@@ -1096,8 +592,12 @@ def main() -> None:
     ap.add_argument(
         "--compile",
         action="store_true",
-        help="torch.compile the UNet/CLIP (~2x faster once warm, but recompiles ~90s on "
-        "each new image size).",
+        help="torch.compile the UNet/CLIP for faster steps (off by default). Worth it on a "
+        "GPU with free VRAM headroom or for smaller/lighter runs (~1.4x); the first run at "
+        "each size warms up (~60s, cached on disk). Robust: compile-time errors and OOM fall "
+        "back to eager rather than crashing. Off by default because the heavy presets at "
+        "large sizes need ~21GB to compile, which can exceed a shared GPU's free memory - and "
+        "eager already runs the 2022 preset at 1280x768 in ~1.5min.",
     )
     ap.add_argument("--cpu", action="store_true", help="Force CPU (very slow).")
     # Defaults are repo-root-relative, matching the library, so weights/outputs are shared
@@ -1126,10 +626,53 @@ def main() -> None:
         height=snap_side(args.height),
         steps=args.steps,
     )
+
+    # Choose the device up front on the main thread: it may prompt on stdin for CPU fallback,
+    # which must not happen on the background loading thread (the prompt would be invisible behind
+    # the window). The loading thread is then handed the chosen device and never re-prompts.
+    from disco_diffusion.session import select_device
+
+    device = select_device(config.cpu)
+
+    # Open the window at its final size now, with a loading screen, so it never resizes after the
+    # models finish loading — App adopts this same window (see __post_init__).
+    win_w, win_h = compute_window_size(
+        snap_side(args.width), snap_side(args.height), SIDEBAR_W_DEFAULT, PANEL_H
+    )
+    screen = pygame.display.set_mode((win_w, win_h), pygame.RESIZABLE)
+    pygame.display.set_caption(APP_TITLE)
+    try:
+        pygame.Window.from_display_module().minimum_size = (MIN_WINDOW_W, MIN_IMAGE_H + PANEL_MIN)
+    except (AttributeError, pygame.error):  # older pygame / headless: best-effort only
+        pass
+
+    # Load the models on a background thread (the device/CPU work) while the loading screen
+    # pumps events and shows what's loading. (DiscoSession off the main thread is already how
+    # the in-app model reload works.)
+    state = LoadingState()
+
+    def load() -> None:
+        try:
+            state.session = DiscoSession(
+                config, device=device, progress=lambda label: setattr(state, "status", label)
+            )
+        except Exception as exc:  # noqa: BLE001 - surfaced on the loading screen, re-raised below
+            log.exception("model load failed")
+            state.error = exc
+        finally:
+            state.done = True
+
     log.info("loading models (this can take a minute)…")
-    session = DiscoSession(config)
+    threading.Thread(target=load, daemon=True).start()
+    if not loading_screen(screen, state):  # window closed before the load succeeded
+        pygame.quit()
+        if state.error is not None:  # it failed (the screen showed the error); surface it
+            raise state.error
+        return  # the user aborted while still loading
     log.info("models loaded")
 
+    session = state.session
+    assert session is not None
     app = App(
         session=session,
         out_dir=args.out,
