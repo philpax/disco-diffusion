@@ -38,7 +38,16 @@ packages = ["src/disco_diffusion"]
 dev = [
     "ruff>=0.6",
     "mypy>=1.10",
+    # The interactive app (studio/) is a workspace member, pulled into the dev environment
+    # so `uv run disco-studio` works from the repo root. It is NOT a runtime dependency of
+    # the library, so the published wheel stays free of pygame.
+    "disco-diffusion-studio",
 ]
+
+# studio/ is a uv workspace member. Indexes/sources defined here apply to the whole
+# workspace (members may not declare their own indexes).
+[tool.uv.workspace]
+members = ["studio"]
 
 # torch/torchvision come from the CUDA 12.8 wheel index so the RTX 5090 (Blackwell,
 # sm_120) is supported. Override with a different index for other platforms.
@@ -50,6 +59,7 @@ explicit = true
 [tool.uv.sources]
 torch = { index = "pytorch-cu128" }
 torchvision = { index = "pytorch-cu128" }
+disco-diffusion-studio = { workspace = true }
 
 [tool.ruff]
 line-length = 100

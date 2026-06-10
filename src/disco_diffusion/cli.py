@@ -62,6 +62,13 @@ def generate(
             help="torch.compile the UNet/CLIP (~2x faster once warm; first run compiles)."
         ),
     ] = True,
+    compile_mode: Annotated[
+        str,
+        typer.Option(
+            help="Inductor mode: 'default' (robust, ~60s warmup) or "
+            "'max-autotune-no-cudagraphs' (small extra win on light recipes, slower warmup)."
+        ),
+    ] = "default",
     fast: Annotated[
         bool,
         typer.Option("--fast", help="Enable all fast (slightly lossy) levers (~58s)."),
@@ -93,6 +100,7 @@ def generate(
         "batch_name": batch_name,
         "cpu": cpu,
         "compile": compile,
+        "compile_mode": compile_mode,
         # --fast turns on all the individual fast levers.
         "fast_fp16_secondary": fast or fast_fp16_secondary,
         "guidance_every": guidance_every,

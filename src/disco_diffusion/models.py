@@ -7,6 +7,7 @@ Ported from the original Disco Diffusion notebook.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
 import torch
@@ -19,6 +20,7 @@ from .secondary import SecondaryDiffusionImageNet2
 from .vendor import clip
 from .vendor import lpips as lpips_pkg
 from .vendor.guided_diffusion.script_util import (
+    create_gaussian_diffusion,
     create_model_and_diffusion,
     model_and_diffusion_defaults,
 )
@@ -101,14 +103,46 @@ def build_model_config(config: RunConfig) -> dict[str, Any]:
         )
 
     # Respacing for the requested step count (handled the same way as the notebook).
-    steps = config.steps
-    model_config.update(
-        {
-            "timestep_respacing": f"ddim{steps}",
-            "diffusion_steps": (1000 // steps) * steps if steps < 1000 else steps,
-        }
-    )
+    model_config.update(_respacing_kwargs(config.steps))
     return model_config
+
+
+def _respacing_kwargs(steps: int) -> dict[str, Any]:
+    """The diffusion-step / respacing keys for a requested DDIM step count.
+
+    Factored out so :func:`build_gaussian_diffusion` can rebuild the schedule for a
+    different step count without touching the rest of the model config.
+    """
+    return {
+        "timestep_respacing": f"ddim{steps}",
+        "diffusion_steps": (1000 // steps) * steps if steps < 1000 else steps,
+    }
+
+
+# Keys that ``create_gaussian_diffusion`` accepts; ``diffusion_steps`` maps to its ``steps``.
+_GAUSSIAN_DIFFUSION_KEYS = (
+    "learn_sigma",
+    "sigma_small",
+    "noise_schedule",
+    "use_kl",
+    "predict_xstart",
+    "rescale_timesteps",
+    "rescale_learned_sigmas",
+    "timestep_respacing",
+)
+
+
+def build_gaussian_diffusion(config: RunConfig, steps: int) -> Any:
+    """Build *only* the diffusion schedule for ``steps`` (the UNet is reused as-is).
+
+    Changing the step count rebuilds this cheap betas/respacing object but never reloads
+    the model weights, so an interactive caller can re-run at a different step count for
+    free. Reuses the same model-config values as :func:`build_model_config`.
+    """
+    model_config = build_model_config(config)
+    model_config.update(_respacing_kwargs(steps))
+    kwargs = {k: model_config[k] for k in _GAUSSIAN_DIFFUSION_KEYS if k in model_config}
+    return create_gaussian_diffusion(steps=model_config["diffusion_steps"], **kwargs)
 
 
 def load_diffusion_model(
@@ -141,12 +175,18 @@ def load_secondary_model(config: RunConfig, device: torch.device) -> SecondaryDi
     return model
 
 
-def load_clip_models(config: RunConfig, device: torch.device) -> list[Any]:
+def load_clip_models(
+    config: RunConfig,
+    device: torch.device,
+    progress: Callable[[str], None] | None = None,
+) -> list[Any]:
     # Typed as Any: CLIP models expose encode_text/encode_image/visual which are not
     # part of the nn.Module interface.
     download_root = str(config.models_dir / "clip")
     models: list[Any] = []
     for name in config.clip_models:
+        if progress is not None:
+            progress(name)
         model = clip.load(name, jit=False, download_root=download_root)[0]
         models.append(model.eval().requires_grad_(False).to(device))
     return models
@@ -159,6 +199,7 @@ def load_lpips(device: torch.device) -> nn.Module:
 
 __all__ = [
     "CLIP_NORMALIZE",
+    "build_gaussian_diffusion",
     "build_model_config",
     "load_clip_models",
     "load_diffusion_model",
